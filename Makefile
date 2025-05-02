@@ -8,15 +8,15 @@ BPF_CFLAGS = -g -O2 -target bpf -D__TARGET_ARCH_$(ARCH) \
 			 -I/usr/include/linux \
              -I/usr/include/$(shell uname -m)-linux-gnu \
              -Werror -Wno-unused-value -Wno-pointer-sign
-LDLIBS := -lelf -lz -lbpf
+LDLIBS := -lelf -lz -lbpf -lm -lpcap
 
 all: bpf_program.o loader
 
-bpf_program.o: bpf_program.c
+bpf_program.o: bpf_program.c 
 	$(CLANG) $(BPF_CFLAGS) -c $< -o $@
 
-loader: loader.c packet.h
-	$(CC) -g -O2 -Wall -o $@ $< -lelf -lz -lbpf
+loader: loader.c flow.c mempool.c 
+	$(CC) -g -O2 -Wall -o $@ $^ $(LDLIBS)
 
 clean:
 	rm -f *.o loader

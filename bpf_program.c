@@ -8,6 +8,7 @@
 #include <bpf/bpf_helpers.h>
 #include <bpf/bpf_endian.h>
 
+
 #define BATCH_SIZE 16
 #define FLUSH_TIMEOUT_NS 1000000 // 1毫秒
 
@@ -24,9 +25,11 @@ struct packet_info {
     __u16 src_port;
     __u16 dst_port;
     __u8 protocol;
-    __u16 pkt_len;
+    __u32 pkt_len;
     __u64 timestamp;
-};
+     __u8 tcp_flags;
+} __attribute__((packed));
+
 
 struct batch_data {
     struct packet_info pkts[BATCH_SIZE];
