@@ -174,24 +174,24 @@ void update_tcp_flags(struct flow_stats *stats, uint8_t tcp_flags, int is_revers
     
     if (is_reverse) {
         // 反向流标志统计
-        if (tcp_flags & TCP_FIN) stats->bwd_fin_count++;
-        if (tcp_flags & TCP_SYN) stats->bwd_syn_count++;
-        if (tcp_flags & TCP_RST) stats->bwd_rst_count++;
-        if (tcp_flags & TCP_PSH) stats->bwd_psh_count++;
-        if (tcp_flags & TCP_ACK) stats->bwd_ack_count++;
-        if (tcp_flags & TCP_URG) stats->bwd_urg_count++;
-        if (tcp_flags & TCP_CWR) stats->bwd_cwr_count++;
-        if (tcp_flags & TCP_ECE) stats->bwd_ece_count++;
+        if (tcp_flags & TCP_FIN) stats->tcp_flags.bwd_fin_count++;
+        if (tcp_flags & TCP_SYN) stats->tcp_flags.bwd_syn_count++;
+        if (tcp_flags & TCP_RST) stats->tcp_flags.bwd_rst_count++;
+        if (tcp_flags & TCP_PSH) stats->tcp_flags.bwd_psh_count++;
+        if (tcp_flags & TCP_ACK) stats->tcp_flags.bwd_ack_count++;
+        if (tcp_flags & TCP_URG) stats->tcp_flags.bwd_urg_count++;
+        if (tcp_flags & TCP_CWR) stats->tcp_flags.bwd_cwr_count++;
+        if (tcp_flags & TCP_ECE) stats->tcp_flags.bwd_ece_count++;
     } else {
         // 正向流标志统计
-        if (tcp_flags & TCP_FIN) stats->fwd_fin_count++;
-        if (tcp_flags & TCP_SYN) stats->fwd_syn_count++;
-        if (tcp_flags & TCP_RST) stats->fwd_rst_count++;
-        if (tcp_flags & TCP_PSH) stats->fwd_psh_count++;
-        if (tcp_flags & TCP_ACK) stats->fwd_ack_count++;
-        if (tcp_flags & TCP_URG) stats->fwd_urg_count++;
-        if (tcp_flags & TCP_CWR) stats->fwd_cwr_count++;
-        if (tcp_flags & TCP_ECE) stats->fwd_ece_count++;
+        if (tcp_flags & TCP_FIN) stats->tcp_flags.fwd_fin_count++;
+        if (tcp_flags & TCP_SYN) stats->tcp_flags.fwd_syn_count++;
+        if (tcp_flags & TCP_RST) stats->tcp_flags.fwd_rst_count++;
+        if (tcp_flags & TCP_PSH) stats->tcp_flags.fwd_psh_count++;
+        if (tcp_flags & TCP_ACK) stats->tcp_flags.fwd_ack_count++;
+        if (tcp_flags & TCP_URG) stats->tcp_flags.fwd_urg_count++;
+        if (tcp_flags & TCP_CWR) stats->tcp_flags.fwd_cwr_count++;
+        if (tcp_flags & TCP_ECE) stats->tcp_flags.fwd_ece_count++;
     }
 }
 
@@ -302,25 +302,24 @@ void calculate_flow_features(const struct flow_stats *stats, struct flow_feature
                                        pow(features->flow_mean_length, 2));
     }
     
-    // TCP标志特征 - 正向
-    features->fwd_fin_count = stats->fwd_fin_count;
-    features->fwd_syn_count = stats->fwd_syn_count;
-    features->fwd_rst_count = stats->fwd_rst_count;
-    features->fwd_psh_count = stats->fwd_psh_count;
-    features->fwd_ack_count = stats->fwd_ack_count;
-    features->fwd_urg_count = stats->fwd_urg_count;
-    features->fwd_cwr_count = stats->fwd_cwr_count;
-    features->fwd_ece_count = stats->fwd_ece_count;
+    // TCP标志特征 - 复制到嵌套结构
+    features->tcp_flags.fwd_fin_count = stats->tcp_flags.fwd_fin_count;
+    features->tcp_flags.fwd_syn_count = stats->tcp_flags.fwd_syn_count;
+    features->tcp_flags.fwd_rst_count = stats->tcp_flags.fwd_rst_count;
+    features->tcp_flags.fwd_psh_count = stats->tcp_flags.fwd_psh_count;
+    features->tcp_flags.fwd_ack_count = stats->tcp_flags.fwd_ack_count;
+    features->tcp_flags.fwd_urg_count = stats->tcp_flags.fwd_urg_count;
+    features->tcp_flags.fwd_cwr_count = stats->tcp_flags.fwd_cwr_count;
+    features->tcp_flags.fwd_ece_count = stats->tcp_flags.fwd_ece_count;
     
-    // TCP标志特征 - 反向
-    features->bwd_fin_count = stats->bwd_fin_count;
-    features->bwd_syn_count = stats->bwd_syn_count;
-    features->bwd_rst_count = stats->bwd_rst_count;
-    features->bwd_psh_count = stats->bwd_psh_count;
-    features->bwd_ack_count = stats->bwd_ack_count;
-    features->bwd_urg_count = stats->bwd_urg_count;
-    features->bwd_cwr_count = stats->bwd_cwr_count;
-    features->bwd_ece_count = stats->bwd_ece_count;
+    features->tcp_flags.bwd_fin_count = stats->tcp_flags.bwd_fin_count;
+    features->tcp_flags.bwd_syn_count = stats->tcp_flags.bwd_syn_count;
+    features->tcp_flags.bwd_rst_count = stats->tcp_flags.bwd_rst_count;
+    features->tcp_flags.bwd_psh_count = stats->tcp_flags.bwd_psh_count;
+    features->tcp_flags.bwd_ack_count = stats->tcp_flags.bwd_ack_count;
+    features->tcp_flags.bwd_urg_count = stats->tcp_flags.bwd_urg_count;
+    features->tcp_flags.bwd_cwr_count = stats->tcp_flags.bwd_cwr_count;
+    features->tcp_flags.bwd_ece_count = stats->tcp_flags.bwd_ece_count;
     
     // TCP相关特征
     features->fwd_header_bytes = stats->fwd_header_bytes;
@@ -442,11 +441,11 @@ void print_flow_stats() {
                     // TCP标志计数
                     printf("\n[Forward TCP Flags]\n");
                     printf("FIN: %u  SYN: %u  RST: %u  PSH: %u\n", 
-                           features.fwd_fin_count, features.fwd_syn_count, 
-                           features.fwd_rst_count, features.fwd_psh_count);
+                           features.tcp_flags.fwd_fin_count, features.tcp_flags.fwd_syn_count, 
+                           features.tcp_flags.fwd_rst_count, features.tcp_flags.fwd_psh_count);
                     printf("ACK: %u  URG: %u  CWR: %u  ECE: %u\n", 
-                           features.fwd_ack_count, features.fwd_urg_count, 
-                           features.fwd_cwr_count, features.fwd_ece_count);
+                           features.tcp_flags.fwd_ack_count, features.tcp_flags.fwd_urg_count, 
+                           features.tcp_flags.fwd_cwr_count, features.tcp_flags.fwd_ece_count);
                 }
             }
             
@@ -482,11 +481,11 @@ void print_flow_stats() {
                     // TCP标志计数
                     printf("\n[Backward TCP Flags]\n");
                     printf("FIN: %u  SYN: %u  RST: %u  PSH: %u\n", 
-                           features.bwd_fin_count, features.bwd_syn_count, 
-                           features.bwd_rst_count, features.bwd_psh_count);
+                           features.tcp_flags.bwd_fin_count, features.tcp_flags.bwd_syn_count, 
+                           features.tcp_flags.bwd_rst_count, features.tcp_flags.bwd_psh_count);
                     printf("ACK: %u  URG: %u  CWR: %u  ECE: %u\n", 
-                           features.bwd_ack_count, features.bwd_urg_count, 
-                           features.bwd_cwr_count, features.bwd_ece_count);
+                           features.tcp_flags.bwd_ack_count, features.tcp_flags.bwd_urg_count, 
+                           features.tcp_flags.bwd_cwr_count, features.tcp_flags.bwd_ece_count);
                 }
             }
             

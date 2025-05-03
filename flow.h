@@ -6,10 +6,6 @@
 #include <time.h>
 // Add the netinet/ip.h header to get struct iphdr definition
 #include <netinet/ip.h>
-// Remove Linux kernel headers causing conflicts
-// #include <linux/ip.h>
-// #include <linux/tcp.h>
-// #include <linux/udp.h>
 #include <arpa/inet.h>
 // Add system network headers
 #include <netinet/in.h>
@@ -53,6 +49,52 @@ typedef struct {
     size_t capacity;       // 数组容量
 } timestamp_array_t;
 
+// UDP流量统计结构
+struct udp_stats {
+    // 正向流统计
+    uint64_t fwd_packets;        // 正向UDP包数量
+    uint64_t fwd_bytes;          // 正向UDP字节总数
+    uint32_t fwd_max_size;       // 正向UDP包最大大小
+    uint32_t fwd_min_size;       // 正向UDP包最小大小
+    double   fwd_sum_squares;    // 正向UDP包大小平方和
+    uint64_t fwd_header_bytes;   // 正向UDP头部字节数
+    
+    // 反向流统计
+    uint64_t bwd_packets;        // 反向UDP包数量
+    uint64_t bwd_bytes;          // 反向UDP字节总数
+    uint32_t bwd_max_size;       // 反向UDP包最大大小
+    uint32_t bwd_min_size;       // 反向UDP包最小大小
+    double   bwd_sum_squares;    // 反向UDP包大小平方和
+    uint64_t bwd_header_bytes;   // 反向UDP头部字节数
+    
+    // 时间相关统计
+    timestamp_array_t fwd_timestamps;  // 正向UDP包时间戳
+    timestamp_array_t bwd_timestamps;  // 反向UDP包时间戳
+};
+
+// TCP标志统计结构
+struct tcp_flag_stats {
+    // 正向流标志统计
+    uint32_t fwd_fin_count;      // FIN标志计数
+    uint32_t fwd_syn_count;      // SYN标志计数
+    uint32_t fwd_rst_count;      // RST标志计数
+    uint32_t fwd_psh_count;      // PSH标志计数
+    uint32_t fwd_ack_count;      // ACK标志计数
+    uint32_t fwd_urg_count;      // URG标志计数
+    uint32_t fwd_cwr_count;      // CWR标志计数
+    uint32_t fwd_ece_count;      // ECE标志计数
+    
+    // 反向流标志统计
+    uint32_t bwd_fin_count;      // FIN标志计数
+    uint32_t bwd_syn_count;      // SYN标志计数
+    uint32_t bwd_rst_count;      // RST标志计数
+    uint32_t bwd_psh_count;      // PSH标志计数
+    uint32_t bwd_ack_count;      // ACK标志计数
+    uint32_t bwd_urg_count;      // URG标志计数
+    uint32_t bwd_cwr_count;      // CWR标志计数
+    uint32_t bwd_ece_count;      // ECE标志计数
+};
+
 // 流量统计指标
 struct flow_stats {
     // 时间相关
@@ -86,25 +128,11 @@ struct flow_stats {
     uint32_t fwd_tcp_payload_bytes; // 至少有1字节payload的TCP流量
     uint32_t fwd_min_segment;       // 前向观察到的最小segment大小
 
-    // TCP标志统计 - 正向
-    uint32_t fwd_fin_count;         // FIN标志计数
-    uint32_t fwd_syn_count;         // SYN标志计数
-    uint32_t fwd_rst_count;         // RST标志计数
-    uint32_t fwd_psh_count;         // PSH标志计数
-    uint32_t fwd_ack_count;         // ACK标志计数
-    uint32_t fwd_urg_count;         // URG标志计数
-    uint32_t fwd_cwr_count;         // CWR标志计数
-    uint32_t fwd_ece_count;         // ECE标志计数
+    // TCP标志统计
+    struct tcp_flag_stats tcp_flags;
 
-    // TCP标志统计 - 反向
-    uint32_t bwd_fin_count;         // FIN标志计数
-    uint32_t bwd_syn_count;         // SYN标志计数
-    uint32_t bwd_rst_count;         // RST标志计数
-    uint32_t bwd_psh_count;         // PSH标志计数
-    uint32_t bwd_ack_count;         // ACK标志计数
-    uint32_t bwd_urg_count;         // URG标志计数
-    uint32_t bwd_cwr_count;         // CWR标志计数
-    uint32_t bwd_ece_count;         // ECE标志计数
+    // UDP特定统计
+    struct udp_stats udp;
 
     // 子流相关统计
     uint64_t subflow_fwd_packets;   // 前向子流中的包数量
@@ -117,6 +145,63 @@ struct flow_stats {
     uint32_t flow_max_length;       // 流的最大长度
     double   flow_length_sum;       // 流长度总和
     double   flow_length_sum_squares; // 流长度平方和
+};
+
+// UDP特征统计结构
+struct udp_features {
+    // 正向流特征
+    uint64_t fwd_packets;         // 正向UDP包数量
+    uint64_t fwd_bytes;           // 正向UDP字节总数
+    uint32_t fwd_max_size;        // 正向UDP包最大大小
+    uint32_t fwd_min_size;        // 正向UDP包最小大小
+    double   fwd_avg_size;        // 正向UDP包平均大小
+    double   fwd_std_size;        // 正向UDP包大小标准差
+    uint64_t fwd_header_bytes;    // 正向UDP头部字节数
+    
+    // 反向流特征
+    uint64_t bwd_packets;         // 反向UDP包数量
+    uint64_t bwd_bytes;           // 反向UDP字节总数
+    uint32_t bwd_max_size;        // 反向UDP包最大大小
+    uint32_t bwd_min_size;        // 反向UDP包最小大小
+    double   bwd_avg_size;        // 反向UDP包平均大小
+    double   bwd_std_size;        // 反向UDP包大小标准差
+    uint64_t bwd_header_bytes;    // 反向UDP头部字节数
+    
+    // 时间特征
+    double fwd_iat_total;         // 正向包间隔时间总和
+    double fwd_iat_mean;          // 正向包间隔时间平均值
+    double fwd_iat_std;           // 正向包间隔时间标准差
+    double fwd_iat_max;           // 正向包间隔时间最大值
+    double fwd_iat_min;           // 正向包间隔时间最小值
+    
+    double bwd_iat_total;         // 反向包间隔时间总和
+    double bwd_iat_mean;          // 反向包间隔时间平均值
+    double bwd_iat_std;           // 反向包间隔时间标准差
+    double bwd_iat_max;           // 反向包间隔时间最大值
+    double bwd_iat_min;           // 反向包间隔时间最小值
+};
+
+// TCP标志特征结构
+struct tcp_flag_features {
+    // 正向流标志特征
+    uint32_t fwd_fin_count;       // FIN标志计数
+    uint32_t fwd_syn_count;       // SYN标志计数
+    uint32_t fwd_rst_count;       // RST标志计数
+    uint32_t fwd_psh_count;       // PSH标志计数
+    uint32_t fwd_ack_count;       // ACK标志计数
+    uint32_t fwd_urg_count;       // URG标志计数
+    uint32_t fwd_cwr_count;       // CWR标志计数
+    uint32_t fwd_ece_count;       // ECE标志计数
+    
+    // 反向流标志特征
+    uint32_t bwd_fin_count;       // FIN标志计数
+    uint32_t bwd_syn_count;       // SYN标志计数
+    uint32_t bwd_rst_count;       // RST标志计数
+    uint32_t bwd_psh_count;       // PSH标志计数
+    uint32_t bwd_ack_count;       // ACK标志计数
+    uint32_t bwd_urg_count;       // URG标志计数
+    uint32_t bwd_cwr_count;       // CWR标志计数
+    uint32_t bwd_ece_count;       // ECE标志计数
 };
 
 // 扩展的特征集
@@ -174,25 +259,11 @@ struct flow_features {
     double flow_mean_length;        // 流的平均长度
     double flow_std_length;         // 流的标准差长度
 
-    // TCP标志特征 - 正向
-    uint32_t fwd_fin_count;         // FIN标志计数
-    uint32_t fwd_syn_count;         // SYN标志计数
-    uint32_t fwd_rst_count;         // RST标志计数
-    uint32_t fwd_psh_count;         // PSH标志计数
-    uint32_t fwd_ack_count;         // ACK标志计数
-    uint32_t fwd_urg_count;         // URG标志计数
-    uint32_t fwd_cwr_count;         // CWR标志计数
-    uint32_t fwd_ece_count;         // ECE标志计数
+    // TCP标志特征
+    struct tcp_flag_features tcp_flags;
 
-    // TCP标志特征 - 反向
-    uint32_t bwd_fin_count;         // FIN标志计数
-    uint32_t bwd_syn_count;         // SYN标志计数
-    uint32_t bwd_rst_count;         // RST标志计数
-    uint32_t bwd_psh_count;         // PSH标志计数
-    uint32_t bwd_ack_count;         // ACK标志计数
-    uint32_t bwd_urg_count;         // URG标志计数
-    uint32_t bwd_cwr_count;         // CWR标志计数
-    uint32_t bwd_ece_count;         // ECE标志计数
+    // UDP特定特征
+    struct udp_features udp;
 
     // TCP相关特征
     uint32_t fwd_header_bytes;      // 用于前向数据包头部的总字节数
@@ -227,6 +298,7 @@ void cleanup_flows();
 struct flow_stats* get_flow_stats(const struct flow_key *key, int is_reverse);
 void update_flow_stats(struct flow_stats *stats, uint32_t pkt_size, int is_reverse);
 void update_tcp_flags(struct flow_stats *stats, uint8_t tcp_flags, int is_reverse);
+void update_udp_stats(struct flow_stats *stats, uint32_t pkt_size, int is_reverse);
 void calculate_flow_features(const struct flow_stats *stats, struct flow_features *features);
 void print_flow_stats();
 void process_packet(const struct iphdr *ip, const void *transport_hdr);

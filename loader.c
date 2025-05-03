@@ -7,6 +7,8 @@
 #include <unistd.h>
 #include <getopt.h>
 #include <time.h>
+#include <fcntl.h>
+#include <sys/file.h>
 
 // System and network headers
 #include <arpa/inet.h>
@@ -40,7 +42,16 @@ typedef unsigned char u_char;
 #define TCPHDR_PSH  0x08
 #define TCPHDR_ACK  0x10
 #define TCPHDR_URG  0x20
+#define TCPHDR_ECE  0x40
+#define TCPHDR_CWR  0x80
 #define PERF_BUFFER_PAGES 16
+
+// NIPQUAD macro for printing IP addresses
+#define NIPQUAD(addr) \
+    ((unsigned char *)&addr)[0], \
+    ((unsigned char *)&addr)[1], \
+    ((unsigned char *)&addr)[2], \
+    ((unsigned char *)&addr)[3]
 
 // Default settings
 #define DEFAULT_STATS_INTERVAL 5   // 5 seconds between stats prints
@@ -48,12 +59,16 @@ typedef unsigned char u_char;
 #define DEFAULT_CLEANUP_INTERVAL 10 // 10 seconds between flow cleanups
 #define DEFAULT_DURATION 0         // 0 means run indefinitely
 
+// 锁文件路径
+#define LOCK_FILE "/var/run/ebpf_pkt.lock"
+
 // Global settings
 static int stats_interval = DEFAULT_STATS_INTERVAL;
 static int stats_packet_count = DEFAULT_STATS_PACKETS;
 static int cleanup_interval = DEFAULT_CLEANUP_INTERVAL;
 static int duration = DEFAULT_DURATION;  // in seconds, 0 means run indefinitely
 static time_t start_time;                // program start time
+static int lock_fd = -1;                // 文件锁描述符
 
 static volatile bool running = true;
 
@@ -75,9 +90,77 @@ struct perf_buffer_opts opts = {
 // Add a global flag to track if cleanup has been done
 static int cleanup_done = 0;
 
+static void cleanup(void) {
+    // 清理流表
+    if (!cleanup_done) {
+        cleanup_done = 1;
+        flow_table_destroy();
+    }
+    
+    // 释放文件锁
+    if (lock_fd != -1) {
+        flock(lock_fd, LOCK_UN);
+        close(lock_fd);
+        lock_fd = -1;
+    }
+}
+
 void sig_handler(int sig) {
     printf("\nReceived signal %d. Cleaning up and exiting...\n", sig);
     running = false;
+}
+
+// 检查是否已经有实例在运行
+static int check_single_instance(void) {
+    // 打开锁文件
+    lock_fd = open(LOCK_FILE, O_RDWR | O_CREAT, 0644);
+    if (lock_fd == -1) {
+        // 检查是否有权限创建锁文件
+        if (errno == EACCES || errno == EPERM) {
+            fprintf(stderr, "无权限创建锁文件 %s，尝试使用 /tmp 目录\n", LOCK_FILE);
+            // 尝试在/tmp目录下创建
+            const char *tmp_lock = "/tmp/ebpf_pkt.lock";
+            lock_fd = open(tmp_lock, O_RDWR | O_CREAT, 0644);
+            if (lock_fd == -1) {
+                fprintf(stderr, "无法创建锁文件: %s\n", strerror(errno));
+                return -1;
+            }
+        } else {
+            fprintf(stderr, "无法创建锁文件: %s\n", strerror(errno));
+            return -1;
+        }
+    }
+    
+    // 尝试对文件加锁
+    if (flock(lock_fd, LOCK_EX | LOCK_NB) == -1) {
+        if (errno == EWOULDBLOCK) {
+            // 已有另一个实例在运行
+            fprintf(stderr, "另一个实例已经在运行\n");
+            close(lock_fd);
+            lock_fd = -1;
+            return 1;
+        } else {
+            fprintf(stderr, "无法锁定文件: %s\n", strerror(errno));
+            close(lock_fd);
+            lock_fd = -1;
+            return -1;
+        }
+    }
+    
+    // 成功获取锁，写入PID
+    char pid_str[32];
+    snprintf(pid_str, sizeof(pid_str), "%d\n", getpid());
+    if (ftruncate(lock_fd, 0) == -1 || 
+        lseek(lock_fd, 0, SEEK_SET) == -1 ||
+        write(lock_fd, pid_str, strlen(pid_str)) == -1) {
+        fprintf(stderr, "无法写入PID到锁文件: %s\n", strerror(errno));
+        // 继续运行，这只是额外的信息
+    }
+    
+    // 注册退出时的清理函数
+    atexit(cleanup);
+    
+    return 0;
 }
 
 static void handle_batch(void *ctx, int cpu, void *data, __u32 size) {
@@ -104,25 +187,45 @@ static void handle_batch(void *ctx, int cpu, void *data, __u32 size) {
         if (pkt->src_ip == 0 || pkt->dst_ip == 0 || pkt->pkt_len == 0) {
             continue;
         }
-        struct flow_key key = {
-            .src_ip = pkt->src_ip,
-            .dst_ip = pkt->dst_ip,
-            .src_port = pkt->src_port,
-            .dst_port = pkt->dst_port,
-            .protocol = pkt->protocol
+        
+        // 手动创建IP头和传输层头用于处理
+        struct iphdr ip_header = {
+            .saddr = pkt->src_ip,
+            .daddr = pkt->dst_ip,
+            .protocol = pkt->protocol,
+            .tot_len = htons(pkt->pkt_len)
         };
+        
+        // 创建临时传输层头
+        struct {
+            union {
+                struct {
+                    uint16_t source;
+                    uint16_t dest;
+                    uint8_t flags_byte[14]; // 足够存储TCP标志位(在字节13)
+                } tcp;
+                struct {
+                    uint16_t source;
+                    uint16_t dest;
+                } udp;
+            } h;
+        } trans_header;
 
-        // 确定流向（简单逻辑：端口号小的为客户端）
-        int is_reverse = 0;
-        if(pkt->src_port > pkt->dst_port) {
-            is_reverse = 1;
+        // 设置传输层信息
+        if (pkt->protocol == IPPROTO_TCP) {
+            trans_header.h.tcp.source = htons(pkt->src_port);
+            trans_header.h.tcp.dest = htons(pkt->dst_port);
+            // 设置TCP标志位到正确位置
+            trans_header.h.tcp.flags_byte[13] = pkt->tcp_flags;
+            
+            // 调试输出TCP标志位已移除，TCP标志会在每个流的统计中显示
+        } else if (pkt->protocol == IPPROTO_UDP) {
+            trans_header.h.udp.source = htons(pkt->src_port);
+            trans_header.h.udp.dest = htons(pkt->dst_port);
         }
 
-        // 获取并更新流统计
-        struct flow_stats *stats = get_flow_stats(&key, is_reverse);
-        if(stats) {
-            update_flow_stats(stats, pkt->pkt_len, is_reverse);
-        }
+        // 调用统一的流处理函数
+        process_packet(&ip_header, &trans_header);
 
         // Count packets
         packet_count++;
@@ -229,10 +332,8 @@ int process_pcap_file(const char *pcap_file) {
         handle = NULL;
     }
     
-    if (!cleanup_done) {
-        cleanup_done = 1;
-        flow_table_destroy();
-    }
+    // 调用统一清理函数
+    cleanup();
     
     return ret;
 }
@@ -378,11 +479,8 @@ cleanup:
         obj = NULL;
     }
     
-    // Clean up flow statistics and memory resources
-    if (!cleanup_done) {
-        cleanup_done = 1;
-        flow_table_destroy();
-    }
+    // 调用统一清理函数
+    cleanup();
     
     return ret;
 }
@@ -396,6 +494,18 @@ int main(int argc, char **argv) {
     // Setup signal handlers
     signal(SIGINT, sig_handler);
     signal(SIGTERM, sig_handler);
+    
+    // 检查是否已经有实例在运行
+    ret = check_single_instance();
+    if (ret > 0) {
+        // 已有实例运行
+        fprintf(stderr, "程序已有一个实例在运行，退出...\n");
+        return 1;
+    } else if (ret < 0) {
+        // 错误
+        fprintf(stderr, "检查单实例失败，继续运行...\n");
+        // 继续运行，因为这不是致命错误
+    }
 
     static struct option long_options[] = {
         {"interface",     required_argument, 0, 'i'},

@@ -12,6 +12,16 @@
 #define BATCH_SIZE 16
 #define FLUSH_TIMEOUT_NS 1000000 // 1毫秒
 
+// TCP标志位常量定义
+#define TCP_FIN  0x01
+#define TCP_SYN  0x02
+#define TCP_RST  0x04
+#define TCP_PSH  0x08
+#define TCP_ACK  0x10
+#define TCP_URG  0x20
+#define TCP_ECE  0x40
+#define TCP_CWR  0x80
+
 struct {
     __uint(type, BPF_MAP_TYPE_PERF_EVENT_ARRAY);
     __uint(key_size, sizeof(int));
@@ -131,6 +141,39 @@ int xdp_packet_capture(struct xdp_md *ctx) {
         if (trans_start + 4 <= data_end) {  // 确保能读取端口
             pkt.src_port = bpf_ntohs(*(__be16 *)trans_start);
             pkt.dst_port = bpf_ntohs(*(__be16 *)(trans_start + 2));
+            
+            // 特殊处理TCP头和标志位
+            if (ip->protocol == IPPROTO_TCP) {
+                struct tcphdr *tcp = (struct tcphdr *)trans_start;
+                
+                // 安全检查，确保可以访问完整的TCP头部
+                if ((void *)(tcp + 1) <= data_end) {
+                    // 标准的TCP标志位提取 - Linux内核中的定义
+                    // 这将处理不同架构上的字节序问题
+                    __u8 flags = 0;
+                    
+                    // 注意：这些可能因字节序影响而需要调整
+                    if (tcp->fin) flags |= TCP_FIN;
+                    if (tcp->syn) flags |= TCP_SYN;
+                    if (tcp->rst) flags |= TCP_RST;
+                    if (tcp->psh) flags |= TCP_PSH;
+                    if (tcp->ack) flags |= TCP_ACK;
+                    if (tcp->urg) flags |= TCP_URG;
+                    
+                    // 另一种方法：直接获取第13字节并使用位操作
+                    void *flags_ptr = (void *)tcp + 13;
+                    if (flags_ptr < data_end) {
+                        __u8 raw_flags = *(__u8 *)flags_ptr;
+                        
+                        // 保存两种方式提取的标志，以便调试比较
+                        pkt.tcp_flags = flags ? flags : raw_flags;
+                        
+                        // 调试输出
+                        bpf_printk("TCP struct flags: 0x%x, raw flags: 0x%x", 
+                                  flags, raw_flags);
+                    }
+                }
+            }
         }
     }
 
