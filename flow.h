@@ -302,6 +302,7 @@ void update_udp_stats(struct flow_stats *stats, uint32_t pkt_size, int is_revers
 void calculate_flow_features(const struct flow_stats *stats, struct flow_features *features);
 void print_flow_stats();
 void process_packet(const struct iphdr *ip, const void *transport_hdr);
+int count_active_flows();
 
 uint32_t hash_flow_key(const struct flow_key *key);
 uint64_t get_current_time();

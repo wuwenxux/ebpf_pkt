@@ -11,13 +11,56 @@
 #include <netinet/udp.h>
 #include <stdlib.h>
 
+// 增加预取相关宏定义
+#define PREFETCH(addr) __builtin_prefetch(addr)
+#define PREFETCH_RW(addr) __builtin_prefetch(addr, 1, 1)
+#define PREFETCH_LOCALITY_HIGH 3
+#define PREFETCH_LOCALITY_MED 2
+#define PREFETCH_LOCALITY_LOW 1
+#define PREFETCH_LOCALITY_NONE 0
+
 // Initial timestamp array size
 #define TIMESTAMP_INITIAL_SIZE 32
 
 // Global variables
 struct mempool global_pool;
 struct flow_node* flow_table[HASH_TABLE_SIZE] = {0}; // Initialize hash table
-static int flow_table_initialized = 0;
+int flow_table_initialized = 0; // 移除static关键字，使其对外部可见
+
+// 外部声明，这些在loader.c中定义
+extern int in_place_updates;
+extern int first_stats_print;
+extern const char *ANSI_CLEAR_SCREEN;
+extern const char *ANSI_CLEAR_LINE;
+extern const char *ANSI_CURSOR_UP;
+extern const char *ANSI_SAVE_CURSOR;
+extern const char *ANSI_RESTORE_CURSOR;
+extern const char *ANSI_HIDE_CURSOR;
+extern const char *ANSI_SHOW_CURSOR;
+extern volatile int running; // 运行状态变量
+
+// 协议处理函数原型定义
+typedef void (*protocol_handler_t)(const void *transport_hdr, struct flow_key *key, uint8_t *flags);
+
+// 处理函数以供跳转表使用
+void handle_tcp(const void *transport_hdr, struct flow_key *key, uint8_t *flags);
+void handle_udp(const void *transport_hdr, struct flow_key *key, uint8_t *flags);
+void handle_unknown(const void *transport_hdr, struct flow_key *key, uint8_t *flags);
+
+// 协议处理函数跳转表
+static protocol_handler_t protocol_handlers[256] = {0}; // 初始化为全零
+
+// 初始化协议处理函数表
+void init_protocol_handlers() {
+    // 默认所有协议都指向handle_unknown
+    for (int i = 0; i < 256; i++) {
+        protocol_handlers[i] = handle_unknown;
+    }
+    
+    // 为已知协议设置处理函数
+    protocol_handlers[IPPROTO_TCP] = handle_tcp;
+    protocol_handlers[IPPROTO_UDP] = handle_udp;
+}
 
 // 时间戳数组操作函数
 void timestamp_array_init(timestamp_array_t *arr) {
@@ -128,6 +171,10 @@ void flow_table_init() {
     // Initialize flow table
     memset(flow_table, 0, sizeof(flow_table));
     flow_table_initialized = 1;
+    
+    // 初始化协议处理函数表
+    init_protocol_handlers();
+    
     printf("Flow table initialized\n");
 }
 
@@ -168,30 +215,33 @@ double time_diff(const struct timespec *end, const struct timespec *start) {
           (end->tv_nsec - start->tv_nsec) / 1e9;
 }
 
-// 更新TCP标志计数
+// 更新TCP标志计数 - 使用位操作进行优化
 void update_tcp_flags(struct flow_stats *stats, uint8_t tcp_flags, int is_reverse) {
     if (!stats) return;
     
+    struct tcp_flag_stats *flag_stats = &stats->tcp_flags;
+    
+    // 使用位操作和掩码优化标志检查
     if (is_reverse) {
-        // 反向流标志统计
-        if (tcp_flags & TCP_FIN) stats->tcp_flags.bwd_fin_count++;
-        if (tcp_flags & TCP_SYN) stats->tcp_flags.bwd_syn_count++;
-        if (tcp_flags & TCP_RST) stats->tcp_flags.bwd_rst_count++;
-        if (tcp_flags & TCP_PSH) stats->tcp_flags.bwd_psh_count++;
-        if (tcp_flags & TCP_ACK) stats->tcp_flags.bwd_ack_count++;
-        if (tcp_flags & TCP_URG) stats->tcp_flags.bwd_urg_count++;
-        if (tcp_flags & TCP_CWR) stats->tcp_flags.bwd_cwr_count++;
-        if (tcp_flags & TCP_ECE) stats->tcp_flags.bwd_ece_count++;
+        // 反向流标志统计 - 使用位操作批量更新
+        flag_stats->bwd_fin_count += (tcp_flags & TCP_FIN) != 0;
+        flag_stats->bwd_syn_count += (tcp_flags & TCP_SYN) != 0;
+        flag_stats->bwd_rst_count += (tcp_flags & TCP_RST) != 0;
+        flag_stats->bwd_psh_count += (tcp_flags & TCP_PSH) != 0;
+        flag_stats->bwd_ack_count += (tcp_flags & TCP_ACK) != 0;
+        flag_stats->bwd_urg_count += (tcp_flags & TCP_URG) != 0;
+        flag_stats->bwd_cwr_count += (tcp_flags & TCP_CWR) != 0;
+        flag_stats->bwd_ece_count += (tcp_flags & TCP_ECE) != 0;
     } else {
-        // 正向流标志统计
-        if (tcp_flags & TCP_FIN) stats->tcp_flags.fwd_fin_count++;
-        if (tcp_flags & TCP_SYN) stats->tcp_flags.fwd_syn_count++;
-        if (tcp_flags & TCP_RST) stats->tcp_flags.fwd_rst_count++;
-        if (tcp_flags & TCP_PSH) stats->tcp_flags.fwd_psh_count++;
-        if (tcp_flags & TCP_ACK) stats->tcp_flags.fwd_ack_count++;
-        if (tcp_flags & TCP_URG) stats->tcp_flags.fwd_urg_count++;
-        if (tcp_flags & TCP_CWR) stats->tcp_flags.fwd_cwr_count++;
-        if (tcp_flags & TCP_ECE) stats->tcp_flags.fwd_ece_count++;
+        // 正向流标志统计 - 使用位操作批量更新
+        flag_stats->fwd_fin_count += (tcp_flags & TCP_FIN) != 0;
+        flag_stats->fwd_syn_count += (tcp_flags & TCP_SYN) != 0;
+        flag_stats->fwd_rst_count += (tcp_flags & TCP_RST) != 0;
+        flag_stats->fwd_psh_count += (tcp_flags & TCP_PSH) != 0;
+        flag_stats->fwd_ack_count += (tcp_flags & TCP_ACK) != 0;
+        flag_stats->fwd_urg_count += (tcp_flags & TCP_URG) != 0;
+        flag_stats->fwd_cwr_count += (tcp_flags & TCP_CWR) != 0;
+        flag_stats->fwd_ece_count += (tcp_flags & TCP_ECE) != 0;
     }
 }
 
@@ -356,7 +406,7 @@ void calculate_flow_features(const struct flow_stats *stats, struct flow_feature
 }
 
 // 计算活跃流的数量
-static int count_active_flows() {
+int count_active_flows() {
     int count = 0;
     for (int i = 0; i < HASH_TABLE_SIZE; i++) {
         struct flow_node *node = flow_table[i];
@@ -662,41 +712,52 @@ void update_flow_stats(struct flow_stats *stats, uint32_t pkt_size, int is_rever
     }
 }
 
-// 主处理函数
+// 处理TCP协议的专用函数
+void handle_tcp(const void *transport_hdr, struct flow_key *key, uint8_t *flags) {
+    const struct tcphdr *tcp = (const struct tcphdr*)transport_hdr;
+    key->src_port = ntohs(tcp->source);
+    key->dst_port = ntohs(tcp->dest);
+    
+    // 获取TCP标志 - 使用通用的方式获取 TCP 标志位
+    // 不同的系统有不同的 tcphdr 定义，所以我们直接使用位操作
+    *flags = *((uint8_t*)tcp + 13); // TCP标志位通常在TCP头部的第13个字节
+}
+
+// 处理UDP协议的专用函数
+void handle_udp(const void *transport_hdr, struct flow_key *key, uint8_t *flags) {
+    const struct udphdr *udp = (const struct udphdr*)transport_hdr;
+    key->src_port = ntohs(udp->source);
+    key->dst_port = ntohs(udp->dest);
+    *flags = 0; // UDP没有标志位
+}
+
+// 处理未知协议的默认函数
+void handle_unknown(const void *transport_hdr, struct flow_key *key, uint8_t *flags) {
+    // 对于未知协议，设置默认值
+    key->src_port = 0;
+    key->dst_port = 0;
+    *flags = 0;
+}
+
+// 主处理函数 - 优化版本
 void process_packet(const struct iphdr *ip, const void *transport_hdr) {
     if (!ip || !transport_hdr || !flow_table_initialized) return;
     
+    // 提前预取哈希表 - 减少缓存缺失
+    uint32_t hash_idx = ip->saddr % HASH_TABLE_SIZE;
+    PREFETCH(&flow_table[hash_idx]);
+    
     struct flow_key key;
-    int is_reverse = 0;
     uint8_t tcp_flags = 0;
+    int is_reverse = 0;
     
     // 生成会话Key
     key.src_ip = ip->saddr;
     key.dst_ip = ip->daddr;
     key.protocol = ip->protocol;
     
-    // 处理传输层
-    switch (ip->protocol) {
-    case IPPROTO_TCP: {
-        const struct tcphdr *tcp = (const struct tcphdr*)transport_hdr;
-        key.src_port = ntohs(tcp->source);
-        key.dst_port = ntohs(tcp->dest);
-        
-        // 获取TCP标志 - 使用通用的方式获取 TCP 标志位
-        // 不同的系统有不同的 tcphdr 定义，所以我们直接使用位操作
-        tcp_flags = *((uint8_t*)tcp + 13); // TCP标志位通常在TCP头部的第13个字节
-        
-        break;
-    }
-    case IPPROTO_UDP: {
-        const struct udphdr *udp = (const struct udphdr*)transport_hdr;
-        key.src_port = ntohs(udp->source);
-        key.dst_port = ntohs(udp->dest);
-        break;
-    }
-    default:
-        return; // 不统计其他协议
-    }
+    // 使用协议处理函数表处理不同协议，替代if-else
+    protocol_handlers[ip->protocol](transport_hdr, &key, &tcp_flags);
     
     // 判断流向（假设初始方向为src->dst）
     struct flow_key reverse_key = {
@@ -707,6 +768,13 @@ void process_packet(const struct iphdr *ip, const void *transport_hdr) {
         .protocol = key.protocol
     };
     
+    // 预取可能的流统计结构
+    uint32_t idx = hash_flow_key(&key);
+    uint32_t reverse_idx = hash_flow_key(&reverse_key);
+    
+    PREFETCH(&flow_table[idx]);
+    PREFETCH(&flow_table[reverse_idx]);
+    
     struct flow_stats *stats = get_flow_stats(&key, 0);
     if (!stats) {
         // 尝试反向查找
@@ -716,13 +784,30 @@ void process_packet(const struct iphdr *ip, const void *transport_hdr) {
     
     // 更新统计 (if stats is NULL, we just skip this)
     if (stats) {
-        uint32_t pkt_size = ntohs(ip->tot_len);
-        update_flow_stats(stats, pkt_size, is_reverse);
+        // 预取统计结构以提高性能
+        PREFETCH_RW(stats);
         
-        // 如果是TCP，更新TCP标志计数
-        if (key.protocol == IPPROTO_TCP) {
-            update_tcp_flags(stats, tcp_flags, is_reverse);
-        }
+    uint32_t pkt_size = ntohs(ip->tot_len);
+    update_flow_stats(stats, pkt_size, is_reverse);
+        
+        // 使用位操作代替条件判断 - 仅当协议为TCP时更新标志
+        stats->tcp_flags.fwd_fin_count += (key.protocol == IPPROTO_TCP && !is_reverse) * ((tcp_flags & TCP_FIN) != 0);
+        stats->tcp_flags.fwd_syn_count += (key.protocol == IPPROTO_TCP && !is_reverse) * ((tcp_flags & TCP_SYN) != 0);
+        stats->tcp_flags.fwd_rst_count += (key.protocol == IPPROTO_TCP && !is_reverse) * ((tcp_flags & TCP_RST) != 0);
+        stats->tcp_flags.fwd_psh_count += (key.protocol == IPPROTO_TCP && !is_reverse) * ((tcp_flags & TCP_PSH) != 0);
+        stats->tcp_flags.fwd_ack_count += (key.protocol == IPPROTO_TCP && !is_reverse) * ((tcp_flags & TCP_ACK) != 0);
+        stats->tcp_flags.fwd_urg_count += (key.protocol == IPPROTO_TCP && !is_reverse) * ((tcp_flags & TCP_URG) != 0);
+        stats->tcp_flags.fwd_cwr_count += (key.protocol == IPPROTO_TCP && !is_reverse) * ((tcp_flags & TCP_CWR) != 0);
+        stats->tcp_flags.fwd_ece_count += (key.protocol == IPPROTO_TCP && !is_reverse) * ((tcp_flags & TCP_ECE) != 0);
+        
+        stats->tcp_flags.bwd_fin_count += (key.protocol == IPPROTO_TCP && is_reverse) * ((tcp_flags & TCP_FIN) != 0);
+        stats->tcp_flags.bwd_syn_count += (key.protocol == IPPROTO_TCP && is_reverse) * ((tcp_flags & TCP_SYN) != 0);
+        stats->tcp_flags.bwd_rst_count += (key.protocol == IPPROTO_TCP && is_reverse) * ((tcp_flags & TCP_RST) != 0);
+        stats->tcp_flags.bwd_psh_count += (key.protocol == IPPROTO_TCP && is_reverse) * ((tcp_flags & TCP_PSH) != 0);
+        stats->tcp_flags.bwd_ack_count += (key.protocol == IPPROTO_TCP && is_reverse) * ((tcp_flags & TCP_ACK) != 0);
+        stats->tcp_flags.bwd_urg_count += (key.protocol == IPPROTO_TCP && is_reverse) * ((tcp_flags & TCP_URG) != 0);
+        stats->tcp_flags.bwd_cwr_count += (key.protocol == IPPROTO_TCP && is_reverse) * ((tcp_flags & TCP_CWR) != 0);
+        stats->tcp_flags.bwd_ece_count += (key.protocol == IPPROTO_TCP && is_reverse) * ((tcp_flags & TCP_ECE) != 0);
     }
 }
 
