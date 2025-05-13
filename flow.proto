@@ -1,0 +1,127 @@
+syntax = "proto3";
+
+package flow;
+
+// 定义流数据消息
+message FlowData {
+  // 基本流标识信息
+  string flow_id = 1;
+  string src_ip = 2;
+  uint32 src_port = 3;
+  string dst_ip = 4;
+  uint32 dst_port = 5;
+  uint32 protocol = 6;
+  
+  // 流时间信息
+  double duration = 7;
+  string start_time = 8;
+  bool is_active = 9;
+  
+  // 流量统计
+  uint64 fwd_packets = 10;
+  uint64 fwd_bytes = 11;
+  uint64 bwd_packets = 12;
+  uint64 bwd_bytes = 13;
+  
+  // 包大小特征
+  uint32 fwd_min_size = 14;
+  uint32 fwd_max_size = 15;
+  double fwd_avg_size = 16;
+  double fwd_std_size = 17;
+  
+  uint32 bwd_min_size = 18;
+  uint32 bwd_max_size = 19;
+  double bwd_avg_size = 20;
+  double bwd_std_size = 21;
+  
+  // 流量率特征
+  double byte_rate = 22;
+  double packet_rate = 23;
+  double fwd_packet_rate = 24;
+  double bwd_packet_rate = 25;
+  
+  // 时间间隔特征
+  double fwd_iat_mean = 26;
+  double fwd_iat_std = 27;
+  double fwd_iat_max = 28;
+  double fwd_iat_min = 29;
+  
+  double bwd_iat_mean = 30;
+  double bwd_iat_std = 31;
+  double bwd_iat_max = 32;
+  double bwd_iat_min = 33;
+  
+  double flow_iat_mean = 34;
+  double flow_iat_std = 35;
+  double flow_iat_max = 36;
+  double flow_iat_min = 37;
+  
+  // TCP标志统计
+  uint32 fin_count = 38;
+  uint32 syn_count = 39;
+  uint32 rst_count = 40;
+  uint32 psh_count = 41;
+  uint32 ack_count = 42;
+  uint32 urg_count = 43;
+  uint32 cwr_count = 44;
+  uint32 ece_count = 45;
+  
+  // TCP窗口信息
+  uint32 fwd_init_win_bytes = 46;
+  uint32 bwd_init_win_bytes = 47;
+  
+  // Bulk分析特征
+  uint32 fwd_bulk_count = 48;
+  uint64 fwd_bulk_bytes = 49;
+  uint32 fwd_bulk_duration = 50;
+  uint32 bwd_bulk_count = 51;
+  uint64 bwd_bulk_bytes = 52;
+  uint32 bwd_bulk_duration = 53;
+  
+  // 活跃/空闲时间特征
+  uint32 active_count = 54;
+  double active_mean = 55;
+  double active_std = 56;
+  double active_max = 57;
+  double active_min = 58;
+  
+  uint32 idle_count = 59;
+  double idle_mean = 60;
+  double idle_std = 61;
+  double idle_max = 62;
+  double idle_min = 63;
+}
+
+// 流数据批次消息 - 包含多个流
+message FlowBatch {
+  repeated FlowData flows = 1;
+  uint64 timestamp = 2;    // 批次创建时间戳
+  uint32 flow_count = 3;   // 批次中的流数量
+  string sender_id = 4;    // 发送者标识
+}
+
+// 流数据请求消息 - 客户端查询流数据
+message FlowRequest {
+  bool include_inactive = 1;  // 是否包含不活跃的流
+  uint32 max_flows = 2;       // 最大返回流数量
+  uint32 protocol_filter = 3; // 协议过滤器 (0=全部)
+}
+
+// 流数据服务定义
+service FlowService {
+  // 获取流数据
+  rpc GetFlowData(FlowRequest) returns (FlowBatch);
+  
+  // 流数据流式传输
+  rpc StreamFlowData(FlowRequest) returns (stream FlowBatch);
+  
+  // 发送流数据批次
+  rpc SendFlowBatch(FlowBatch) returns (FlowResponse);
+}
+
+// 流数据响应消息
+message FlowResponse {
+  bool success = 1;
+  string message = 2;
+  uint32 received_count = 3;
+}
