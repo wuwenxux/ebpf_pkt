@@ -6,7 +6,8 @@
 #include <stdint.h>
 #include "flow.h"
 
-#define MEMPOOL_BLOCK_SIZE 4096  // 每次扩展分配的节点数
+// 大幅增加内存块大小，以支持更多流
+#define MEMPOOL_BLOCK_SIZE 65536  // 每次扩展分配的节点数增加到64K
 
 // Memory pool structure
 struct mempool {

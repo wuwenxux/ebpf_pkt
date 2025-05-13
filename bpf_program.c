@@ -9,7 +9,7 @@
 #include <bpf/bpf_endian.h>
 
 
-#define BATCH_SIZE 16
+#define BATCH_SIZE 32
 #define FLUSH_TIMEOUT_NS 1000000 // 1毫秒
 
 // TCP标志位常量定义
@@ -84,16 +84,28 @@ static __always_inline int is_loopback(__u32 saddr, __u32 daddr) {
 
 static __always_inline void submit_batch(struct xdp_md *ctx, struct batch_data *batch) {
     if (batch->count > 0) {
+        // 显式限制 count 不超过 BATCH_SIZE
+        __u32 count = batch->count;
+        if (count > BATCH_SIZE)
+            count = BATCH_SIZE;
+        
         __u32 max_size = sizeof(struct batch_data);
-        __u32 data_size = offsetof(struct batch_data, pkts) + 
-                         batch->count * sizeof(struct packet_info);
-        data_size = data_size > max_size ? max_size : data_size; // 截断
+        __u32 data_size = offsetof(struct batch_data, pkts);
+        
+        // 使用安全的方式计算数据大小，避免整数溢出
+        data_size += count * sizeof(struct packet_info);
+        
+        // 显式边界检查，使验证器满意
+        if (data_size > max_size)
+            data_size = max_size;
+        
+        // 使用 & 操作符来限制范围，这是验证器最喜欢的方式
+        data_size &= (max_size - 1) | max_size;
         
         bpf_perf_event_output(ctx, &events, BPF_F_CURRENT_CPU, 
                              batch, data_size);
         batch->count = 0;
         batch->last_flush = bpf_ktime_get_ns();
-
     }
 }
 
@@ -182,8 +194,11 @@ int xdp_packet_capture(struct xdp_md *ctx) {
         submit_batch(ctx, batch);
     }
 
+    // 使用显式边界检查
     if (batch->count < BATCH_SIZE) {
-        batch->pkts[batch->count] = pkt;
+        // 确保数组访问安全
+        __u32 index = batch->count & (BATCH_SIZE - 1);
+        batch->pkts[index] = pkt;
         batch->count++;
     } else {
         // 防御性处理：提交后重置

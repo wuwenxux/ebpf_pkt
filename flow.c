@@ -38,6 +38,7 @@ extern const char *ANSI_RESTORE_CURSOR;
 extern const char *ANSI_HIDE_CURSOR;
 extern const char *ANSI_SHOW_CURSOR;
 extern volatile int running; // 运行状态变量
+extern int quiet_mode;       // 安静模式变量
 
 // 协议处理函数原型定义
 typedef void (*protocol_handler_t)(const void *transport_hdr, struct flow_key *key, uint8_t *flags);
@@ -184,7 +185,16 @@ struct flow_node *flow_table_insert(const struct flow_key *key) {
     struct flow_node *node = mempool_alloc(&global_pool);
     if (!node) return NULL;
     
+    // 创建新的key，如果设置了忽略端口，确保端口为0
+#if IGNORE_PORTS
+    struct flow_key normalized_key = *key;
+    normalized_key.src_port = 0;
+    normalized_key.dst_port = 0;
+    memcpy(&node->key, &normalized_key, sizeof(normalized_key));
+#else
     memcpy(&node->key, key, sizeof(*key));
+#endif
+    
     // 初始化统计信息...
     memset(&node->stats, 0, sizeof(node->stats));
     node->stats.fwd_min_size = UINT32_MAX;
@@ -215,33 +225,33 @@ double time_diff(const struct timespec *end, const struct timespec *start) {
           (end->tv_nsec - start->tv_nsec) / 1e9;
 }
 
-// 更新TCP标志计数 - 使用位操作进行优化
+// 更新TCP标志计数 - 使用更精确的位检查
 void update_tcp_flags(struct flow_stats *stats, uint8_t tcp_flags, int is_reverse) {
     if (!stats) return;
     
     struct tcp_flag_stats *flag_stats = &stats->tcp_flags;
     
-    // 使用位操作和掩码优化标志检查
+    // 使用显式位检查而不是非零检查
     if (is_reverse) {
-        // 反向流标志统计 - 使用位操作批量更新
-        flag_stats->bwd_fin_count += (tcp_flags & TCP_FIN) != 0;
-        flag_stats->bwd_syn_count += (tcp_flags & TCP_SYN) != 0;
-        flag_stats->bwd_rst_count += (tcp_flags & TCP_RST) != 0;
-        flag_stats->bwd_psh_count += (tcp_flags & TCP_PSH) != 0;
-        flag_stats->bwd_ack_count += (tcp_flags & TCP_ACK) != 0;
-        flag_stats->bwd_urg_count += (tcp_flags & TCP_URG) != 0;
-        flag_stats->bwd_cwr_count += (tcp_flags & TCP_CWR) != 0;
-        flag_stats->bwd_ece_count += (tcp_flags & TCP_ECE) != 0;
+        // 反向流标志统计 - 明确检查每个位
+        flag_stats->bwd_fin_count += ((tcp_flags & TCP_FIN) == TCP_FIN) ? 1 : 0;
+        flag_stats->bwd_syn_count += ((tcp_flags & TCP_SYN) == TCP_SYN) ? 1 : 0;
+        flag_stats->bwd_rst_count += ((tcp_flags & TCP_RST) == TCP_RST) ? 1 : 0;
+        flag_stats->bwd_psh_count += ((tcp_flags & TCP_PSH) == TCP_PSH) ? 1 : 0;
+        flag_stats->bwd_ack_count += ((tcp_flags & TCP_ACK) == TCP_ACK) ? 1 : 0;
+        flag_stats->bwd_urg_count += ((tcp_flags & TCP_URG) == TCP_URG) ? 1 : 0;
+        flag_stats->bwd_cwr_count += ((tcp_flags & TCP_CWR) == TCP_CWR) ? 1 : 0;
+        flag_stats->bwd_ece_count += ((tcp_flags & TCP_ECE) == TCP_ECE) ? 1 : 0;
     } else {
-        // 正向流标志统计 - 使用位操作批量更新
-        flag_stats->fwd_fin_count += (tcp_flags & TCP_FIN) != 0;
-        flag_stats->fwd_syn_count += (tcp_flags & TCP_SYN) != 0;
-        flag_stats->fwd_rst_count += (tcp_flags & TCP_RST) != 0;
-        flag_stats->fwd_psh_count += (tcp_flags & TCP_PSH) != 0;
-        flag_stats->fwd_ack_count += (tcp_flags & TCP_ACK) != 0;
-        flag_stats->fwd_urg_count += (tcp_flags & TCP_URG) != 0;
-        flag_stats->fwd_cwr_count += (tcp_flags & TCP_CWR) != 0;
-        flag_stats->fwd_ece_count += (tcp_flags & TCP_ECE) != 0;
+        // 正向流标志统计 - 明确检查每个位
+        flag_stats->fwd_fin_count += ((tcp_flags & TCP_FIN) == TCP_FIN) ? 1 : 0;
+        flag_stats->fwd_syn_count += ((tcp_flags & TCP_SYN) == TCP_SYN) ? 1 : 0;
+        flag_stats->fwd_rst_count += ((tcp_flags & TCP_RST) == TCP_RST) ? 1 : 0;
+        flag_stats->fwd_psh_count += ((tcp_flags & TCP_PSH) == TCP_PSH) ? 1 : 0;
+        flag_stats->fwd_ack_count += ((tcp_flags & TCP_ACK) == TCP_ACK) ? 1 : 0;
+        flag_stats->fwd_urg_count += ((tcp_flags & TCP_URG) == TCP_URG) ? 1 : 0;
+        flag_stats->fwd_cwr_count += ((tcp_flags & TCP_CWR) == TCP_CWR) ? 1 : 0;
+        flag_stats->fwd_ece_count += ((tcp_flags & TCP_ECE) == TCP_ECE) ? 1 : 0;
     }
 }
 
@@ -405,231 +415,300 @@ void calculate_flow_features(const struct flow_stats *stats, struct flow_feature
     features->fwd_min_segment = stats->fwd_min_segment;
 }
 
-// 计算活跃流的数量
-int count_active_flows() {
-    int count = 0;
-    for (int i = 0; i < HASH_TABLE_SIZE; i++) {
-        struct flow_node *node = flow_table[i];
-        while (node) {
-            count++;
-            node = node->next;
-        }
-    }
-    return count;
-}
-
-// 定期输出流统计（示例）
-void print_flow_stats() {
-    time_t current_time = time(NULL);
-    printf("\n============= Flow Statistics %s =============\n", ctime(&current_time));
-    printf("Current Active Flows: %d\n", count_active_flows());
-    
-    int flow_count = 0;
-    for (int i = 0; i < HASH_TABLE_SIZE; i++) {
-        struct flow_node *node = flow_table[i];
-        while (node) {
-            flow_count++;
-            struct flow_features features;
-            calculate_flow_features(&node->stats, &features);
-            
-            // Print flow identifier and basic info
-            printf("\n[Flow #%d] %u.%u.%u.%u:%d -> %u.%u.%u.%u:%d Protocol=%s\n",
-                   flow_count,
-                   NIPQUAD(node->key.src_ip), node->key.src_port,
-                   NIPQUAD(node->key.dst_ip), node->key.dst_port,
-                   node->key.protocol == IPPROTO_TCP ? "TCP" : 
-                   (node->key.protocol == IPPROTO_UDP ? "UDP" : "Unknown"));
-            
-            // Print time information
-            char start_time_str[64], end_time_str[64];
-            struct tm *start_tm = localtime(&node->stats.start_time.tv_sec);
-            struct tm *end_tm = localtime(&node->stats.end_time.tv_sec);
-            strftime(start_time_str, sizeof(start_time_str), "%Y-%m-%d %H:%M:%S", start_tm);
-            strftime(end_time_str, sizeof(end_time_str), "%Y-%m-%d %H:%M:%S", end_tm);
-            
-            printf("Start Time: %s.%09ld\n", start_time_str, node->stats.start_time.tv_nsec);
-            printf("Last Time: %s.%09ld\n", end_time_str, node->stats.end_time.tv_nsec);
-            printf("Duration: %.3f seconds\n", features.duration);
-            
-            // Active status
-            uint64_t now = get_current_time();
-            uint64_t idle_time = now - node->stats.last_seen;
-            printf("Idle Time: %.3f seconds\n", idle_time / 1000000000.0);
-            printf("Status: %s\n", idle_time > FLOW_TIMEOUT_NS ? "Expiring Soon" : "Active");
-            
-            // Print forward flow stats
-            printf("\n[Forward Flow Stats (Source->Destination)]\n");
-            printf("Packet Count: %lu\n", (unsigned long)node->stats.fwd_packets);
-            printf("Total Bytes: %lu (%.2f KB)\n", 
-                   (unsigned long)node->stats.fwd_bytes, 
-                   node->stats.fwd_bytes / 1024.0);
-            if (node->stats.fwd_packets > 0) {
-                printf("Max Packet Size: %u bytes\n", node->stats.fwd_max_size);
-                printf("Min Packet Size: %u bytes\n", 
-                       node->stats.fwd_min_size == UINT32_MAX ? 0 : node->stats.fwd_min_size);
-                printf("Avg Packet Size: %.2f bytes\n", features.fwd_avg_size);
-                printf("Packet Size StdDev: %.2f\n", features.fwd_std_size);
-                printf("Packets/sec: %.2f\n", features.fwd_packet_rate);
-                printf("Header Bytes: %u\n", features.fwd_header_bytes);
-                
-                // 包间隔时间
-                if (node->stats.fwd_packets > 1) {
-                    printf("IAT Total: %.6f sec\n", features.fwd_iat_total);
-                    printf("IAT Mean: %.6f sec\n", features.fwd_iat_mean);
-                    printf("IAT StdDev: %.6f sec\n", features.fwd_iat_std);
-                    printf("IAT Max: %.6f sec\n", features.fwd_iat_max);
-                    printf("IAT Min: %.6f sec\n", features.fwd_iat_min);
-                }
-                
-                // TCP特定信息
-                if (node->key.protocol == IPPROTO_TCP) {
-                    printf("TCP Segment Avg Size: %.2f bytes\n", features.fwd_segment_avg_size);
-                    printf("Initial Window Bytes: %u\n", features.fwd_init_win_bytes);
-                    printf("Min Segment Size: %u\n", features.fwd_min_segment);
-                    printf("TCP Payload Bytes: %u\n", features.fwd_tcp_payload_bytes);
-                    
-                    // TCP标志计数
-                    printf("\n[Forward TCP Flags]\n");
-                    printf("FIN: %u  SYN: %u  RST: %u  PSH: %u\n", 
-                           features.tcp_flags.fwd_fin_count, features.tcp_flags.fwd_syn_count, 
-                           features.tcp_flags.fwd_rst_count, features.tcp_flags.fwd_psh_count);
-                    printf("ACK: %u  URG: %u  CWR: %u  ECE: %u\n", 
-                           features.tcp_flags.fwd_ack_count, features.tcp_flags.fwd_urg_count, 
-                           features.tcp_flags.fwd_cwr_count, features.tcp_flags.fwd_ece_count);
-                }
-            }
-            
-            // Print backward flow stats
-            printf("\n[Backward Flow Stats (Destination->Source)]\n");
-            printf("Packet Count: %lu\n", (unsigned long)node->stats.bwd_packets);
-            printf("Total Bytes: %lu (%.2f KB)\n", 
-                   (unsigned long)node->stats.bwd_bytes, 
-                   node->stats.bwd_bytes / 1024.0);
-            if (node->stats.bwd_packets > 0) {
-                printf("Max Packet Size: %u bytes\n", node->stats.bwd_max_size);
-                printf("Min Packet Size: %u bytes\n", 
-                       node->stats.bwd_min_size == UINT32_MAX ? 0 : node->stats.bwd_min_size);
-                printf("Avg Packet Size: %.2f bytes\n", features.bwd_avg_size);
-                printf("Packet Size StdDev: %.2f\n", features.bwd_std_size);
-                printf("Packets/sec: %.2f\n", features.bwd_packet_rate);
-                printf("Header Bytes: %u\n", features.bwd_header_bytes);
-                
-                // 包间隔时间
-                if (node->stats.bwd_packets > 1) {
-                    printf("IAT Total: %.6f sec\n", features.bwd_iat_total);
-                    printf("IAT Mean: %.6f sec\n", features.bwd_iat_mean);
-                    printf("IAT StdDev: %.6f sec\n", features.bwd_iat_std);
-                    printf("IAT Max: %.6f sec\n", features.bwd_iat_max);
-                    printf("IAT Min: %.6f sec\n", features.bwd_iat_min);
-                }
-                
-                // TCP特定信息
-                if (node->key.protocol == IPPROTO_TCP) {
-                    printf("TCP Segment Avg Size: %.2f bytes\n", features.bwd_segment_avg_size);
-                    printf("Initial Window Bytes: %u\n", features.bwd_init_win_bytes);
-                    
-                    // TCP标志计数
-                    printf("\n[Backward TCP Flags]\n");
-                    printf("FIN: %u  SYN: %u  RST: %u  PSH: %u\n", 
-                           features.tcp_flags.bwd_fin_count, features.tcp_flags.bwd_syn_count, 
-                           features.tcp_flags.bwd_rst_count, features.tcp_flags.bwd_psh_count);
-                    printf("ACK: %u  URG: %u  CWR: %u  ECE: %u\n", 
-                           features.tcp_flags.bwd_ack_count, features.tcp_flags.bwd_urg_count, 
-                           features.tcp_flags.bwd_cwr_count, features.tcp_flags.bwd_ece_count);
-                }
-            }
-            
-            // Print overall flow stats
-            printf("\n[Overall Flow Statistics]\n");
-            printf("Total Packets: %lu\n", 
-                   (unsigned long)(node->stats.fwd_packets + node->stats.bwd_packets));
-            printf("Total Bytes: %lu (%.2f KB)\n", 
-                   (unsigned long)(node->stats.fwd_bytes + node->stats.bwd_bytes),
-                   (node->stats.fwd_bytes + node->stats.bwd_bytes) / 1024.0);
-            printf("Byte Rate: %.2f KB/s\n", features.byte_rate / 1024.0);
-            printf("Packet Rate: %.2f pps\n", features.packet_rate);
-            printf("Download/Upload Ratio: %.2f\n", features.download_upload_ratio);
-            
-            // 流长度统计
-            printf("Flow Min Length: %u bytes\n", features.flow_min_length);
-            printf("Flow Max Length: %u bytes\n", features.flow_max_length);
-            printf("Flow Mean Length: %.2f bytes\n", features.flow_mean_length);
-            printf("Flow Length StdDev: %.2f\n", features.flow_std_length);
-            
-            // 整体流间隔时间
-            if (features.flow_iat_total > 0) {
-                printf("Flow IAT Total: %.6f sec\n", features.flow_iat_total);
-                printf("Flow IAT Mean: %.6f sec\n", features.flow_iat_mean);
-                printf("Flow IAT Max: %.6f sec\n", features.flow_iat_max);
-                printf("Flow IAT Min: %.6f sec\n", features.flow_iat_min);
-                printf("Min Packet IAT: %.6f sec\n", features.min_packet_iat);
-            }
-            
-            printf("------------------------------------------------\n");
-            node = node->next;
-        }
-    }
-    
-    if (flow_count == 0) {
-        printf("No active flows currently\n");
-    } else {
-        printf("\nTotal: %d flows\n", flow_count);
-    }
-    printf("==================================================\n\n");
-}
-
-// 哈希函数（Jenkins one-at-a-time）
+// 改进的哈希函数，减少冲突
 uint32_t hash_flow_key(const struct flow_key *key) {
-    uint32_t hash = 0;
-    hash = (hash + key->src_ip) * 0x1f3d5b79;
-    hash = (hash + key->dst_ip) * 0x9e3779b9;
-    hash = (hash + key->src_port) * 0x85ebca6b;
-    hash = (hash + key->dst_port) * 0xc2b2ae35;
-    hash = (hash + key->protocol) * 0x165667b1;
+    if (!key) return 0;
+    
+    // 使用FNV-1a哈希算法，它具有很好的分布性能
+    uint32_t hash = 2166136261u; // FNV偏移基数
+    
+    // 哈希源IP
+    hash ^= (key->src_ip & 0xFF);
+    hash *= 16777619; // FNV素数
+    hash ^= ((key->src_ip >> 8) & 0xFF);
+    hash *= 16777619;
+    hash ^= ((key->src_ip >> 16) & 0xFF);
+    hash *= 16777619;
+    hash ^= ((key->src_ip >> 24) & 0xFF);
+    hash *= 16777619;
+    
+    // 哈希目的IP
+    hash ^= (key->dst_ip & 0xFF);
+    hash *= 16777619;
+    hash ^= ((key->dst_ip >> 8) & 0xFF);
+    hash *= 16777619;
+    hash ^= ((key->dst_ip >> 16) & 0xFF);
+    hash *= 16777619;
+    hash ^= ((key->dst_ip >> 24) & 0xFF);
+    hash *= 16777619;
+    
+#if !IGNORE_PORTS
+    // 哈希源端口
+    hash ^= (key->src_port & 0xFF);
+    hash *= 16777619;
+    hash ^= ((key->src_port >> 8) & 0xFF);
+    hash *= 16777619;
+    
+    // 哈希目的端口
+    hash ^= (key->dst_port & 0xFF);
+    hash *= 16777619;
+    hash ^= ((key->dst_port >> 8) & 0xFF);
+    hash *= 16777619;
+#endif
+    
+    // 哈希协议
+    hash ^= key->protocol;
+    hash *= 16777619;
+    
     return hash % HASH_TABLE_SIZE;
 }
 
-// 获取或创建会话记录
-struct flow_stats* get_flow_stats(const struct flow_key *key, int is_reverse) {
+// 检查TCP流是否应该分段成新流
+static int should_segment_tcp_flow(struct flow_stats *stats, uint8_t new_flags) {
+    // 如果禁用了所有分段功能，直接返回0
+#if !TCP_SEGMENT_ON_IDLE && !TCP_SEGMENT_ON_FLAGS
+    return 0;
+#else
+    // 检查基于空闲时间的分段
+#if TCP_SEGMENT_ON_IDLE
+    uint64_t now = get_current_time();
+    // 检查空闲超时
+    if (now - stats->last_seen > TCP_IDLE_TIMEOUT_NS) {
+        return 1; // 流空闲超时，应该创建新流
+    }
+#endif
+
+    // 检查基于标志位的分段
+#if TCP_SEGMENT_ON_FLAGS
+    // 根据TCP标志变化判断是否需要创建新流
+    struct tcp_flag_stats *flags = &stats->tcp_flags;
+    int total_flags = flags->fwd_syn_count + flags->fwd_fin_count + 
+                      flags->fwd_rst_count + flags->fwd_psh_count +
+                      flags->bwd_syn_count + flags->bwd_fin_count +
+                      flags->bwd_rst_count + flags->bwd_psh_count;
+    
+    // 检查是否超过标志位阈值
+    if (total_flags > TCP_FLAGS_THRESH) {
+        return 1; // 标志位变化过多，应该创建新流
+    }
+    
+    // 检查关键标志位
+    if (new_flags & TCP_SYN) {
+        // 如果已经有其他SYN, 或流中已有数据包，可能是新连接
+        if (flags->fwd_syn_count + flags->bwd_syn_count > 0 || 
+            stats->fwd_packets + stats->bwd_packets > 2) {
+            return 1;
+        }
+    }
+    
+    // FIN或RST通常标志着流的结束
+    if ((new_flags & TCP_FIN) || (new_flags & TCP_RST)) {
+        if (stats->fwd_packets + stats->bwd_packets > 2) {
+            return 1;
+        }
+    }
+#endif
+    
+    return 0; // 默认不分段
+#endif
+}
+
+// 修改get_flow_stats函数，加入TCP流分段逻辑
+struct flow_stats* get_flow_stats(const struct flow_key *key, int *is_reverse_ptr) {
     if (!key || !flow_table_initialized) return NULL;
     
-    uint32_t idx = hash_flow_key(key);
+    // 创建临时key用于查找
+    struct flow_key search_key = *key;
+    
+    // 如果配置为忽略端口，将端口设置为0
+#if IGNORE_PORTS
+    search_key.src_port = 0;
+    search_key.dst_port = 0;
+#endif
+    
+    uint32_t idx = hash_flow_key(&search_key);
     struct flow_node *node = flow_table[idx];
     
-    // 查找现有会话
+    // 处理TCP流的特殊情况
+    int is_tcp = (key->protocol == IPPROTO_TCP);
+    uint8_t tcp_flags = 0;
+    
+    // 获取当前TCP标志，供分段逻辑使用
+    if (is_tcp && is_reverse_ptr) {
+        tcp_flags = *((uint8_t*)is_reverse_ptr); // 临时使用is_reverse_ptr传递标志位
+        *is_reverse_ptr = 0;                    // 重置标志
+    }
+    
+    // 查找流
     while (node) {
-        if (memcmp(&node->key, key, sizeof(struct flow_key)) == 0) {
+#if IGNORE_PORTS
+        // 如果忽略端口，只比较IP和协议
+        if (node->key.src_ip == search_key.src_ip &&
+            node->key.dst_ip == search_key.dst_ip &&
+            node->key.protocol == search_key.protocol) {
+#else
+        // 完整比较
+        if (memcmp(&node->key, &search_key, sizeof(struct flow_key)) == 0) {
+#endif
+            // 检查TCP流是否应该分段
+#if TCP_SEGMENT_ON_IDLE || TCP_SEGMENT_ON_FLAGS
+            if (is_tcp && should_segment_tcp_flow(&node->stats, tcp_flags)) {
+                // 跳过现有流，创建新流
+                break;
+            }
+#endif
+            
+            if (is_reverse_ptr) *is_reverse_ptr = 0;
             return &node->stats;
         }
         node = node->next;
     }
     
-    // 创建新会话
-    struct flow_node *new_node = flow_table_insert(key);
-    if(!new_node) return NULL;
+    // 创建新流
+    struct flow_node *new_node = flow_table_insert(&search_key);
+    if (!new_node) return NULL;
     
     new_node->next = flow_table[idx];
     flow_table[idx] = new_node;
-
+    
+    if (is_reverse_ptr) *is_reverse_ptr = 0;
     return &new_node->stats;
 }
 
+// 流统计函数 - 只统计当前活跃（未超时）的流
+int count_active_flows() {
+    int count = 0;
+    uint64_t now = get_current_time();
+    
+    // 直接统计流表中的活跃节点
+    for (int i = 0; i < HASH_TABLE_SIZE; i++) {
+        struct flow_node *node = flow_table[i];
+        while (node) {
+            // 检查流是否超时
+            uint64_t timeout = FLOW_TIMEOUT_NS;
+            if (node->key.protocol == IPPROTO_TCP) {
+                timeout = TCP_FLOW_TIMEOUT_NS;
+            }
+            
+            // 只统计未超时的流
+            if (now - node->stats.last_seen <= timeout) {
+                // 每个活跃流节点计数
+                count++;
+            }
+            
+            node = node->next;
+        }
+    }
+    
+    return count;
+}
+
+// 简单统计信息输出函数 - 仅显示活跃流的包数量
+void print_simple_stats() {
+    static uint64_t last_total_packets = 0;
+    static uint64_t last_total_bytes = 0;
+    int flow_count = count_active_flows();
+    uint64_t total_packets = 0;
+    uint64_t total_bytes = 0;
+    
+    uint64_t now = get_current_time();
+    
+    // 计算活跃流的总数据包和字节数
+    for (int i = 0; i < HASH_TABLE_SIZE; i++) {
+        struct flow_node *node = flow_table[i];
+        while (node) {
+            // 检查流是否超时
+            uint64_t timeout = FLOW_TIMEOUT_NS;
+            if (node->key.protocol == IPPROTO_TCP) {
+                timeout = TCP_FLOW_TIMEOUT_NS;
+            }
+            
+            // 只统计未超时的流
+            if (now - node->stats.last_seen <= timeout) {
+                total_packets += node->stats.fwd_packets + node->stats.bwd_packets;
+                total_bytes += node->stats.fwd_bytes + node->stats.bwd_bytes;
+            }
+            
+            node = node->next;
+        }
+    }
+    
+    // 计算自上次统计以来的增量
+    uint64_t packet_diff = total_packets - last_total_packets;
+    uint64_t bytes_diff = total_bytes - last_total_bytes;
+    
+    // 更新上次统计值
+    last_total_packets = total_packets;
+    last_total_bytes = total_bytes;
+    
+    // 控制台输出
+    if (in_place_updates) {
+        // 使用ANSI序列清理行并显示简单统计
+        printf("%s[STATS] Active Flows: %d | Total Packets: %lu (+%lu) | Total Traffic: %.2f MB (+%.2f KB)",
+               ANSI_CLEAR_LINE,
+               flow_count,
+               (unsigned long)total_packets,
+               (unsigned long)packet_diff,
+               total_bytes / (1024.0 * 1024.0),
+               bytes_diff / 1024.0);
+        
+        // 将光标返回到行首，不换行
+        fflush(stdout);
+    } else {
+        // 标准输出模式
+        printf("[STATS] Active Flows: %d | Total Packets: %lu (+%lu) | Total Traffic: %.2f MB (+%.2f KB)\n",
+               flow_count,
+               (unsigned long)total_packets, 
+               (unsigned long)packet_diff,
+               total_bytes / (1024.0 * 1024.0),
+               bytes_diff / 1024.0);
+    }
+}
+
+// 定期输出流统计（示例）
+void print_flow_stats() {
+    // 安静模式下不输出任何信息
+    if (quiet_mode) {
+        return;
+    }
+    
+    // 否则显示简单统计，详细统计由print_final_stats在程序退出时调用
+    print_simple_stats();
+}
+
 void cleanup_flows() {
+#if ENABLE_FLOW_CLEANUP
     if (!flow_table_initialized) return;
     
     uint64_t now = get_current_time();
+    int flows_cleaned = 0;
+    
     for (int i = 0; i < HASH_TABLE_SIZE; i++) {
         struct flow_node **ptr = &flow_table[i];
         while (*ptr) {
             struct flow_node *curr = *ptr;
-            if (now - curr->stats.last_seen > FLOW_TIMEOUT_NS) {
+            
+            // 对TCP流应用特殊的超时
+            uint64_t timeout = FLOW_TIMEOUT_NS;
+            if (curr->key.protocol == IPPROTO_TCP) {
+                timeout = TCP_FLOW_TIMEOUT_NS;
+            }
+            
+            // 清理超时流
+            if (now - curr->stats.last_seen > timeout) {
                 *ptr = curr->next;
                 flow_table_remove(curr);  // 使用内存池释放
+                flows_cleaned++;
             } else {
                 ptr = &curr->next;
             }
         }
     }
+    
+    if (flows_cleaned > 0) {
+        printf("Cleaned up %d expired flows\n", flows_cleaned);
+    }
+#endif
 }
 
 // 更新流量统计
@@ -712,15 +791,38 @@ void update_flow_stats(struct flow_stats *stats, uint32_t pkt_size, int is_rever
     }
 }
 
-// 处理TCP协议的专用函数
+// 处理TCP协议的专用函数 - 改进标志位提取
 void handle_tcp(const void *transport_hdr, struct flow_key *key, uint8_t *flags) {
     const struct tcphdr *tcp = (const struct tcphdr*)transport_hdr;
     key->src_port = ntohs(tcp->source);
     key->dst_port = ntohs(tcp->dest);
     
-    // 获取TCP标志 - 使用通用的方式获取 TCP 标志位
-    // 不同的系统有不同的 tcphdr 定义，所以我们直接使用位操作
-    *flags = *((uint8_t*)tcp + 13); // TCP标志位通常在TCP头部的第13个字节
+    // 更可靠的标志位提取方法（适应不同系统）
+    uint8_t *tcp_bytes = (uint8_t*)tcp;
+    
+    // 尝试多种常见的标志位偏移
+    *flags = 0;
+    
+    // 主要的TCP标志字节通常在偏移13处（第14个字节）
+    if (tcp_bytes[13] != 0) {
+        *flags = tcp_bytes[13];
+    } 
+    // 备选位置检查
+    else if (tcp_bytes[12] != 0) {
+        *flags = tcp_bytes[12];
+    }
+    // 使用位偏移检查，更通用的方法
+    else {
+        // 假设标准TCP头中的标志位位置
+        int offset = (tcp->doff * 4) - 8; // 标志位距离TCP头尾部通常为8字节
+        if (offset >= 0 && offset < 20) { // 安全检查
+            *flags = tcp_bytes[offset];
+        }
+    }
+    
+#ifdef DEBUG
+    printf("TCP: %d->%d flags:%02x\n", key->src_port, key->dst_port, *flags);
+#endif
 }
 
 // 处理UDP协议的专用函数
@@ -739,76 +841,229 @@ void handle_unknown(const void *transport_hdr, struct flow_key *key, uint8_t *fl
     *flags = 0;
 }
 
-// 主处理函数 - 优化版本
+// 新添加的函数实现，用于处理Bulk特征、子流和活跃空闲状态计算
+
+/**
+ * 更新流统计中的Bulk分析相关数据
+ * @param stats 流统计指针
+ * @param payload_size 有效载荷大小
+ * @param is_reverse 是否为反向流量
+ * @param timestamp 数据包时间戳
+ */
+void update_flow_bulk(struct flow_stats *stats, uint32_t payload_size, int is_reverse, uint64_t timestamp) {
+    if (!stats || payload_size == 0) {
+        return;
+    }
+
+    if (!is_reverse) {  // 前向流量
+        if (stats->backward_bulk_last_timestamp > stats->forward_bulk_start_tmp) {
+            stats->forward_bulk_start_tmp = 0;
+        }
+        
+        if (stats->forward_bulk_start_tmp == 0) {
+            stats->forward_bulk_start_tmp = timestamp;
+            stats->forward_bulk_last_timestamp = timestamp;
+            stats->forward_bulk_count_tmp = 1;
+            stats->forward_bulk_size_tmp = payload_size;
+        } else {
+            // 检查是否超时（将nanoseconds转换为秒比较）
+            if ((timestamp - stats->forward_bulk_last_timestamp) / 1000000000.0 > CLUMP_TIMEOUT) {
+                stats->forward_bulk_start_tmp = timestamp;
+                stats->forward_bulk_last_timestamp = timestamp;
+                stats->forward_bulk_count_tmp = 1;
+                stats->forward_bulk_size_tmp = payload_size;
+            } else {  // 添加到现有Bulk
+                stats->forward_bulk_count_tmp += 1;
+                stats->forward_bulk_size_tmp += payload_size;
+                
+                // 检查是否达到Bulk边界
+                if (stats->forward_bulk_count_tmp == BULK_BOUND) {
+                    stats->forward_bulk_count += 1;
+                    stats->forward_bulk_packet_count += stats->forward_bulk_count_tmp;
+                    stats->forward_bulk_size += stats->forward_bulk_size_tmp;
+                    stats->forward_bulk_duration += (timestamp - stats->forward_bulk_start_tmp);
+                } else if (stats->forward_bulk_count_tmp > BULK_BOUND) {
+                    stats->forward_bulk_packet_count += 1;
+                    stats->forward_bulk_size += payload_size;
+                    stats->forward_bulk_duration += (timestamp - stats->forward_bulk_last_timestamp);
+                }
+                
+                stats->forward_bulk_last_timestamp = timestamp;
+            }
+        }
+    } else {  // 反向流量
+        if (stats->forward_bulk_last_timestamp > stats->backward_bulk_start_tmp) {
+            stats->backward_bulk_start_tmp = 0;
+        }
+        
+        if (stats->backward_bulk_start_tmp == 0) {
+            stats->backward_bulk_start_tmp = timestamp;
+            stats->backward_bulk_last_timestamp = timestamp;
+            stats->backward_bulk_count_tmp = 1;
+            stats->backward_bulk_size_tmp = payload_size;
+        } else {
+            // 检查是否超时（将nanoseconds转换为秒比较）
+            if ((timestamp - stats->backward_bulk_last_timestamp) / 1000000000.0 > CLUMP_TIMEOUT) {
+                stats->backward_bulk_start_tmp = timestamp;
+                stats->backward_bulk_last_timestamp = timestamp;
+                stats->backward_bulk_count_tmp = 1;
+                stats->backward_bulk_size_tmp = payload_size;
+            } else {  // 添加到现有Bulk
+                stats->backward_bulk_count_tmp += 1;
+                stats->backward_bulk_size_tmp += payload_size;
+                
+                // 检查是否达到Bulk边界
+                if (stats->backward_bulk_count_tmp == BULK_BOUND) {
+                    stats->backward_bulk_count += 1;
+                    stats->backward_bulk_packet_count += stats->backward_bulk_count_tmp;
+                    stats->backward_bulk_size += stats->backward_bulk_size_tmp;
+                    stats->backward_bulk_duration += (timestamp - stats->backward_bulk_start_tmp);
+                } else if (stats->backward_bulk_count_tmp > BULK_BOUND) {
+                    stats->backward_bulk_packet_count += 1;
+                    stats->backward_bulk_size += payload_size;
+                    stats->backward_bulk_duration += (timestamp - stats->backward_bulk_last_timestamp);
+                }
+                
+                stats->backward_bulk_last_timestamp = timestamp;
+            }
+        }
+    }
+}
+
+/**
+ * 更新子流统计信息
+ * @param stats 流统计指针
+ * @param current_time 当前时间戳
+ */
+void update_subflow(struct flow_stats *stats, uint64_t current_time) {
+    if (!stats) {
+        return;
+    }
+    
+    uint64_t last_timestamp = (stats->last_seen != 0) ? stats->last_seen : current_time;
+    
+    // 如果两个包之间的时间差超过分组超时，则更新活跃/空闲状态
+    if ((current_time - last_timestamp) / 1000000000.0 > CLUMP_TIMEOUT) {
+        update_active_idle(stats, current_time);
+    }
+}
+
+/**
+ * 更新活跃和空闲状态统计
+ * @param stats 流统计指针
+ * @param current_time 当前时间（纳秒）
+ */
+void update_active_idle(struct flow_stats *stats, uint64_t current_time) {
+    if (!stats) {
+        return;
+    }
+    
+    // 计算时间差（秒）
+    double time_diff = (current_time - stats->last_seen) / 1000000000.0;
+    
+    // 如果流空闲时间超过活跃超时，将当前活跃周期添加到活跃数组，并开始新的活跃周期
+    if (time_diff > ACTIVE_TIMEOUT) {
+        double duration = fabs((double)(stats->last_seen - stats->start_time.tv_sec) - 
+                                stats->start_time.tv_nsec / 1000000000.0);
+        
+        // 分配活跃状态数组（如果需要）
+        if (!stats->active) {
+            stats->active = malloc(TIMESTAMP_INITIAL_SIZE * sizeof(uint64_t));
+            if (stats->active) {
+                stats->active_count = 0;
+            } else {
+                fprintf(stderr, "Failed to allocate memory for active array\n");
+                return;
+            }
+        }
+        
+        // 分配空闲状态数组（如果需要）
+        if (!stats->idle) {
+            stats->idle = malloc(TIMESTAMP_INITIAL_SIZE * sizeof(uint64_t));
+            if (stats->idle) {
+                stats->idle_count = 0;
+            } else {
+                fprintf(stderr, "Failed to allocate memory for idle array\n");
+                return;
+            }
+        }
+        
+        // 如果有有效的活跃持续时间，添加到活跃数组
+        if (duration > 0 && stats->active && stats->active_count < TIMESTAMP_INITIAL_SIZE) {
+            stats->active[stats->active_count++] = (uint64_t)(duration * 1000000); // 转换为微秒
+        }
+        
+        // 添加空闲时间到空闲数组
+        if (stats->idle && stats->idle_count < TIMESTAMP_INITIAL_SIZE) {
+            stats->idle[stats->idle_count++] = (uint64_t)(time_diff * 1000000); // 转换为微秒
+        }
+    }
+}
+
+// 更新处理数据包的函数，加入对新增功能的处理
 void process_packet(const struct iphdr *ip, const void *transport_hdr) {
-    if (!ip || !transport_hdr || !flow_table_initialized) return;
+    if (!ip || !transport_hdr) return;
     
-    // 提前预取哈希表 - 减少缓存缺失
-    uint32_t hash_idx = ip->saddr % HASH_TABLE_SIZE;
-    PREFETCH(&flow_table[hash_idx]);
+    struct flow_key key = {0};
+    uint8_t flags = 0;
+    uint64_t current_time_ns = get_current_time();
     
-    struct flow_key key;
-    uint8_t tcp_flags = 0;
-    int is_reverse = 0;
+    // 调用协议处理函数填充key和flags
+    protocol_handlers[ip->protocol](transport_hdr, &key, &flags);
     
-    // 生成会话Key
+    // 补全key中的IP信息
     key.src_ip = ip->saddr;
     key.dst_ip = ip->daddr;
     key.protocol = ip->protocol;
     
-    // 使用协议处理函数表处理不同协议，替代if-else
-    protocol_handlers[ip->protocol](transport_hdr, &key, &tcp_flags);
+    // 如果配置为忽略端口，清空端口信息
+    if (IGNORE_PORTS) {
+        key.src_port = 0;
+        key.dst_port = 0;
+    }
     
-    // 判断流向（假设初始方向为src->dst）
-    struct flow_key reverse_key = {
-        .src_ip = key.dst_ip,
-        .dst_ip = key.src_ip,
-        .src_port = key.dst_port,
-        .dst_port = key.src_port,
-        .protocol = key.protocol
-    };
+    int is_reverse = 0;
+    struct flow_stats *stats = get_flow_stats(&key, &is_reverse);
     
-    // 预取可能的流统计结构
-    uint32_t idx = hash_flow_key(&key);
-    uint32_t reverse_idx = hash_flow_key(&reverse_key);
-    
-    PREFETCH(&flow_table[idx]);
-    PREFETCH(&flow_table[reverse_idx]);
-    
-    struct flow_stats *stats = get_flow_stats(&key, 0);
     if (!stats) {
-        // 尝试反向查找
-        stats = get_flow_stats(&reverse_key, 1);
-        is_reverse = 1;
+        fprintf(stderr, "Failed to get flow stats\n");
+        return;
     }
     
-    // 更新统计 (if stats is NULL, we just skip this)
-    if (stats) {
-        // 预取统计结构以提高性能
-        PREFETCH_RW(stats);
+    // 计算数据包大小和头部大小
+    uint32_t total_size = ntohs(ip->tot_len);
+    uint32_t header_size = ip->ihl * 4;
+    uint32_t transport_header_size = 0;
+    uint32_t payload_size = 0;
+    
+    if (key.protocol == IPPROTO_TCP) {
+        const struct tcphdr *tcp = (const struct tcphdr *)transport_hdr;
+        transport_header_size = tcp->doff * 4;
+        payload_size = total_size - header_size - transport_header_size;
         
-    uint32_t pkt_size = ntohs(ip->tot_len);
-    update_flow_stats(stats, pkt_size, is_reverse);
+        // 更新TCP标志
+        update_tcp_flags(stats, flags, is_reverse);
+    } else if (key.protocol == IPPROTO_UDP) {
+        transport_header_size = 8; // UDP header is always 8 bytes
+        payload_size = total_size - header_size - transport_header_size;
         
-        // 使用位操作代替条件判断 - 仅当协议为TCP时更新标志
-        stats->tcp_flags.fwd_fin_count += (key.protocol == IPPROTO_TCP && !is_reverse) * ((tcp_flags & TCP_FIN) != 0);
-        stats->tcp_flags.fwd_syn_count += (key.protocol == IPPROTO_TCP && !is_reverse) * ((tcp_flags & TCP_SYN) != 0);
-        stats->tcp_flags.fwd_rst_count += (key.protocol == IPPROTO_TCP && !is_reverse) * ((tcp_flags & TCP_RST) != 0);
-        stats->tcp_flags.fwd_psh_count += (key.protocol == IPPROTO_TCP && !is_reverse) * ((tcp_flags & TCP_PSH) != 0);
-        stats->tcp_flags.fwd_ack_count += (key.protocol == IPPROTO_TCP && !is_reverse) * ((tcp_flags & TCP_ACK) != 0);
-        stats->tcp_flags.fwd_urg_count += (key.protocol == IPPROTO_TCP && !is_reverse) * ((tcp_flags & TCP_URG) != 0);
-        stats->tcp_flags.fwd_cwr_count += (key.protocol == IPPROTO_TCP && !is_reverse) * ((tcp_flags & TCP_CWR) != 0);
-        stats->tcp_flags.fwd_ece_count += (key.protocol == IPPROTO_TCP && !is_reverse) * ((tcp_flags & TCP_ECE) != 0);
-        
-        stats->tcp_flags.bwd_fin_count += (key.protocol == IPPROTO_TCP && is_reverse) * ((tcp_flags & TCP_FIN) != 0);
-        stats->tcp_flags.bwd_syn_count += (key.protocol == IPPROTO_TCP && is_reverse) * ((tcp_flags & TCP_SYN) != 0);
-        stats->tcp_flags.bwd_rst_count += (key.protocol == IPPROTO_TCP && is_reverse) * ((tcp_flags & TCP_RST) != 0);
-        stats->tcp_flags.bwd_psh_count += (key.protocol == IPPROTO_TCP && is_reverse) * ((tcp_flags & TCP_PSH) != 0);
-        stats->tcp_flags.bwd_ack_count += (key.protocol == IPPROTO_TCP && is_reverse) * ((tcp_flags & TCP_ACK) != 0);
-        stats->tcp_flags.bwd_urg_count += (key.protocol == IPPROTO_TCP && is_reverse) * ((tcp_flags & TCP_URG) != 0);
-        stats->tcp_flags.bwd_cwr_count += (key.protocol == IPPROTO_TCP && is_reverse) * ((tcp_flags & TCP_CWR) != 0);
-        stats->tcp_flags.bwd_ece_count += (key.protocol == IPPROTO_TCP && is_reverse) * ((tcp_flags & TCP_ECE) != 0);
+        // 更新UDP统计
+        update_udp_stats(stats, total_size, is_reverse);
     }
+    
+    // 更新流统计
+    update_flow_stats(stats, total_size, is_reverse);
+    
+    // 更新子流统计
+    update_subflow(stats, current_time_ns);
+    
+    // 更新Bulk分析
+    if (payload_size > 0) {
+        update_flow_bulk(stats, payload_size, is_reverse, current_time_ns);
+    }
+    
+    // 更新最后访问时间
+    stats->last_seen = current_time_ns;
 }
 
 // 程序退出时清理
@@ -837,4 +1092,143 @@ void flow_table_destroy() {
     mempool_destroy(&global_pool);
     
     printf("Flow table destroyed\n");
+}
+
+// 流方向统计函数 - 只统计当前活跃（未超时）的流
+void count_flow_directions(int *forward_flows, int *reverse_flows) {
+    if (!forward_flows || !reverse_flows) return;
+    
+    *forward_flows = 0;
+    *reverse_flows = 0;
+    
+    uint64_t now = get_current_time();
+    
+    for (int i = 0; i < HASH_TABLE_SIZE; i++) {
+        struct flow_node *node = flow_table[i];
+        while (node) {
+            // 检查流是否超时
+            uint64_t timeout = FLOW_TIMEOUT_NS;
+            if (node->key.protocol == IPPROTO_TCP) {
+                timeout = TCP_FLOW_TIMEOUT_NS;
+            }
+            
+            // 只统计未超时的流
+            if (now - node->stats.last_seen <= timeout) {
+                // 通过比较源目IP判断流方向
+                // 当忽略端口时，只使用IP比较
+#if IGNORE_PORTS
+                if (node->key.src_ip < node->key.dst_ip) {
+                    (*forward_flows)++;
+                } else {
+                    (*reverse_flows)++;
+                }
+#else
+                // 通过比较源目IP和端口判断流方向
+                if (node->key.src_ip < node->key.dst_ip || 
+                   (node->key.src_ip == node->key.dst_ip && 
+                    node->key.src_port < node->key.dst_port)) {
+                    (*forward_flows)++;
+                } else {
+                    (*reverse_flows)++;
+                }
+#endif
+            }
+            
+            node = node->next;
+        }
+    }
+}
+
+// 统计所有流，包括已超时的流
+int count_all_flows() {
+    int count = 0;
+    
+    // 直接统计流表中的所有节点
+    for (int i = 0; i < HASH_TABLE_SIZE; i++) {
+        struct flow_node *node = flow_table[i];
+        while (node) {
+            count++;
+            node = node->next;
+        }
+    }
+    
+    return count;
+}
+
+// 统计所有流的方向，包括已超时的流
+void count_all_flow_directions(int *forward_flows, int *reverse_flows) {
+    if (!forward_flows || !reverse_flows) return;
+    
+    *forward_flows = 0;
+    *reverse_flows = 0;
+    
+    for (int i = 0; i < HASH_TABLE_SIZE; i++) {
+        struct flow_node *node = flow_table[i];
+        while (node) {
+            // 通过比较源目IP判断流方向
+            // 当忽略端口时，只使用IP比较
+#if IGNORE_PORTS
+            if (node->key.src_ip < node->key.dst_ip) {
+                (*forward_flows)++;
+            } else {
+                (*reverse_flows)++;
+            }
+#else
+            // 通过比较源目IP和端口判断流方向
+            if (node->key.src_ip < node->key.dst_ip || 
+               (node->key.src_ip == node->key.dst_ip && 
+                node->key.src_port < node->key.dst_port)) {
+                (*forward_flows)++;
+            } else {
+                (*reverse_flows)++;
+            }
+#endif
+            
+            node = node->next;
+        }
+    }
+}
+
+/**
+ * 更新UDP特定统计信息
+ * @param stats 流统计指针
+ * @param pkt_size 数据包大小
+ * @param is_reverse 是否为反向流
+ */
+void update_udp_stats(struct flow_stats *stats, uint32_t pkt_size, int is_reverse) {
+    if (!stats) return;
+    
+    if (is_reverse) {
+        // 更新反向UDP统计
+        stats->udp.bwd_packets++;
+        stats->udp.bwd_bytes += pkt_size;
+        stats->udp.bwd_sum_squares += (double)pkt_size * pkt_size;
+        
+        // 更新最大/最小包大小
+        if (pkt_size > stats->udp.bwd_max_size) {
+            stats->udp.bwd_max_size = pkt_size;
+        }
+        if (stats->udp.bwd_min_size == 0 || pkt_size < stats->udp.bwd_min_size) {
+            stats->udp.bwd_min_size = pkt_size;
+        }
+        
+        // 更新UDP头部字节统计
+        stats->udp.bwd_header_bytes += 8; // UDP头部固定为8字节
+    } else {
+        // 更新正向UDP统计
+        stats->udp.fwd_packets++;
+        stats->udp.fwd_bytes += pkt_size;
+        stats->udp.fwd_sum_squares += (double)pkt_size * pkt_size;
+        
+        // 更新最大/最小包大小
+        if (pkt_size > stats->udp.fwd_max_size) {
+            stats->udp.fwd_max_size = pkt_size;
+        }
+        if (stats->udp.fwd_min_size == 0 || pkt_size < stats->udp.fwd_min_size) {
+            stats->udp.fwd_min_size = pkt_size;
+        }
+        
+        // 更新UDP头部字节统计
+        stats->udp.fwd_header_bytes += 8; // UDP头部固定为8字节
+    }
 }

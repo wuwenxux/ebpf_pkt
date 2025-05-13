@@ -17,7 +17,7 @@ void mempool_init(struct mempool *pool) {
     
     memset(pool, 0, sizeof(struct mempool));
     // Allocate initial block
-    mempool_expand(pool); 
+    mempool_expand(pool);
 }
 
 static void mempool_expand(struct mempool *pool) {

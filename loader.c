@@ -91,10 +91,11 @@ extern int count_active_flows(); // 从flow.c导入流计数函数
     ((unsigned char *)&addr)[3]
 
 // Default settings
-#define DEFAULT_STATS_INTERVAL 5   // 5 seconds between stats prints
+#define DEFAULT_STATS_INTERVAL 2   // 5 seconds between stats prints
 #define DEFAULT_STATS_PACKETS 1000 // Print stats every 1000 packets
 #define DEFAULT_CLEANUP_INTERVAL 10 // 10 seconds between flow cleanups
 #define DEFAULT_DURATION 0         // 0 means run indefinitely
+#define DEFAULT_CSV_FILE NULL      // Default CSV file (none)
 
 // 锁文件路径
 #define LOCK_FILE "/var/run/ebpf_pkt.lock"
@@ -102,11 +103,13 @@ extern int count_active_flows(); // 从flow.c导入流计数函数
 // Global settings
 static int stats_interval = DEFAULT_STATS_INTERVAL;
 static int stats_packet_count = DEFAULT_STATS_PACKETS;
-static int cleanup_interval = DEFAULT_CLEANUP_INTERVAL;
+static int cleanup_interval = EXPIRED_UPDATE;  // 使用从cicflowmeter复制的参数
 static int duration = DEFAULT_DURATION;  // in seconds, 0 means run indefinitely
 static time_t start_time;                // program start time
 static int lock_fd = -1;                // 文件锁描述符
 static int num_threads = DEFAULT_NUM_THREADS; // 工作线程数量
+static const char *csv_file = DEFAULT_CSV_FILE; // CSV输出文件路径
+int quiet_mode = 0;              // 安静模式，不输出统计信息，声明为全局可访问
 
 // 多线程处理相关数据结构
 typedef struct {
@@ -375,16 +378,16 @@ static int check_single_instance(void) {
     if (lock_fd == -1) {
         // 检查是否有权限创建锁文件
         if (errno == EACCES || errno == EPERM) {
-            fprintf(stderr, "无权限创建锁文件 %s，尝试使用 /tmp 目录\n", LOCK_FILE);
+            fprintf(stderr, "No permission to create lock file %s, trying to use /tmp directory\n", LOCK_FILE);
             // 尝试在/tmp目录下创建
             const char *tmp_lock = "/tmp/ebpf_pkt.lock";
             lock_fd = open(tmp_lock, O_RDWR | O_CREAT, 0644);
             if (lock_fd == -1) {
-                fprintf(stderr, "无法创建锁文件: %s\n", strerror(errno));
+                fprintf(stderr, "Cannot create lock file: %s\n", strerror(errno));
                 return -1;
             }
         } else {
-            fprintf(stderr, "无法创建锁文件: %s\n", strerror(errno));
+            fprintf(stderr, "Cannot create lock file: %s\n", strerror(errno));
             return -1;
         }
     }
@@ -393,12 +396,12 @@ static int check_single_instance(void) {
     if (flock(lock_fd, LOCK_EX | LOCK_NB) == -1) {
         if (errno == EWOULDBLOCK) {
             // 已有另一个实例在运行
-            fprintf(stderr, "另一个实例已经在运行\n");
+            fprintf(stderr, "Another instance is already running\n");
             close(lock_fd);
             lock_fd = -1;
             return 1;
         } else {
-            fprintf(stderr, "无法锁定文件: %s\n", strerror(errno));
+            fprintf(stderr, "Unable to lock file: %s\n", strerror(errno));
             close(lock_fd);
             lock_fd = -1;
             return -1;
@@ -411,7 +414,7 @@ static int check_single_instance(void) {
     if (ftruncate(lock_fd, 0) == -1 || 
         lseek(lock_fd, 0, SEEK_SET) == -1 ||
         write(lock_fd, pid_str, strlen(pid_str)) == -1) {
-        fprintf(stderr, "无法写入PID到锁文件: %s\n", strerror(errno));
+        fprintf(stderr, "Unable to write PID to lock file: %s\n", strerror(errno));
         // 继续运行，这只是额外的信息
     }
     
@@ -645,10 +648,6 @@ int process_pcap_file(const char *pcap_file) {
         process_pcap_packet(packet, &header);
         packet_count++;
         
-        // Print progress every 10000 packets
-        if (packet_count % 10000 == 0) {
-            printf("Processed %d packets...\n", packet_count);
-        }
     }
     
     printf("Read %d packets from pcap file\n", packet_count);
@@ -660,9 +659,34 @@ int process_pcap_file(const char *pcap_file) {
     
     // 停止工作线程
     stop_worker_threads();
+
+    // 输出流统计信息
+    printf("====== Flow Statistics ======\n");
     
-    printf("Processed %lu packets total\n", (unsigned long)total_packets_processed);
+    // 计算活跃流和所有流的方向统计
+    int forward_active_flows = 0, reverse_active_flows = 0;
+    count_flow_directions(&forward_active_flows, &reverse_active_flows);
     
+    int forward_all_flows = 0, reverse_all_flows = 0;
+    count_all_flow_directions(&forward_all_flows, &reverse_all_flows);
+    
+    // 统计活跃流和所有流的数量
+    int active_flows = count_active_flows();
+    int all_flows = count_all_flows();
+    
+    // 中英文输出
+    printf("活跃流: %d | 所有流: %d | 不活跃流: %d\n", 
+           active_flows, all_flows, all_flows - active_flows);
+    printf("Active flows: %d | All flows: %d | Inactive flows: %d\n", 
+           active_flows, all_flows, all_flows - active_flows);
+           
+    printf("活跃流方向统计: 正向: %d, 反向: %d\n", forward_active_flows, reverse_active_flows);
+    printf("Active flow directions: Forward: %d, Reverse: %d\n", forward_active_flows, reverse_active_flows);
+    
+    printf("所有流方向统计: 正向: %d, 反向: %d\n", forward_all_flows, reverse_all_flows);
+    printf("All flow directions: Forward: %d, Reverse: %d\n", forward_all_flows, reverse_all_flows);
+    printf("===============================\n");
+
     // Clean up
     if (handle) {
         pcap_close(handle);
@@ -705,7 +729,7 @@ int run_live_capture(const char *ifname) {
     
     printf("Started %d worker threads for packet processing\n", num_threads);
 
-    /* 1. 加载BPF程序 */
+    /* 1. Load BPF program */
     obj = bpf_object__open_file("bpf_program.o", NULL);
     if (libbpf_get_error(obj)) {
         fprintf(stderr, "Failed to open BPF object file\n");
@@ -713,7 +737,7 @@ int run_live_capture(const char *ifname) {
         goto cleanup;
     }
 
-    /* 2. 加载到内核 */
+    /* 2. Load into kernel */
     err = bpf_object__load(obj);
     if (err) {
         fprintf(stderr, "BPF loading failed: %s\n", strerror(-err));
@@ -721,7 +745,7 @@ int run_live_capture(const char *ifname) {
         goto cleanup;
     }
 
-    /* 3. 附加到接口 */
+    /* 3. Attach to interface */
     prog = bpf_object__find_program_by_name(obj, "xdp_packet_capture");
     if (!prog) {
         fprintf(stderr, "BPF program not found\n");
@@ -745,7 +769,7 @@ int run_live_capture(const char *ifname) {
         goto cleanup;
     }
 
-    /* 4. 设置perf buffer */
+    /* 4. Setup perf buffer */
     map_fd = bpf_object__find_map_fd_by_name(obj, "events");
     if (map_fd < 0) {
         fprintf(stderr, "Perf event map not found\n");
@@ -771,7 +795,7 @@ int run_live_capture(const char *ifname) {
 
     printf("Successfully started capturing on %s, press Ctrl+C to stop...\n", ifname);
 
-    /* 5. 事件循环 */
+    /* 5. Event loop */
     while (running) {
         err = perf_buffer__poll(pb, 100);
         // 使用位操作代替条件判断 - 仅当err < 0且err != -EINTR时退出
@@ -791,6 +815,33 @@ int run_live_capture(const char *ifname) {
     
     // 停止工作线程
     stop_worker_threads();
+
+    // 输出流统计信息
+    printf("====== Flow Statistics ======\n");
+    
+    // 计算活跃流和所有流的方向统计
+    int forward_active_flows = 0, reverse_active_flows = 0;
+    count_flow_directions(&forward_active_flows, &reverse_active_flows);
+    
+    int forward_all_flows = 0, reverse_all_flows = 0;
+    count_all_flow_directions(&forward_all_flows, &reverse_all_flows);
+    
+    // 统计活跃流和所有流的数量
+    int active_flows = count_active_flows();
+    int all_flows = count_all_flows();
+    
+    // 中英文输出
+    printf("活跃流: %d | 所有流: %d | 不活跃流: %d\n", 
+           active_flows, all_flows, all_flows - active_flows);
+    printf("Active flows: %d | All flows: %d | Inactive flows: %d\n", 
+           active_flows, all_flows, all_flows - active_flows);
+           
+    printf("活跃流方向统计: 正向: %d, 反向: %d\n", forward_active_flows, reverse_active_flows);
+    printf("Active flow directions: Forward: %d, Reverse: %d\n", forward_active_flows, reverse_active_flows);
+    
+    printf("所有流方向统计: 正向: %d, 反向: %d\n", forward_all_flows, reverse_all_flows);
+    printf("All flow directions: Forward: %d, Reverse: %d\n", forward_all_flows, reverse_all_flows);
+    printf("===============================\n");
 
 cleanup:
     // Cleanup resources in reverse order of creation
@@ -818,8 +869,6 @@ cleanup:
 // 实现print_final_stats函数 - 在程序结束时打印最终统计
 void print_final_stats(void) {
     time_t current_time = time(NULL);
-    printf("\n============= Final Flow Statistics at %s =============\n", ctime(&current_time));
-    printf("Total Active Flows: %d\n", count_active_flows());
     
     // 收集总数据包和字节统计
     uint64_t total_packets = 0;
@@ -831,17 +880,79 @@ void print_final_stats(void) {
     uint64_t total_tcp_bytes = 0;
     uint64_t total_udp_bytes = 0;
     
-    // 打印流量详细信息
+    // 获取活跃流和所有流的数量
+    int active_flow_count = count_active_flows();
+    int all_flow_count = count_all_flows();
+    
+    // 在非安静模式下打印标题
+    if (!quiet_mode) {
+        printf("\n============= Final Flow Statistics at %s =============\n", ctime(&current_time));
+        printf("Active Flows: %d | Total Flows (including inactive): %d\n", 
+               active_flow_count, all_flow_count);
+    }
+    
+    // 如果指定了CSV文件，打开它
+    FILE *csv_fp = NULL;
+    if (csv_file) {
+        csv_fp = fopen(csv_file, "w");
+        if (!csv_fp) {
+            fprintf(stderr, "Error: Could not open CSV file %s for writing: %s\n", 
+                    csv_file, strerror(errno));
+        }
+        
+        // 写入CSV标题
+        if (csv_fp) {
+            fprintf(csv_fp, "流ID,源IP,源端口,目的IP,目的端口,协议,持续时间,开始时间,");
+            fprintf(csv_fp, "正向包数,正向字节数,反向包数,反向字节数,");
+            fprintf(csv_fp, "正向最小包大小,正向最大包大小,正向平均包大小,正向包大小标准差,");
+            fprintf(csv_fp, "反向最小包大小,反向最大包大小,反向平均包大小,反向包大小标准差,");
+            fprintf(csv_fp, "字节率,包率,正向包率,反向包率,");
+            fprintf(csv_fp, "正向包间隔平均值,正向包间隔标准差,正向包间隔最大值,正向包间隔最小值,");
+            fprintf(csv_fp, "反向包间隔平均值,反向包间隔标准差,反向包间隔最大值,反向包间隔最小值,");
+            fprintf(csv_fp, "流间隔平均值,流间隔标准差,流间隔最大值,流间隔最小值,");
+            fprintf(csv_fp, "FIN标志数,SYN标志数,RST标志数,PSH标志数,ACK标志数,");
+            fprintf(csv_fp, "正向初始窗口字节数,反向初始窗口字节数,活跃状态\n");
+        }
+    }
+    
+    // 统计流方向
+    int forward_all_flows = 0, reverse_all_flows = 0;
+    count_all_flow_directions(&forward_all_flows, &reverse_all_flows);
+    
+    if (!quiet_mode) {
+        printf("Total Flow Directions: Forward: %d, Reverse: %d\n", 
+               forward_all_flows, reverse_all_flows);
+        
+        // 打印活跃流方向统计
+        int forward_active_flows = 0, reverse_active_flows = 0;
+        count_flow_directions(&forward_active_flows, &reverse_active_flows);
+        printf("Active Flow Directions: Forward: %d, Reverse: %d\n", 
+               forward_active_flows, reverse_active_flows);
+               
+        // 打印表头
+        printf("\n%-5s %-25s %-25s %-10s %-15s %-15s %-10s %-10s %-10s\n", 
+               "ID", "Source", "Destination", "Protocol", "Duration(s)", "Start Time", "Status", "Packets", "Bytes");
+        printf("%-5s %-25s %-25s %-10s %-15s %-15s %-10s %-10s %-10s\n", 
+               "----", "-----------------", "-----------------", "--------", "-----------", "-----------", "------", "-------", "-----");
+    }
+    
+    uint64_t now = get_current_time();
     int flow_count = 0;
-    printf("\nFlow Details:\n");
-    printf("------------------------------------------------------\n");
-    printf("%-5s %-25s %-25s %-10s\n", "ID", "Source", "Destination", "Protocol");
-    printf("------------------------------------------------------\n");
+    char time_buf[64];
     
     for (int i = 0; i < HASH_TABLE_SIZE; i++) {
         struct flow_node *node = flow_table[i];
         while (node) {
             flow_count++;
+            
+            // 检查流是否超时
+            uint64_t timeout = FLOW_TIMEOUT_NS;
+            if (node->key.protocol == IPPROTO_TCP) {
+                timeout = TCP_FLOW_TIMEOUT_NS;
+            }
+            
+            // 判断流是否活跃
+            int is_active = (now - node->stats.last_seen <= timeout) ? 1 : 0;
             
             // 计算总计数
             uint64_t flow_packets = node->stats.fwd_packets + node->stats.bwd_packets;
@@ -860,38 +971,183 @@ void print_final_stats(void) {
                 total_udp_bytes += flow_bytes;
             }
             
-            // 打印流信息
-            char src[30], dst[30];
-            snprintf(src, sizeof(src), "%u.%u.%u.%u:%d", 
-                    NIPQUAD(node->key.src_ip), node->key.src_port);
-            snprintf(dst, sizeof(dst), "%u.%u.%u.%u:%d", 
-                    NIPQUAD(node->key.dst_ip), node->key.dst_port);
+            // 计算流持续时间
+            double duration = time_diff(&node->stats.end_time, &node->stats.start_time);
             
-            printf("%-5d %-25s %-25s %-10s\n", 
-                   flow_count, src, dst, 
-                   node->key.protocol == IPPROTO_TCP ? "TCP" : 
-                   (node->key.protocol == IPPROTO_UDP ? "UDP" : "Other"));
+            // 格式化开始时间
+            struct tm *start_tm = localtime(&node->stats.start_time.tv_sec);
+            strftime(time_buf, sizeof(time_buf), "%H:%M:%S", start_tm);
+            
+            // 准备IP地址字符串
+            char src_ip[16], dst_ip[16];
+            snprintf(src_ip, sizeof(src_ip), "%u.%u.%u.%u", NIPQUAD(node->key.src_ip));
+            snprintf(dst_ip, sizeof(dst_ip), "%u.%u.%u.%u", NIPQUAD(node->key.dst_ip));
+            
+            // 非安静模式下打印流信息
+            if (!quiet_mode) {
+                char src[30], dst[30];
+                snprintf(src, sizeof(src), "%s:%d", src_ip, node->key.src_port);
+                snprintf(dst, sizeof(dst), "%s:%d", dst_ip, node->key.dst_port);
+                
+                printf("%-5d %-25s %-25s %-10s %-15.2f %-15s %-10s %-10lu %-10lu\n", 
+                       flow_count, src, dst, 
+                       node->key.protocol == IPPROTO_TCP ? "TCP" : 
+                       (node->key.protocol == IPPROTO_UDP ? "UDP" : "Other"),
+                       duration, 
+                       time_buf,
+                       is_active ? "ACTIVE" : "INACTIVE",
+                       (unsigned long)flow_packets,
+                       (unsigned long)flow_bytes);
+                
+                // 打印方向统计信息
+                printf("     Forward: %-10lu pkts, %-10lu bytes | Reverse: %-10lu pkts, %-10lu bytes\n",
+                       (unsigned long)node->stats.fwd_packets,
+                       (unsigned long)node->stats.fwd_bytes,
+                       (unsigned long)node->stats.bwd_packets,
+                       (unsigned long)node->stats.bwd_bytes);
+            }
+            
+            // 计算流特征
+            struct flow_features features;
+            calculate_flow_features(&node->stats, &features);
+            
+            // 非安静模式下打印特征信息
+            if (!quiet_mode) {
+                // 打印包特征信息
+                printf("     Packet Size (bytes) - Fwd: min=%-5u max=%-5u avg=%-7.1f | Bwd: min=%-5u max=%-5u avg=%-7.1f\n",
+                       features.fwd_min_size,
+                       features.fwd_max_size,
+                       features.fwd_avg_size,
+                       features.bwd_min_size,
+                       features.bwd_max_size,
+                       features.bwd_avg_size);
+                       
+                // 打印流量率特征
+                printf("     Flow Rates - Bytes: %-7.2f KB/s | Packets: %-7.2f pkts/s\n",
+                       features.byte_rate / 1024.0,
+                       features.packet_rate);
+                
+                // 打印时间间隔特征
+                printf("     Packet IAT (s) - Fwd: avg=%-7.6f std=%-7.6f | Bwd: avg=%-7.6f std=%-7.6f\n",
+                       features.fwd_iat_mean,
+                       features.fwd_iat_std,
+                       features.bwd_iat_mean,
+                       features.bwd_iat_std);
+                
+                // 打印TCP标志信息 (如果是TCP流)
+                if (node->key.protocol == IPPROTO_TCP) {
+                    printf("     TCP Flags - FIN: %-4u SYN: %-4u RST: %-4u PSH: %-4u ACK: %-4u URG: %-4u CWR: %-4u ECE: %-4u\n",
+                           node->stats.tcp_flags.fwd_fin_count + node->stats.tcp_flags.bwd_fin_count,
+                           node->stats.tcp_flags.fwd_syn_count + node->stats.tcp_flags.bwd_syn_count,
+                           node->stats.tcp_flags.fwd_rst_count + node->stats.tcp_flags.bwd_rst_count,
+                           node->stats.tcp_flags.fwd_psh_count + node->stats.tcp_flags.bwd_psh_count,
+                           node->stats.tcp_flags.fwd_ack_count + node->stats.tcp_flags.bwd_ack_count,
+                           node->stats.tcp_flags.fwd_urg_count + node->stats.tcp_flags.bwd_urg_count,
+                           node->stats.tcp_flags.fwd_cwr_count + node->stats.tcp_flags.bwd_cwr_count,
+                           node->stats.tcp_flags.fwd_ece_count + node->stats.tcp_flags.bwd_ece_count);
+                    
+                    // 打印TCP初始窗口大小
+                    printf("     TCP Init Windows - Fwd: %-6u bytes | Bwd: %-6u bytes\n",
+                           node->stats.fwd_init_win_bytes,
+                           node->stats.bwd_init_win_bytes);
+                }
+                
+                // 打印空行分隔不同流的信息
+                printf("\n");
+            }
+            
+            if (csv_fp) {
+                // 基本流信息
+                fprintf(csv_fp, "%d,%s,%d,%s,%d,%d,%.6f,%s,%d,",
+                       flow_count, src_ip, node->key.src_port, dst_ip, node->key.dst_port,
+                       node->key.protocol, duration, time_buf, is_active);
+                
+                // 方向统计
+                fprintf(csv_fp, "%lu,%lu,%lu,%lu,",
+                       (unsigned long)features.fwd_packets,
+                       (unsigned long)features.fwd_bytes,
+                       (unsigned long)features.bwd_packets,
+                       (unsigned long)features.bwd_bytes);
+                
+                // 包大小特征
+                fprintf(csv_fp, "%u,%u,%.6f,%.6f,",
+                       features.fwd_min_size, features.fwd_max_size,
+                       features.fwd_avg_size, features.fwd_std_size);
+                fprintf(csv_fp, "%u,%u,%.6f,%.6f,",
+                       features.bwd_min_size, features.bwd_max_size,
+                       features.bwd_avg_size, features.bwd_std_size);
+                
+                // 流量率特征
+                fprintf(csv_fp, "%.6f,%.6f,%.6f,%.6f,",
+                       features.byte_rate, features.packet_rate,
+                       features.fwd_packet_rate, features.bwd_packet_rate);
+                
+                // 时间间隔特征 - 正向
+                fprintf(csv_fp, "%.6f,%.6f,%.6f,%.6f,",
+                       features.fwd_iat_mean, features.fwd_iat_std,
+                       features.fwd_iat_max, features.fwd_iat_min);
+                
+                // 时间间隔特征 - 反向
+                fprintf(csv_fp, "%.6f,%.6f,%.6f,%.6f,",
+                       features.bwd_iat_mean, features.bwd_iat_std,
+                       features.bwd_iat_max, features.bwd_iat_min);
+                
+                // 流间隔时间特征
+                fprintf(csv_fp, "%.6f,%.6f,%.6f,%.6f,",
+                       features.flow_iat_mean, features.flow_iat_std,
+                       features.flow_iat_max, features.flow_iat_min);
+                
+                // TCP标志统计 (所有流)
+                int total_fin = node->stats.tcp_flags.fwd_fin_count + node->stats.tcp_flags.bwd_fin_count;
+                int total_syn = node->stats.tcp_flags.fwd_syn_count + node->stats.tcp_flags.bwd_syn_count;
+                int total_rst = node->stats.tcp_flags.fwd_rst_count + node->stats.tcp_flags.bwd_rst_count;
+                int total_psh = node->stats.tcp_flags.fwd_psh_count + node->stats.tcp_flags.bwd_psh_count;
+                int total_ack = node->stats.tcp_flags.fwd_ack_count + node->stats.tcp_flags.bwd_ack_count;
+                
+                fprintf(csv_fp, "%d,%d,%d,%d,%d,",
+                       total_fin, total_syn, total_rst, total_psh, total_ack);
+                
+                // TCP窗口信息
+                fprintf(csv_fp, "%u,%u,%d\n",
+                       node->stats.fwd_init_win_bytes,
+                       node->stats.bwd_init_win_bytes,
+                       is_active);
+            }
             
             node = node->next;
         }
     }
     
-    // 打印摘要统计
-    printf("\nSummary Statistics:\n");
-    printf("Total Flows:      %lu\n", (unsigned long)flow_count);
-    printf("  TCP Flows:      %lu\n", (unsigned long)total_tcp_flows);
-    printf("  UDP Flows:      %lu\n", (unsigned long)total_udp_flows);
-    printf("Total Packets:    %lu\n", (unsigned long)total_packets);
-    printf("  TCP Packets:    %lu\n", (unsigned long)total_tcp_packets);
-    printf("  UDP Packets:    %lu\n", (unsigned long)total_udp_packets);
-    printf("Total Bytes:      %lu (%.2f MB)\n", 
-           (unsigned long)total_bytes, total_bytes / (1024.0 * 1024.0));
-    printf("  TCP Bytes:      %lu (%.2f MB)\n", 
-           (unsigned long)total_tcp_bytes, total_tcp_bytes / (1024.0 * 1024.0));
-    printf("  UDP Bytes:      %lu (%.2f MB)\n", 
-           (unsigned long)total_udp_bytes, total_udp_bytes / (1024.0 * 1024.0));
+    if (!quiet_mode) {
+        printf("\nSummary Statistics:\n");
+        printf("Total Flows:      %lu\n", (unsigned long)flow_count);
+        printf("  TCP Flows:      %lu\n", (unsigned long)total_tcp_flows);
+        printf("  UDP Flows:      %lu\n", (unsigned long)total_udp_flows);
+        printf("Total Packets:    %lu\n", (unsigned long)total_packets);
+        printf("  TCP Packets:    %lu\n", (unsigned long)total_tcp_packets);
+        printf("  UDP Packets:    %lu\n", (unsigned long)total_udp_packets);
+        printf("Total Bytes:      %lu (%.2f MB)\n", 
+               (unsigned long)total_bytes, total_bytes / (1024.0 * 1024.0));
+        printf("  TCP Bytes:      %lu (%.2f MB)\n", 
+               (unsigned long)total_tcp_bytes, total_tcp_bytes / (1024.0 * 1024.0));
+        printf("  UDP Bytes:      %lu (%.2f MB)\n", 
+               (unsigned long)total_udp_bytes, total_udp_bytes / (1024.0 * 1024.0));
+        printf("Active Flows:     %d\n", active_flow_count);
+        printf("Inactive Flows:   %d\n", all_flow_count - active_flow_count);
+    }
     
-    printf("\n=============================================================\n\n");
+    if (csv_fp) {
+        fclose(csv_fp);
+        if (!quiet_mode) {
+            printf("\nFeatures exported to CSV file: %s\n", csv_file);
+        } else {
+            printf("Features exported to CSV file: %s\n", csv_file);
+        }
+    }
+    
+    if (!quiet_mode) {
+        printf("\n=============================================================\n\n");
+    }
 }
 
 // 打印使用帮助
@@ -908,11 +1164,13 @@ void print_usage(const char *prog_name) {
            DEFAULT_CLEANUP_INTERVAL);
     printf("  -t, --threads <count>       Number of worker threads (default: %d)\n",
            DEFAULT_NUM_THREADS);
+    printf("  -o, --output <csv-file>     Export features to CSV file\n");
+    printf("  -q, --quiet                 Quiet mode, don't print statistics to screen\n");
     printf("  -h, --help                  Show this help message\n");
 }
 
 int main(int argc, char **argv) {
-    const char *ifname = "eth0";  // Default interface
+    const char *ifname = "enp1s0";  // Default interface
     const char *pcap_file = NULL;
     int c;
     int ret = 0;
@@ -925,11 +1183,11 @@ int main(int argc, char **argv) {
     ret = check_single_instance();
     if (ret > 0) {
         // 已有实例运行
-        fprintf(stderr, "程序已有一个实例在运行，退出...\n");
+        fprintf(stderr, "Another instance is already running\n");
         return 1;
     } else if (ret < 0) {
         // 错误
-        fprintf(stderr, "检查单实例失败，继续运行...\n");
+        fprintf(stderr, "Failed to check single instance, continuing...\n");
         // 继续运行，因为这不是致命错误
     }
 
@@ -941,11 +1199,13 @@ int main(int argc, char **argv) {
         {"packets",       required_argument, 0, 'p'},
         {"cleanup",       required_argument, 0, 'c'},
         {"threads",       required_argument, 0, 't'},
+        {"output",        required_argument, 0, 'o'},
+        {"quiet",         no_argument,       0, 'q'},
         {"help",          no_argument,       0, 'h'},
         {0, 0, 0, 0}
     };
 
-    while ((c = getopt_long(argc, argv, "i:r:d:s:p:c:t:h", long_options, NULL)) != -1) {
+    while ((c = getopt_long(argc, argv, "i:r:d:s:p:c:t:o:qh", long_options, NULL)) != -1) {
         switch (c) {
             case 'i':
                 ifname = optarg;
@@ -997,6 +1257,14 @@ int main(int argc, char **argv) {
                     num_threads = MAX_NUM_THREADS;
                 }
                 printf("Setting worker thread count to %d\n", num_threads);
+                break;
+            case 'o':
+                csv_file = optarg;
+                printf("Will export flow features to CSV file: %s\n", csv_file);
+                break;
+            case 'q':
+                quiet_mode = 1;
+                printf("Quiet mode enabled, statistics will not be printed to screen\n");
                 break;
             case 'h':
                 print_usage(argv[0]);
