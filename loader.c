@@ -151,20 +151,211 @@ typedef struct {
     } transport_header;
 } packet_data_t;
 
-// 数据包队列
+// 无锁队列结构 - 使用原子操作确保线程安全
 typedef struct {
     packet_data_t *packets;          // 数据包缓冲区
-    int front;                        // 队列前端
-    int rear;                         // 队列尾部
-    int size;                         // 队列大小
-    int capacity;                     // 队列容量 
-    pthread_mutex_t mutex;            // 保护队列的互斥锁
-    pthread_cond_t not_empty;         // 队列非空条件变量
-    pthread_cond_t not_full;          // 队列非满条件变量
-} packet_queue_t;
+    volatile uint64_t head;          // 队列头部索引（读位置）
+    volatile uint64_t tail;          // 队列尾部索引（写位置）
+    volatile uint64_t capacity;      // 队列容量
+    volatile uint64_t mask;          // 容量掩码（用于快速取模）
+    volatile int expanding;          // 扩容标志
+    packet_data_t *new_packets;     // 新缓冲区（扩容时使用）
+    volatile uint64_t new_capacity;  // 新容量
+} lockfree_queue_t;
 
 // 全局数据包队列
-static packet_queue_t packet_queue;
+static lockfree_queue_t packet_queue;
+
+// 确保队列容量是2的幂次，便于位运算优化
+static uint64_t next_power_of_2(uint64_t n) {
+    n--;
+    n |= n >> 1;
+    n |= n >> 2;
+    n |= n >> 4;
+    n |= n >> 8;
+    n |= n >> 16;
+    n |= n >> 32;
+    return n + 1;
+}
+
+// 初始化无锁队列
+static void packet_queue_init(lockfree_queue_t *queue, int initial_capacity) {
+    uint64_t capacity = next_power_of_2(initial_capacity);
+    
+    queue->packets = (packet_data_t *)aligned_alloc(64, capacity * sizeof(packet_data_t));
+    if (!queue->packets) {
+        fprintf(stderr, "Failed to allocate packet queue\n");
+        exit(EXIT_FAILURE);
+    }
+    
+    queue->head = 0;
+    queue->tail = 0;
+    queue->capacity = capacity;
+    queue->mask = capacity - 1;
+    queue->expanding = 0;
+    queue->new_packets = NULL;
+    queue->new_capacity = 0;
+    
+    // 预热缓存
+    memset(queue->packets, 0, capacity * sizeof(packet_data_t));
+}
+
+// 销毁无锁队列
+static void packet_queue_destroy(lockfree_queue_t *queue) {
+    if (queue->packets) {
+        free(queue->packets);
+        queue->packets = NULL;
+    }
+    if (queue->new_packets) {
+        free(queue->new_packets);
+        queue->new_packets = NULL;
+    }
+}
+
+// 扩容队列 - 当队列接近满时触发
+static int expand_queue(lockfree_queue_t *queue) {
+    // 使用CAS操作确保只有一个线程进行扩容
+    if (!__sync_bool_compare_and_swap(&queue->expanding, 0, 1)) {
+        return 0; // 其他线程正在扩容
+    }
+    
+    uint64_t new_capacity = queue->capacity * 2;
+    packet_data_t *new_packets = (packet_data_t *)aligned_alloc(64, new_capacity * sizeof(packet_data_t));
+    
+    if (!new_packets) {
+        queue->expanding = 0;
+        return -1; // 扩容失败
+    }
+    
+    // 复制现有数据到新缓冲区
+    uint64_t head = queue->head;
+    uint64_t tail = queue->tail;
+    uint64_t old_mask = queue->mask;
+    
+    for (uint64_t i = head; i != tail; i++) {
+        uint64_t old_idx = i & old_mask;
+        uint64_t new_idx = i & (new_capacity - 1);
+        memcpy(&new_packets[new_idx], &queue->packets[old_idx], sizeof(packet_data_t));
+    }
+    
+    // 原子更新队列参数
+    queue->new_packets = new_packets;
+    queue->new_capacity = new_capacity;
+    
+    // 内存屏障确保所有写操作完成
+    __sync_synchronize();
+    
+    // 切换到新缓冲区
+    packet_data_t *old_packets = queue->packets;
+    queue->packets = new_packets;
+    queue->capacity = new_capacity;
+    queue->mask = new_capacity - 1;
+    queue->new_packets = NULL;
+    queue->new_capacity = 0;
+    
+    // 清理旧缓冲区
+    free(old_packets);
+    
+    queue->expanding = 0;
+    return 0;
+}
+
+// 无锁入队操作
+static int packet_queue_enqueue(lockfree_queue_t *queue, const packet_data_t *packet) {
+    if (!running) return -1;
+    
+    uint64_t tail, head, next_tail;
+    int retry_count = 0;
+    const int max_retries = 1000;
+    
+    while (retry_count < max_retries && running) {
+        tail = queue->tail;
+        head = queue->head;
+        next_tail = tail + 1;
+        
+        // 检查队列是否接近满（留一些缓冲空间）
+        if (next_tail - head >= queue->capacity - 1) {
+            // 尝试扩容
+            if (queue->expanding == 0) {
+                expand_queue(queue);
+            }
+            // 短暂等待后重试
+            usleep(1);
+            retry_count++;
+            continue;
+        }
+        
+        // 尝试原子更新tail
+        if (__sync_bool_compare_and_swap(&queue->tail, tail, next_tail)) {
+            // 成功获得写入位置，复制数据
+            uint64_t idx = tail & queue->mask;
+            PREFETCH_RW(&queue->packets[idx]);
+            memcpy(&queue->packets[idx], packet, sizeof(packet_data_t));
+            
+            // 内存屏障确保数据写入完成
+            __sync_synchronize();
+            return 0;
+        }
+        
+        // CAS失败，CPU yield后重试
+        __asm__ __volatile__("pause" ::: "memory");
+        retry_count++;
+    }
+    
+    // 达到最大重试次数，这种情况下我们仍不丢包，等待一段时间后继续
+    if (running) {
+        usleep(10); // 等待10微秒
+        return packet_queue_enqueue(queue, packet); // 递归重试
+    }
+    
+    return -1;
+}
+
+// 无锁出队操作
+static int packet_queue_dequeue(lockfree_queue_t *queue, packet_data_t *packet) {
+    uint64_t head, tail, next_head;
+    int retry_count = 0;
+    const int max_retries = 100;
+    
+    while (retry_count < max_retries && running) {
+        head = queue->head;
+        tail = queue->tail;
+        next_head = head + 1;
+        
+        // 检查队列是否为空
+        if (head == tail) {
+            // 队列为空，短暂等待
+            usleep(1);
+            retry_count++;
+            continue;
+        }
+        
+        // 尝试原子更新head
+        if (__sync_bool_compare_and_swap(&queue->head, head, next_head)) {
+            // 成功获得读取位置，复制数据
+            uint64_t idx = head & queue->mask;
+            PREFETCH(&queue->packets[idx]);
+            memcpy(packet, &queue->packets[idx], sizeof(packet_data_t));
+            
+            // 内存屏障确保数据读取完成
+            __sync_synchronize();
+            return 0;
+        }
+        
+        // CAS失败，CPU yield后重试
+        __asm__ __volatile__("pause" ::: "memory");
+        retry_count++;
+    }
+    
+    return running ? 0 : -1; // 如果仍在运行，返回0表示可以继续尝试
+}
+
+// 获取队列当前大小（近似值，用于监控）
+static uint64_t packet_queue_size(lockfree_queue_t *queue) {
+    uint64_t tail = queue->tail;
+    uint64_t head = queue->head;
+    return tail - head;
+}
 
 // 线程相关
 static pthread_t *worker_threads = NULL;
@@ -194,92 +385,6 @@ struct perf_buffer_opts opts = {
 // Add a global flag to track if cleanup has been done
 static int cleanup_done = 0;
 
-// 初始化数据包队列
-static void packet_queue_init(packet_queue_t *queue, int capacity) {
-    queue->packets = (packet_data_t *)malloc(capacity * sizeof(packet_data_t));
-    if (!queue->packets) {
-        fprintf(stderr, "Failed to allocate packet queue\n");
-        exit(EXIT_FAILURE);
-    }
-    
-    queue->front = 0;
-    queue->rear = -1;
-    queue->size = 0;
-    queue->capacity = capacity;
-    
-    pthread_mutex_init(&queue->mutex, NULL);
-    pthread_cond_init(&queue->not_empty, NULL);
-    pthread_cond_init(&queue->not_full, NULL);
-}
-
-// 销毁数据包队列
-static void packet_queue_destroy(packet_queue_t *queue) {
-    if (queue->packets) {
-        free(queue->packets);
-        queue->packets = NULL;
-    }
-    
-    pthread_mutex_destroy(&queue->mutex);
-    pthread_cond_destroy(&queue->not_empty);
-    pthread_cond_destroy(&queue->not_full);
-}
-
-// 将数据包添加到队列
-static int packet_queue_enqueue(packet_queue_t *queue, const packet_data_t *packet) {
-    pthread_mutex_lock(&queue->mutex);
-    
-    // 队列已满，等待队列有空间
-    while (queue->size == queue->capacity && running) {
-        pthread_cond_wait(&queue->not_full, &queue->mutex);
-    }
-    
-    // 如果程序不再运行，退出
-    if (!running) {
-        pthread_mutex_unlock(&queue->mutex);
-        return -1;
-    }
-    
-    // 添加数据包到队列
-    queue->rear = (queue->rear + 1) % queue->capacity;
-    PREFETCH_RW(&queue->packets[queue->rear]);
-    memcpy(&queue->packets[queue->rear], packet, sizeof(packet_data_t));
-    queue->size++;
-    
-    // 通知等待的消费者
-    pthread_cond_signal(&queue->not_empty);
-    pthread_mutex_unlock(&queue->mutex);
-    
-    return 0;
-}
-
-// 从队列中获取数据包
-static int packet_queue_dequeue(packet_queue_t *queue, packet_data_t *packet) {
-    pthread_mutex_lock(&queue->mutex);
-    
-    // 队列为空，等待队列有数据
-    while (queue->size == 0 && running) {
-        pthread_cond_wait(&queue->not_empty, &queue->mutex);
-    }
-    
-    // 如果程序不再运行且队列为空，退出
-    if (!running && queue->size == 0) {
-        pthread_mutex_unlock(&queue->mutex);
-        return -1;
-    }
-    
-    // 从队列中获取数据包
-    PREFETCH(&queue->packets[queue->front]);
-    memcpy(packet, &queue->packets[queue->front], sizeof(packet_data_t));
-    queue->front = (queue->front + 1) % queue->capacity;
-    queue->size--;
-    
-    // 通知等待的生产者
-    pthread_cond_signal(&queue->not_full);
-    pthread_mutex_unlock(&queue->mutex);
-    
-    return 0;
-}
-
 // 线程安全版本的流表访问函数
 static void thread_safe_process_packet(const struct iphdr *ip, const void *transport_hdr) {
     pthread_mutex_lock(&flow_table_mutex);
@@ -294,21 +399,39 @@ static void thread_safe_process_packet(const struct iphdr *ip, const void *trans
 // 工作线程函数，从队列中获取数据包并处理
 static void *worker_thread_func(void *arg) {
     packet_data_t packet;
+    int idle_count = 0;
+    const int max_idle = 1000; // 最大空闲次数
     
     while (running) {
         // 从队列中获取数据包
-        if (packet_queue_dequeue(&packet_queue, &packet) != 0) {
-            // 队列获取失败，检查是否应该退出
+        int result = packet_queue_dequeue(&packet_queue, &packet);
+        
+        if (result == 0) {
+            // 成功获取数据包，重置空闲计数
+            idle_count = 0;
+            
+            // 预取数据包内容以提高性能
+            PREFETCH(&packet.ip_header);
+            PREFETCH(&packet.transport_header);
+            
+            // 处理数据包
+            thread_safe_process_packet(&packet.ip_header, &packet.transport_header);
+        } else {
+            // 队列为空或出错，增加空闲计数
+            idle_count++;
+            
+            // 如果空闲时间过长，让出CPU
+            if (idle_count > max_idle) {
+                usleep(100); // 100微秒
+                idle_count = 0;
+            } else {
+                // 短暂yield
+                __asm__ __volatile__("pause" ::: "memory");
+            }
+            
+            // 检查是否应该退出
             if (!running) break;
-            continue;
         }
-        
-        // 预取数据包内容以提高性能
-        PREFETCH(&packet.ip_header);
-        PREFETCH(&packet.transport_header);
-        
-        // 处理数据包
-        thread_safe_process_packet(&packet.ip_header, &packet.transport_header);
     }
     
     return NULL;
@@ -577,10 +700,6 @@ static void stop_worker_threads() {
     // 设置运行标志为停止
     running = 0;
     
-    // 唤醒所有等待队列的线程
-    pthread_cond_broadcast(&packet_queue.not_empty);
-    pthread_cond_broadcast(&packet_queue.not_full);
-    
     // 等待所有工作线程退出
     for (int i = 0; i < num_threads; i++) {
         pthread_join(worker_threads[i], NULL);
@@ -836,7 +955,7 @@ int process_pcap_file(const char *pcap_file) {
         printf("Waiting for packet processing to complete...\n");
     }
     
-    while (packet_queue.size > 0 && running) {
+    while (packet_queue_size(&packet_queue) > 0 && running) {
         usleep(10000); // 10ms
     }
     
@@ -992,7 +1111,7 @@ int run_live_capture(const char *ifname) {
     printf("Exiting program...\n");
     
     // 等待队列处理完所有数据包
-    while (packet_queue.size > 0 && running) {
+    while (packet_queue_size(&packet_queue) > 0 && running) {
         usleep(10000); // 10ms
     }
     
