@@ -11,6 +11,11 @@
 #include <sys/file.h>
 #include <pthread.h>  // 添加pthread库支持
 
+// System monitoring headers
+#include <sys/resource.h>
+#include <sys/times.h>
+#include <sys/sysinfo.h>
+
 // System and network headers
 #include <arpa/inet.h>
 #include <net/if.h>
@@ -59,6 +64,21 @@ const char *ANSI_RESTORE_CURSOR = "\033[u";         // 恢复光标位置
 const char *ANSI_HIDE_CURSOR = "\033[?25l";      // 隐藏光标
 const char *ANSI_SHOW_CURSOR = "\033[?25h";      // 显示光标
 
+// System statistics structure
+typedef struct {
+    double cpu_usage;           // CPU使用率 (%)
+    double memory_usage;        // 内存使用率 (%)
+    uint64_t packets_processed; // 已处理的数据包数量
+    double processing_time;     // 处理时间 (秒)
+    uint64_t packets_per_second; // 每秒处理的数据包数
+} system_stats_t;
+
+// Global system statistics
+static system_stats_t system_stats = {0};
+static clock_t start_cpu_time;
+static clock_t start_wall_time;
+static struct timespec program_start_time;
+
 // 全局变量以跟踪终端模式
 int in_place_updates = 1;  // 默认启用原位更新
 int first_stats_print = 1; // 第一次打印标志
@@ -68,6 +88,7 @@ volatile int running = 1;
 
 // 函数前向声明
 void print_final_stats(void);
+static void stop_worker_threads(void);
 
 // flow_table_initialized是flow.c中的变量，我们在这里声明为外部变量
 extern int flow_table_initialized;
@@ -332,46 +353,135 @@ static void *stats_thread_func(void *arg) {
 }
 
 static void cleanup(void) {
-    // 确保终端光标可见
-    if (in_place_updates) {
-        printf("%s", ANSI_SHOW_CURSOR);
+    if (cleanup_done) {
+        return;
     }
+    cleanup_done = 1;
     
-    // 如果流表已初始化，打印最终统计信息
-    if (!cleanup_done && flow_table_initialized) {
-        print_final_stats();
-    }
-    
-    // 清理流表
-    if (!cleanup_done) {
-        cleanup_done = 1;
-        flow_table_destroy();
-    }
-    
-    // 释放文件锁
-    if (lock_fd != -1) {
-        flock(lock_fd, LOCK_UN);
-        close(lock_fd);
-        lock_fd = -1;
+    // 停止worker线程
+    if (worker_threads != NULL) {
+        stop_worker_threads();
+        free(worker_threads);
+        worker_threads = NULL;
     }
     
     // 销毁数据包队列
     packet_queue_destroy(&packet_queue);
     
-    // 释放线程资源
-    if (worker_threads) {
-        free(worker_threads);
-        worker_threads = NULL;
+    // Cleanup flow table
+    if (flow_table_initialized) {
+        print_final_stats();
+        flow_table_destroy();
+    }
+    
+    // Close lock file
+    if (lock_fd != -1) {
+        flock(lock_fd, LOCK_UN);
+        close(lock_fd);
+        unlink(LOCK_FILE);
+        lock_fd = -1;
+    }
+}
+
+// Initialize system monitoring
+static void init_system_monitoring(void) {
+    start_cpu_time = clock();
+    start_wall_time = clock();
+    clock_gettime(CLOCK_REALTIME, &program_start_time);
+    system_stats.packets_processed = 0;
+    system_stats.cpu_usage = 0.0;
+    system_stats.memory_usage = 0.0;
+    system_stats.processing_time = 0.0;
+    system_stats.packets_per_second = 0;
+}
+
+// Get current CPU usage
+static double get_cpu_usage(void) {
+    struct rusage usage;
+    if (getrusage(RUSAGE_SELF, &usage) != 0) {
+        return 0.0;
+    }
+    
+    // 计算用户态和内核态CPU时间
+    double user_time = usage.ru_utime.tv_sec + usage.ru_utime.tv_usec / 1000000.0;
+    double sys_time = usage.ru_stime.tv_sec + usage.ru_stime.tv_usec / 1000000.0;
+    double total_cpu_time = user_time + sys_time;
+    
+    // 计算程序运行的总时间
+    struct timespec current_time;
+    clock_gettime(CLOCK_REALTIME, &current_time);
+    double elapsed_time = (current_time.tv_sec - program_start_time.tv_sec) + 
+                         (current_time.tv_nsec - program_start_time.tv_nsec) / 1000000000.0;
+    
+    if (elapsed_time > 0) {
+        return (total_cpu_time / elapsed_time) * 100.0;
+    }
+    return 0.0;
+}
+
+// Get current memory usage
+static double get_memory_usage(void) {
+    struct rusage usage;
+    if (getrusage(RUSAGE_SELF, &usage) != 0) {
+        return 0.0;
+    }
+    
+    // ru_maxrss在Linux上以KB为单位
+    long memory_kb = usage.ru_maxrss;
+    
+    // 获取系统总内存
+    struct sysinfo si;
+    if (sysinfo(&si) != 0) {
+        return 0.0;
+    }
+    
+    // 转换为MB并计算百分比
+    double memory_mb = memory_kb / 1024.0;
+    double total_memory_mb = si.totalram / (1024.0 * 1024.0);
+    
+    if (total_memory_mb > 0) {
+        return (memory_mb / total_memory_mb) * 100.0;
+    }
+    return 0.0;
+}
+
+// Update system statistics
+static void update_system_stats(void) {
+    system_stats.cpu_usage = get_cpu_usage();
+    system_stats.memory_usage = get_memory_usage();
+    system_stats.packets_processed = total_packets_processed;
+    
+    // 计算处理时间
+    struct timespec current_time;
+    clock_gettime(CLOCK_REALTIME, &current_time);
+    system_stats.processing_time = (current_time.tv_sec - program_start_time.tv_sec) + 
+                                  (current_time.tv_nsec - program_start_time.tv_nsec) / 1000000000.0;
+    
+    // 计算每秒处理的数据包数
+    if (system_stats.processing_time > 0) {
+        system_stats.packets_per_second = (uint64_t)(system_stats.packets_processed / system_stats.processing_time);
     }
 }
 
 void sig_handler(int sig) {
-    printf("\nReceived signal %d. Cleaning up and exiting...\n", sig);
-    running = 0;
+    static int signal_count = 0;
+    signal_count++;
     
-    // 唤醒所有等待队列的线程
-    pthread_cond_broadcast(&packet_queue.not_empty);
-    pthread_cond_broadcast(&packet_queue.not_full);
+    if (signal_count == 1) {
+        printf("\nReceived signal %d, initiating graceful shutdown...\n", sig);
+        running = 0;
+        
+        if (flow_table_initialized) {
+            print_final_stats();
+        }
+        
+        // Give some time for threads to finish
+        sleep(1);
+        alarm(5); // Set a 5-second timeout
+    } else {
+        printf("\nForcing immediate exit...\n");
+        exit(1);
+    }
 }
 
 // 检查是否已经有实例在运行
@@ -979,6 +1089,17 @@ static int compare_flows_by_time(const void *a, const void *b) {
 void print_final_stats(void) {
     time_t current_time = time(NULL);
     
+    // Update and print system statistics first
+    update_system_stats();
+    
+    printf("\n=== System Performance Statistics ===\n");
+    printf("CPU Usage:              %.2f%%\n", system_stats.cpu_usage);
+    printf("Memory Usage:           %.2f%%\n", system_stats.memory_usage);
+    printf("Packets Processed:      %lu\n", system_stats.packets_processed);
+    printf("Processing Time:        %.2f seconds\n", system_stats.processing_time);
+    printf("Packets per Second:     %lu\n", system_stats.packets_per_second);
+    printf("======================================\n");
+    
     // 收集总数据包和字节统计
     uint64_t total_packets = 0;
     uint64_t total_bytes = 0;
@@ -1316,6 +1437,12 @@ int main(int argc, char **argv) {
     // Setup signal handlers
     signal(SIGINT, sig_handler);
     signal(SIGTERM, sig_handler);
+    
+    // Initialize system monitoring
+    init_system_monitoring();
+    
+    // Register cleanup function for normal exit
+    atexit(cleanup);
     
     // 检查是否已经有实例在运行
     ret = check_single_instance();

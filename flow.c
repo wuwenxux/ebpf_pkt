@@ -471,7 +471,7 @@ static int should_segment_tcp_flow(struct flow_stats *stats, uint8_t new_flags) 
 #else
     // 检查基于空闲时间的分段
 #if TCP_SEGMENT_ON_IDLE
-    uint64_t now = get_current_time();
+            uint64_t now = get_current_time();
     // 检查空闲超时
     if (now - stats->last_seen > TCP_IDLE_TIMEOUT_NS) {
         return 1; // 流空闲超时，应该创建新流
@@ -616,7 +616,7 @@ void print_simple_stats() {
     // 计算活跃流的总数据包和字节数
     for (int i = 0; i < HASH_TABLE_SIZE; i++) {
         struct flow_node *node = flow_table[i];
-        while (node) {
+    while (node) {
             // 检查流是否超时
             uint64_t timeout = FLOW_TIMEOUT_NS;
             if (node->key.protocol == IPPROTO_TCP) {
@@ -629,7 +629,7 @@ void print_simple_stats() {
                 total_bytes += node->stats.fwd_bytes + node->stats.bwd_bytes;
             }
             
-            node = node->next;
+        node = node->next;
         }
     }
     

@@ -524,7 +524,7 @@ int send_flow_data(const char *server_addr, int port, bool include_inactive) {
             // 如果不包括非活跃流，则跳过超时的流
             if (!include_inactive && !is_active) {
                 node = node->next;
-                continue;
+            continue;
             }
             
             // 检查是否需要扩展数组
@@ -569,7 +569,7 @@ int send_flow_data(const char *server_addr, int port, bool include_inactive) {
     char hostname[256];
     if (gethostname(hostname, sizeof(hostname)) == 0) {
         flow_batch.sender_id = hostname;
-    } else {
+            } else {
         flow_batch.sender_id = "unknown";
     }
     
@@ -809,9 +809,9 @@ int send_flow_data_from_csv(const char *csv_file, const char *server_addr, int p
                     free_flow_pb(pb_flows[j]);
                 }
                 free(pb_flows);
-                close(sock);
+        close(sock);
                 fclose(file);
-                return -1;
+        return -1;
             }
             pb_flows = new_flows;
         }
@@ -984,11 +984,11 @@ void stop_flow_sender() {
     pthread_mutex_lock(&sender_mutex);
     
     if (sender_running) {
-        sender_running = 0;
+    sender_running = 0;
         pthread_mutex_unlock(&sender_mutex);
-        
+    
         // 等待线程结束
-        pthread_join(sender_thread, NULL);
+    pthread_join(sender_thread, NULL);
         return;
     }
     
