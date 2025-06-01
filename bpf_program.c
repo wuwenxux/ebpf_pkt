@@ -57,10 +57,21 @@ struct {
 
 
 static __always_inline int is_valid_packet(struct iphdr *ip) {
+    // 检查IP地址是否有效（排除0.0.0.0和广播地址）
     if (ip->saddr == 0 || ip->daddr == 0 || 
         ip->saddr == 0xFFFFFFFF || ip->daddr == 0xFFFFFFFF)
         return 0;
     
+    // 检查是否为多播地址（224.0.0.0/4）
+    if ((bpf_ntohl(ip->daddr) & 0xF0000000) == 0xE0000000)
+        return 0;
+    
+    // 检查是否为链路本地地址（169.254.0.0/16）
+    if ((bpf_ntohl(ip->saddr) & 0xFFFF0000) == 0xA9FE0000 ||
+        (bpf_ntohl(ip->daddr) & 0xFFFF0000) == 0xA9FE0000)
+        return 0;
+    
+    // 检查协议类型
     switch (ip->protocol) {
         case IPPROTO_TCP:
         case IPPROTO_UDP:
@@ -70,8 +81,13 @@ static __always_inline int is_valid_packet(struct iphdr *ip) {
             return 0;
     }
     
+    // 检查包长度
     __u16 len = bpf_ntohs(ip->tot_len);
     if (len < sizeof(struct iphdr) || len > 1500)
+        return 0;
+    
+    // 检查IP头部长度
+    if (ip->ihl < 5)
         return 0;
     
     return 1;
@@ -154,6 +170,11 @@ int xdp_packet_capture(struct xdp_md *ctx) {
             pkt.src_port = bpf_ntohs(*(__be16 *)trans_start);
             pkt.dst_port = bpf_ntohs(*(__be16 *)(trans_start + 2));
             
+            // 验证端口号是否有效（排除端口0）
+            if (pkt.src_port == 0 && pkt.dst_port == 0) {
+                return XDP_DROP;  // 丢弃无效端口的包
+            }
+            
             // 特殊处理TCP头和标志位
             if (ip->protocol == IPPROTO_TCP) {
                 struct tcphdr *tcp = (struct tcphdr *)trans_start;
@@ -186,6 +207,9 @@ int xdp_packet_capture(struct xdp_md *ctx) {
                     }
                 }
             }
+        } else {
+            // 无法读取端口信息，丢弃包
+            return XDP_DROP;
         }
     }
 
