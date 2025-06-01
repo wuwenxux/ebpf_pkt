@@ -17,44 +17,77 @@
 #include <netinet/tcp.h>
 #include <netinet/udp.h>
 
-// 增加流超时时间，确保短期流不会过快删除
-#define FLOW_TIMEOUT_NS 9999999999999 // 普通流不超时
+// =================== 流管理参数 ===================
 
-// TCP流使用特殊的超时时间，显著短于一般超时
-#define TCP_FLOW_TIMEOUT_NS 1500000000 // 1.5sTCP流超时
+// 流超时配置
+#define FLOW_TIMEOUT_NS (40 * 1000000000ULL)    // 流过期时间 (40秒)
+#define TCP_FLOW_TIMEOUT_NS (30 * 1000000000ULL) // TCP流30秒超时
+
+// cicflowmeter 活跃超时配置
+#define ACTIVE_TIMEOUT_NS (5 * 1000000ULL)       // 活跃超时时间 (5毫秒 = 0.005秒)
+#define CLUMP_TIMEOUT_NS (1 * 1000000000ULL)     // 集群超时时间 (1秒)，用于子流和批量传输分割
+#define BULK_BOUND 4                             // 批量传输阈值 (4个数据包)
 
 // TCP流分段设置
-#define TCP_SEGMENT_ON_IDLE 1      // 空闲超时时分段（已关闭）
-#define TCP_IDLE_TIMEOUT_NS 500000000 // 0.5秒无活动视为空闲
+#define TCP_SEGMENT_ON_IDLE 1               // 空闲超时时分段
+#define TCP_IDLE_TIMEOUT_NS (1 * 1000000000ULL) // TCP空闲超时 (1秒)
 
 // TCP标志位分段设置
-#define TCP_SEGMENT_ON_FLAGS 0     // 根据TCP标志位分段（已关闭）
-#define TCP_FLAGS_THRESH 10        // 10个标志位变化视为新的子流
+#define TCP_SEGMENT_ON_FLAGS 1              // 根据TCP标志位分段（启用）
+#define TCP_FLAGS_THRESH 10                 // 10个标志位变化视为新的子流
 
-// 启用流清理，但只对TCP流应用更短的超时
+// 启用流清理
 #define ENABLE_FLOW_CLEANUP 1
 
 // Initial window size for TCP (number of packets to consider)
 #define INITIAL_WINDOW_SIZE 10
 
-// 以下是流识别配置选项，关闭过度细分的特征
+// 流识别配置选项
 #define CAPTURE_TOS 0          // 关闭TOS/DSCP字段区分
 #define CAPTURE_TTL 0          // 关闭TTL字段区分
 #define CAPTURE_TCP_WIN 0      // 关闭TCP窗口大小区分
 #define CAPTURE_TCP_OPTIONS 0  // 关闭TCP选项区分
 #define FINE_GRAINED_FLOWS 0   // 关闭细粒度流识别
 
-// 定义更宽松的流识别，忽略端口信息
+// 流识别参数
 #define IGNORE_PORTS 0         // 设置为1将忽略端口号，只用IP和协议识别流
 
-// 流活跃性检查，确保将所有活跃流计入统计
+// 流活跃性检查
 #define FLOW_ACTIVE_THRESHOLD 0  // 任何数据包都认为流是活跃的
 
-// 从cicflowmeter项目复制的TCP相关参数
-#define EXPIRED_UPDATE 240           // 流过期更新时间（秒）
-#define CLUMP_TIMEOUT 1              // 数据包分组超时（秒）
-#define ACTIVE_TIMEOUT 0.005         // 活跃超时（秒）
-#define BULK_BOUND 4                 // 批量传输边界条件
+// =================== cicflowmeter 流键生成宏 ===================
+
+/**
+ * 检查时间间隔是否超过阈值
+ */
+#define CIC_TIME_DIFF_EXCEEDS(current, last, threshold_ns) \
+    ((current) - (last) > (threshold_ns))
+
+/**
+ * 获取两个时间戳的差值 (纳秒)
+ */
+#define CIC_TIME_DIFF_NS(current, last) \
+    ((current) - (last))
+
+/**
+ * 检查TCP标志是否包含特定位
+ */
+#define CIC_HAS_TCP_FLAG(flags, flag) \
+    (((flags) & (flag)) != 0)
+
+/**
+ * 检查是否为TCP FIN包
+ */
+#define CIC_IS_TCP_FIN(flags) \
+    CIC_HAS_TCP_FLAG(flags, TCP_FIN)
+
+/**
+ * 检查是否为TCP RST包
+ */
+#define CIC_IS_TCP_RST(flags) \
+    CIC_HAS_TCP_FLAG(flags, TCP_RST)
+
+// =================== 原有定义保持不变 ===================
 
 // TCP标志定义
 #define TCP_FIN  0x01
@@ -65,6 +98,32 @@
 #define TCP_URG  0x20
 #define TCP_ECE  0x40
 #define TCP_CWR  0x80
+
+// =================== Wireshark风格TCP对话完整性标志 ===================
+// 基于Wireshark的conversation.h中的对话完整性追踪
+#define TCP_COMPLETENESS_SYNSENT        0x01    // SYN发送
+#define TCP_COMPLETENESS_SYNACK         0x02    // SYN-ACK发送 
+#define TCP_COMPLETENESS_ACK            0x04    // ACK发送
+#define TCP_COMPLETENESS_DATA           0x08    // 数据传输
+#define TCP_COMPLETENESS_FIN            0x10    // FIN发送
+#define TCP_COMPLETENESS_RST            0x20    // RST发送
+
+// TCP对话完整性类型
+#define TCP_CONV_COMPLETE               0x3F    // 完整对话 (所有标志)
+#define TCP_CONV_INCOMPLETE             0x00    // 不完整对话
+#define TCP_CONV_PARTIAL_HANDSHAKE      0x07    // 部分握手 (SYN+SYNACK+ACK)
+#define TCP_CONV_DATA_ONLY              0x08    // 仅数据传输
+
+// =================== Wireshark风格对话状态 ===================
+// 类似packet-tcp.h中的TCP分析状态
+typedef enum {
+    TCP_CONV_UNKNOWN = 0,       // 未知状态
+    TCP_CONV_INIT,              // 初始状态
+    TCP_CONV_ESTABLISHED,       // 已建立连接
+    TCP_CONV_CLOSING,           // 正在关闭
+    TCP_CONV_CLOSED,            // 已关闭
+    TCP_CONV_RESET              // 被重置
+} tcp_conversation_state_t;
 
 // NIPQUAD macro for printing IP addresses
 #define NIPQUAD(addr) \
@@ -211,6 +270,59 @@ struct flow_stats {
     uint32_t flow_max_length;       // 流的最大长度
     double   flow_length_sum;       // 流长度总和
     double   flow_length_sum_squares; // 流长度平方和
+    
+    // =================== cicflowmeter 状态管理字段 ===================
+    
+    // 流状态管理 (cicflowmeter 兼容)
+    uint64_t last_activity_time;            // 最后活跃时间 (纳秒)
+    uint32_t packet_count;                  // 总包数计数器
+    uint32_t subflow_count;                 // 子流计数
+    
+    // 批量传输特性字段 (新的 cicflowmeter 实现)
+    uint64_t fwd_bulk_bytes;                // 前向批量传输字节数
+    uint32_t fwd_bulk_packets;              // 前向批量传输包数
+    uint32_t fwd_bulk_state_count;          // 前向批量传输状态计数
+    uint64_t fwd_bulk_duration_ns;          // 前向批量传输持续时间
+    uint64_t fwd_bulk_start;                // 前向批量传输开始时间
+    double   fwd_bulk_rate;                 // 前向批量传输速率
+    
+    uint64_t bwd_bulk_bytes;                // 反向批量传输字节数
+    uint32_t bwd_bulk_packets;              // 反向批量传输包数
+    uint32_t bwd_bulk_state_count;          // 反向批量传输状态计数
+    uint64_t bwd_bulk_duration_ns;          // 反向批量传输持续时间
+    uint64_t bwd_bulk_start;                // 反向批量传输开始时间
+    double   bwd_bulk_rate;                 // 反向批量传输速率
+    
+    // 子流管理字段
+    uint64_t last_subflow_time;             // 最后子流时间
+    uint32_t subflow_packets;               // 当前子流包数
+    uint64_t subflow_bytes;                 // 当前子流字节数
+    uint64_t subflow_start;                 // 当前子流开始时间
+    uint64_t subflow_duration_ns;           // 当前子流持续时间
+    
+    // 活跃/空闲时间管理字段
+    uint64_t active_time_ns;                // 累积活跃时间
+    uint64_t idle_time_ns;                  // 累积空闲时间
+    uint64_t active_max_ns;                 // 最大活跃时间
+    uint64_t active_min_ns;                 // 最小活跃时间
+    uint64_t active_mean_ns;                // 平均活跃时间
+    uint64_t idle_max_ns;                   // 最大空闲时间
+    uint64_t idle_min_ns;                   // 最小空闲时间
+    uint64_t idle_mean_ns;                  // 平均空闲时间
+    uint64_t idle_std_ns;                   // 空闲状态标准差
+    
+    // 流分割控制 (cicflowmeter 逻辑)
+    uint64_t last_fin_time;                 // 最后FIN包时间
+    uint8_t  fin_seen;                      // 是否看到FIN包
+    uint8_t  rst_seen;                      // 是否看到RST包
+    
+    // 第一个包的方向 (用于确定正向/反向)
+    uint8_t  first_packet_direction;
+    
+    // 垃圾回收和流管理
+    uint8_t  should_expire;                 // 标记是否应该过期
+    uint8_t  in_garbage_collect;            // 标记是否在垃圾回收中
+    uint8_t  session_completed;             // 标记TCP会话是否已完成（FIN或RST）
 };
 
 // UDP特征统计结构
@@ -274,6 +386,7 @@ struct tcp_flag_features {
 struct flow_features {
     // 基本特征
     double duration;                // 持续时间
+    char start_time_str[64];        // 开始时间字符串(年月日时分秒)
     uint64_t fwd_packets;           // 正向包数
     uint64_t bwd_packets;           // 反向包数 
     uint64_t fwd_bytes;             // 正向字节数
@@ -390,6 +503,14 @@ struct flow_node {
     struct flow_node *next;
     uint8_t in_use;         // 标记是否使用中
     uint8_t tcp_state;      // TCP连接状态
+    
+    // =================== Wireshark风格的对话字段 ===================
+    uint32_t conversation_id;       // 对话ID (类似Wireshark的stream)
+    uint8_t  completeness;          // 对话完整性标志
+    uint64_t first_packet_time;     // 第一个包的时间戳
+    uint64_t last_packet_time;      // 最后一个包的时间戳
+    uint32_t packet_num;            // 流内包序号
+    uint8_t  create_flags;          // 创建时的标志 (SYN/UDP等)
 };
 
 // 大幅增加哈希表大小以减少冲突
@@ -397,19 +518,24 @@ struct flow_node {
 extern struct flow_node* flow_table[HASH_TABLE_SIZE]; // 哈希表
 
 void flow_table_init();
+struct flow_node *flow_table_insert(const struct flow_key *key);
+struct flow_node *flow_table_insert_with_timestamp(const struct flow_key *key, uint64_t packet_timestamp);
+void set_flow_start_time_from_timestamp(struct flow_stats *stats, uint64_t timestamp_ns);
+void ns_to_timespec(uint64_t timestamp_ns, struct timespec *ts);
 void flow_table_destroy();
 void cleanup_flows();
 
 // Time utility function
 double time_diff(const struct timespec *end, const struct timespec *start);
 
-struct flow_stats* get_flow_stats(const struct flow_key *key, int *is_reverse_ptr) ;
-void update_flow_stats(struct flow_stats *stats, uint32_t pkt_size, int is_reverse);
+struct flow_stats* get_flow_stats(const struct flow_key *key, int *is_reverse_ptr, uint64_t packet_timestamp) ;
+void update_flow_stats(struct flow_stats *stats, uint32_t pkt_size, int is_reverse, uint64_t packet_timestamp);
+void reset_flow_stats_for_new_session(struct flow_stats *stats, uint64_t packet_timestamp);
 void update_tcp_flags(struct flow_stats *stats, uint8_t tcp_flags, int is_reverse);
-void update_udp_stats(struct flow_stats *stats, uint32_t pkt_size, int is_reverse);
+void update_udp_stats(struct flow_stats *stats, uint32_t pkt_size, int is_reverse, uint64_t packet_timestamp);
 void calculate_flow_features(const struct flow_stats *stats, struct flow_features *features);
 void print_flow_stats();
-void process_packet(const struct iphdr *ip, const void *transport_hdr);
+void process_packet(const struct iphdr *ip, const void *transport_hdr, uint64_t packet_timestamp);
 int count_active_flows();
 void count_flow_directions(int *forward_flows, int *reverse_flows);
 int count_all_flows();
@@ -427,5 +553,54 @@ void timestamp_array_free(timestamp_array_t *arr);
 void update_flow_bulk(struct flow_stats *stats, uint32_t payload_size, int is_reverse, uint64_t timestamp);
 void update_subflow(struct flow_stats *stats, uint64_t current_time);
 void update_active_idle(struct flow_stats *stats, uint64_t current_time);
+
+// cicflowmeter Integration - Bulk Transfer Threshold
+#define CIC_BULK_BYTE_THRESHOLD   512      // 批量传输阈值 (字节)
+
+// cicflowmeter Integration - Subflow Timeout
+#define CIC_SUBFLOW_TIMEOUT_NS    1000000000ULL   // 子流超时时间 (1秒)
+
+// =================== cicflowmeter 风格的流处理函数 ===================
+void update_subflow_cic(struct flow_stats *stats, uint64_t packet_timestamp);
+void update_active_idle_cic(struct flow_stats *stats, uint64_t current_time_diff);
+void update_flow_bulk_cic(struct flow_stats *stats, uint32_t payload_size, int is_reverse, uint64_t packet_timestamp);
+
+// =================== Wireshark 风格的对话统计函数 ===================
+
+// 对话计数器重置函数 (类似Wireshark的tcp_init())
+void reset_conversation_counters();
+
+// 获取对话计数函数 (类似Wireshark的get_tcp_stream_count())
+uint32_t get_tcp_conversation_count();
+uint32_t get_udp_conversation_count();  
+uint32_t get_total_conversation_count();
+
+// 分配对话ID函数 (类似Wireshark的tcpd->stream = tcp_stream_count++)
+uint32_t assign_tcp_conversation_id();
+uint32_t assign_udp_conversation_id();
+
+// Wireshark风格的流创建函数 (类似find_or_create_conversation)
+struct flow_stats* get_or_create_conversation(const struct flow_key *key, int *is_reverse_ptr, uint64_t packet_timestamp, uint8_t tcp_flags);
+
+// 更新对话完整性函数 (类似Wireshark的completeness tracking)
+void update_conversation_completeness(struct flow_node *node, uint8_t tcp_flags);
+
+// Wireshark风格的统计打印函数
+void print_wireshark_conversation_stats();
+int count_wireshark_tcp_conversations();
+int count_wireshark_udp_conversations();
+int count_wireshark_all_conversations();
+void count_tcp_conversations_by_completeness(int *complete, int *incomplete, int *partial);
+
+// =================== Tshark风格兼容函数声明 ===================
+
+// 统计函数 - 与tshark完全兼容
+int count_tshark_tcp_conversations();       // 统计TCP对话数（与tshark -z conv,tcp一致）
+int count_tshark_udp_conversations();       // 统计UDP对话数（与tshark -z conv,udp一致）
+int count_tshark_ip_conversations();        // 统计IP对话数（与tshark -z conv,ip一致）
+void print_tshark_style_stats();            // 打印tshark风格的统计信息
+
+extern int quiet_mode;       // 安静模式变量
+extern int tshark_stats_mode; // tshark兼容统计模式变量
 
 #endif /* FLOW_H */
