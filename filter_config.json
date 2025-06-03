@@ -1,0 +1,112 @@
+{
+  "filter_config": {
+    "enabled": true,
+    "default_action": "allow",
+    "description": "eBPF packet filter configuration"
+  },
+  "rules": [
+    {
+      "id": 1,
+      "name": "Block malicious IP",
+      "type": "ip",
+      "action": "deny",
+      "priority": 10,
+      "enabled": true,
+      "src_ip": "192.168.1.100",
+      "dst_ip": "",
+      "description": "Block traffic from suspicious IP"
+    },
+    {
+      "id": 2,
+      "name": "Allow HTTP traffic",
+      "type": "port",
+      "action": "allow",
+      "priority": 20,
+      "enabled": true,
+      "src_port_min": 0,
+      "src_port_max": 0,
+      "dst_port_min": 80,
+      "dst_port_max": 80,
+      "protocol": 6,
+      "description": "Allow HTTP traffic on port 80"
+    },
+    {
+      "id": 3,
+      "name": "Allow HTTPS traffic",
+      "type": "port",
+      "action": "allow",
+      "priority": 21,
+      "enabled": true,
+      "src_port_min": 0,
+      "src_port_max": 0,
+      "dst_port_min": 443,
+      "dst_port_max": 443,
+      "protocol": 6,
+      "description": "Allow HTTPS traffic on port 443"
+    },
+    {
+      "id": 4,
+      "name": "Allow SSH traffic",
+      "type": "port",
+      "action": "allow",
+      "priority": 22,
+      "enabled": true,
+      "src_port_min": 0,
+      "src_port_max": 0,
+      "dst_port_min": 22,
+      "dst_port_max": 22,
+      "protocol": 6,
+      "description": "Allow SSH traffic on port 22"
+    },
+    {
+      "id": 5,
+      "name": "Block private network range",
+      "type": "subnet",
+      "action": "deny",
+      "priority": 30,
+      "enabled": false,
+      "src_subnet": "192.168.0.0/16",
+      "dst_subnet": "",
+      "description": "Block traffic from private network range"
+    },
+    {
+      "id": 6,
+      "name": "Allow local network",
+      "type": "subnet",
+      "action": "allow",
+      "priority": 5,
+      "enabled": true,
+      "src_subnet": "192.168.1.0/24",
+      "dst_subnet": "",
+      "description": "Allow traffic from local network"
+    },
+    {
+      "id": 7,
+      "name": "Block high ports",
+      "type": "port",
+      "action": "deny",
+      "priority": 40,
+      "enabled": false,
+      "src_port_min": 0,
+      "src_port_max": 0,
+      "dst_port_min": 8000,
+      "dst_port_max": 9000,
+      "protocol": 0,
+      "description": "Block traffic to high port range 8000-9000"
+    },
+    {
+      "id": 8,
+      "name": "Allow DNS traffic",
+      "type": "port",
+      "action": "allow",
+      "priority": 15,
+      "enabled": true,
+      "src_port_min": 0,
+      "src_port_max": 0,
+      "dst_port_min": 53,
+      "dst_port_max": 53,
+      "protocol": 17,
+      "description": "Allow DNS traffic on port 53 (UDP)"
+    }
+  ]
+} 

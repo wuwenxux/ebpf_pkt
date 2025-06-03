@@ -17,13 +17,14 @@ BPF_CFLAGS = -g -O2 -target bpf -D__TARGET_ARCH_$(ARCH) \
 # Application CFLAGS and LDFLAGS
 CFLAGS += -g -O2 -Wall -I$(LIBBPF_SRC)
 LDLIBS := -lelf -lz -lbpf -lm -lpcap
+JSON_LDLIBS := $(LDLIBS) -lcjson
 
 # 确定正确的库路径
 LIB64_DIR := /usr/lib64
 LIB_DIR := /usr/lib
 
 # Main target
-all: bpf_program.o loader
+all: bpf_program.o loader filter_manager filter_json_manager
 
 # BPF program compilation
 bpf_program.o: bpf_program.c
@@ -33,6 +34,14 @@ bpf_program.o: bpf_program.c
 loader: loader.c flow.c mempool.c
 	$(CC) $(CFLAGS) -o $@ $^ $(LDLIBS)
 
+# Filter manager application
+filter_manager: filter_manager.c
+	$(CC) $(CFLAGS) -o $@ $^ $(LDLIBS)
+
+# JSON Filter manager application
+filter_json_manager: filter_json_manager.c
+	$(CC) $(CFLAGS) -o $@ $^ $(JSON_LDLIBS)
+
 # 添加运行时路径信息
 fix_rpath:
 	@if [ -f loader ]; then \
@@ -41,6 +50,22 @@ fix_rpath:
 			patchelf --set-rpath $(LIB64_DIR) loader; \
 		else \
 			patchelf --set-rpath $(LIB_DIR) loader; \
+		fi; \
+	fi
+	@if [ -f filter_manager ]; then \
+		echo "添加运行时库搜索路径到过滤器管理程序..."; \
+		if [ -d $(LIB64_DIR) ]; then \
+			patchelf --set-rpath $(LIB64_DIR) filter_manager; \
+		else \
+			patchelf --set-rpath $(LIB_DIR) filter_manager; \
+		fi; \
+	fi
+	@if [ -f filter_json_manager ]; then \
+		echo "添加运行时库搜索路径到JSON过滤器管理程序..."; \
+		if [ -d $(LIB64_DIR) ]; then \
+			patchelf --set-rpath $(LIB64_DIR) filter_json_manager; \
+		else \
+			patchelf --set-rpath $(LIB_DIR) filter_json_manager; \
 		fi; \
 	fi
 
@@ -89,9 +114,13 @@ install_all: check_privileges
 	
 	@echo "=== 安装应用程序 ==="
 	sudo install -m 755 loader /usr/bin/ebpf_pkt
+	sudo install -m 755 filter_manager /usr/bin/ebpf_filter
+	sudo install -m 755 filter_json_manager /usr/bin/ebpf_filter_json
 	sudo mkdir -p /usr/share/ebpf_pkt
 	sudo install -m 644 bpf_program.o /usr/share/ebpf_pkt/
 	@echo "安装完成! 可以使用 'ebpf_pkt' 命令运行程序"
+	@echo "可以使用 'ebpf_filter' 命令管理过滤规则"
+	@echo "可以使用 'ebpf_filter_json' 命令管理 JSON 过滤规则"
 	@echo ""
 	@echo "如果仍然有库问题，请尝试运行:"
 	@echo "export LD_LIBRARY_PATH=\$$LD_LIBRARY_PATH:/usr/lib64:/usr/lib"
@@ -112,6 +141,6 @@ wrapper:
 	@echo "创建了启动脚本 ebpf_pkt.sh - 使用这个来运行程序"
 
 clean:
-	rm -f *.o loader ebpf_pkt.sh
+	rm -f *.o loader filter_manager filter_json_manager ebpf_pkt.sh
 
 .PHONY: all clean install_all fix_rpath wrapper check_privileges
