@@ -1,27 +1,31 @@
 #ifndef FLOW_H
 #define FLOW_H
 
-#include <stdint.h>
-#include <math.h>
-#include <time.h>
-// Add the netinet/ip.h header to get struct iphdr definition
-#include <netinet/ip.h>
-#include <arpa/inet.h>
-// Add system network headers
-#include <netinet/in.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <unistd.h>
-#include <sys/time.h>
+#include <stdint.h>
+#include <stdbool.h>
+#include <time.h>
+// 使用用户空间的网络头文件，避免与内核头文件冲突
+#include <netinet/ip.h>
 #include <netinet/tcp.h>
 #include <netinet/udp.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
+
+// 添加缺失的宏定义
+#define MAX_TIMESTAMPS 1000
+
+// =================== 调试级别控制 ===================
+void set_debug_level(int level);
+int get_debug_level();
 
 // =================== 流管理参数 ===================
 
 // 流超时配置
 #define FLOW_TIMEOUT_NS (40 * 1000000000ULL)    // 流过期时间 (40秒)
-#define TCP_FLOW_TIMEOUT_NS (30 * 1000000000ULL) // TCP流30秒超时
+#define TCP_FLOW_TIMEOUT_NS (5 * 1000000000ULL) // TCP流5秒超时，更积极地分割会话
 
 // cicflowmeter 活跃超时配置
 #define ACTIVE_TIMEOUT_NS (5 * 1000000ULL)       // 活跃超时时间 (5毫秒 = 0.005秒)
@@ -323,6 +327,23 @@ struct flow_stats {
     uint8_t  should_expire;                 // 标记是否应该过期
     uint8_t  in_garbage_collect;            // 标记是否在垃圾回收中
     uint8_t  session_completed;             // 标记TCP会话是否已完成（FIN或RST）
+
+    // TCP端口重用检测字段
+    uint32_t tcp_base_seq;          // TCP基础序列号，用于检测端口重用
+    bool tcp_base_seq_set;       // 是否已设置TCP基础序列号
+    bool tcp_session_ended;      // TCP会话是否已结束（收到RST或FIN）
+
+    uint64_t forward_packets;
+    uint64_t reverse_packets;
+    uint64_t total_packets;
+    uint64_t total_bytes;
+    uint64_t first_packet_time;
+    uint64_t last_packet_time;
+    uint64_t timestamps[MAX_TIMESTAMPS];
+    uint32_t timestamp_index;
+    uint32_t tcp_conversation_id;
+    uint32_t udp_conversation_id;
+    uint8_t conversation_completeness;
 };
 
 // UDP特征统计结构
@@ -540,6 +561,7 @@ int count_active_flows();
 void count_flow_directions(int *forward_flows, int *reverse_flows);
 int count_all_flows();
 void count_all_flow_directions(int *forward_flows, int *reverse_flows);
+uint32_t get_total_conversation_count();
 
 uint32_t hash_flow_key(const struct flow_key *key);
 uint64_t get_current_time();
@@ -573,11 +595,13 @@ void reset_conversation_counters();
 // 获取对话计数函数 (类似Wireshark的get_tcp_stream_count())
 uint32_t get_tcp_conversation_count();
 uint32_t get_udp_conversation_count();  
-uint32_t get_total_conversation_count();
 
 // 分配对话ID函数 (类似Wireshark的tcpd->stream = tcp_stream_count++)
 uint32_t assign_tcp_conversation_id();
 uint32_t assign_udp_conversation_id();
+
+// **新增函数**: 为指定协议分配对话ID
+void assign_conversation_id_for_protocol(struct flow_stats *stats, uint8_t protocol);
 
 // Wireshark风格的流创建函数 (类似find_or_create_conversation)
 struct flow_stats* get_or_create_conversation(const struct flow_key *key, int *is_reverse_ptr, uint64_t packet_timestamp, uint8_t tcp_flags);

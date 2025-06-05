@@ -125,7 +125,7 @@ extern int count_active_flows(); // 从flow.c导入流计数函数
 // Global settings
 static int stats_interval = DEFAULT_STATS_INTERVAL;
 static int stats_packet_count = DEFAULT_STATS_PACKETS;
-static int cleanup_interval = EXPIRED_UPDATE;  // 使用从cicflowmeter复制的参数
+static int cleanup_interval = DEFAULT_CLEANUP_INTERVAL;  // 使用从cicflowmeter复制的参数
 static int duration = DEFAULT_DURATION;  // in seconds, 0 means run indefinitely
 static time_t start_time;                // program start time
 static int lock_fd = -1;                // 文件锁描述符
@@ -142,6 +142,7 @@ typedef struct {
         struct {
             uint16_t source;
             uint16_t dest;
+            uint32_t seq;           // 添加TCP序列号
             uint8_t flags_byte[14]; // 足够存储TCP标志位(在字节13)
         } tcp;
         struct {
@@ -149,6 +150,7 @@ typedef struct {
             uint16_t dest;
         } udp;
     } transport_header;
+    uint64_t timestamp; // 添加时间戳字段
 } packet_data_t;
 
 // 无锁队列结构 - 使用原子操作确保线程安全
@@ -302,10 +304,14 @@ static int packet_queue_enqueue(lockfree_queue_t *queue, const packet_data_t *pa
         retry_count++;
     }
     
-    // 达到最大重试次数，这种情况下我们仍不丢包，等待一段时间后继续
+    // 达到最大重试次数，直接返回失败，避免无限递归
     if (running) {
-        usleep(10); // 等待10微秒
-        return packet_queue_enqueue(queue, packet); // 递归重试
+        // 队列可能已满，丢弃这个包以避免卡死
+        static int drop_warning_count = 0;
+        if (drop_warning_count < 10) {
+            fprintf(stderr, "Warning: Packet queue full, dropping packet (warning %d/10)\n", ++drop_warning_count);
+        }
+        return -1;
     }
     
     return -1;
@@ -386,9 +392,29 @@ struct perf_buffer_opts opts = {
 static int cleanup_done = 0;
 
 // 线程安全版本的流表访问函数
-static void thread_safe_process_packet(const struct iphdr *ip, const void *transport_hdr) {
+static void thread_safe_process_packet(const struct iphdr *ip, uint16_t src_port, uint16_t dst_port, 
+                                     uint32_t tcp_seq, uint8_t tcp_flags, uint64_t timestamp) {
     pthread_mutex_lock(&flow_table_mutex);
-    process_packet(ip, transport_hdr);
+    
+    // 创建传输层头部信息用于传递给process_packet
+    if (ip->protocol == IPPROTO_TCP) {
+        // 对于TCP，我们需要传递序列号和标志位
+        struct tcphdr tcp_info = {0};
+        tcp_info.source = htons(src_port);
+        tcp_info.dest = htons(dst_port);
+        tcp_info.seq = htonl(tcp_seq);
+        *((uint8_t*)&tcp_info + 13) = tcp_flags;  // 设置TCP标志位
+        
+        process_packet(ip, &tcp_info, timestamp);
+    } else if (ip->protocol == IPPROTO_UDP) {
+        // 对于UDP，只需要端口信息
+        struct udphdr udp_info = {0};
+        udp_info.source = htons(src_port);
+        udp_info.dest = htons(dst_port);
+        
+        process_packet(ip, &udp_info, timestamp);
+    }
+    
     pthread_mutex_unlock(&flow_table_mutex);
     
     // 更新统计信息
@@ -415,7 +441,22 @@ static void *worker_thread_func(void *arg) {
             PREFETCH(&packet.transport_header);
             
             // 处理数据包
-            thread_safe_process_packet(&packet.ip_header, &packet.transport_header);
+            if (packet.ip_header.protocol == IPPROTO_TCP) {
+                // 从存储的TCP头部数据中提取标志位
+                struct tcphdr *tcp_header = (struct tcphdr *)packet.transport_header.tcp.flags_byte;
+                uint8_t tcp_flags = *((uint8_t*)tcp_header + 13);  // TCP标志位在第13字节
+                uint32_t tcp_seq = packet.transport_header.tcp.seq;
+                
+                thread_safe_process_packet(&packet.ip_header, 
+                                         packet.transport_header.tcp.source,
+                                         packet.transport_header.tcp.dest,
+                                         tcp_seq, tcp_flags, packet.timestamp);
+            } else if (packet.ip_header.protocol == IPPROTO_UDP) {
+                thread_safe_process_packet(&packet.ip_header,
+                                         packet.transport_header.udp.source,
+                                         packet.transport_header.udp.dest,
+                                         0, 0, packet.timestamp);  // UDP没有序列号和标志位
+            }
         } else {
             // 队列为空或出错，增加空闲计数
             idle_count++;
@@ -594,9 +635,10 @@ void sig_handler(int sig) {
         printf("\nReceived signal %d, initiating graceful shutdown...\n", sig);
         running = 0;
         
-        if (flow_table_initialized) {
-            print_final_stats();
-        }
+        // 移除这里的print_final_stats()调用，避免与cleanup()中的重复
+        // if (flow_table_initialized) {
+        //     print_final_stats();
+        // }
         
         // Give some time for threads to finish
         sleep(1);
@@ -764,6 +806,9 @@ static void handle_batch(void *ctx, int cpu, void *data, __u32 size) {
         // 仅当协议为TCP时设置标志位
         packet_data.transport_header.tcp.flags_byte[13] = pkt->tcp_flags & is_tcp;
         
+        // 提取并转换时间戳为纳秒
+        packet_data.timestamp = (uint64_t)pkt->timestamp;
+        
         // 将数据包添加到队列
         if (packet_queue_enqueue(&packet_queue, &packet_data) != 0) {
             // 入队失败，检查是否应该退出
@@ -802,12 +847,16 @@ void process_pcap_packet(const u_char *packet, const struct pcap_pkthdr *header)
     // 复制IP头
     memcpy(&packet_data.ip_header, ip, sizeof(struct iphdr));
     
+    // 提取并转换时间戳为纳秒
+    packet_data.timestamp = (uint64_t)header->ts.tv_sec * 1000000000ULL + (uint64_t)header->ts.tv_usec * 1000ULL;
+    
     // 根据协议类型处理传输层
     if (ip->protocol == IPPROTO_TCP) {
         struct tcphdr *tcp = (struct tcphdr *)transport_header;
         packet_data.transport_header.tcp.source = tcp->source;
         packet_data.transport_header.tcp.dest = tcp->dest;
-        packet_data.transport_header.tcp.flags_byte[13] = *((uint8_t*)tcp + 13);
+        packet_data.transport_header.tcp.seq = ntohl(tcp->seq);
+        memcpy(packet_data.transport_header.tcp.flags_byte, tcp, sizeof(struct tcphdr));
     } else if (ip->protocol == IPPROTO_UDP) {
         struct udphdr *udp = (struct udphdr *)transport_header;
         packet_data.transport_header.udp.source = udp->source;
@@ -962,8 +1011,23 @@ int process_pcap_file(const char *pcap_file) {
     // 停止工作线程
     stop_worker_threads();
 
-    // 输出流统计信息
-    printf("====== Flow Statistics ======\n");
+    // 输出流统计信息 - 已注释掉
+    /*
+    printf("====== Conversation & Flow Statistics ======\n");
+    
+    // 使用get_total_conversation_count统计对话总数
+    uint32_t total_conversations = get_total_conversation_count();
+    uint32_t tcp_conversations = get_tcp_conversation_count();
+    uint32_t udp_conversations = get_udp_conversation_count();
+    
+    // 统计活跃流和所有流的数量
+    int active_flows = count_active_flows();
+    int all_flows = count_all_flows();
+    
+    printf("Conversations: Total=%u (TCP=%u, UDP=%u)\n", 
+           total_conversations, tcp_conversations, udp_conversations);
+    printf("Flows: Active=%d, Total=%d, Inactive=%d\n", 
+           active_flows, all_flows, all_flows - active_flows);
     
     // 计算活跃流和所有流的方向统计
     int forward_active_flows = 0, reverse_active_flows = 0;
@@ -972,23 +1036,13 @@ int process_pcap_file(const char *pcap_file) {
     int forward_all_flows = 0, reverse_all_flows = 0;
     count_all_flow_directions(&forward_all_flows, &reverse_all_flows);
     
-    // 统计活跃流和所有流的数量
-    int active_flows = count_active_flows();
-    int all_flows = count_all_flows();
+    printf("Flow Directions - Active: Forward=%d, Reverse=%d\n", 
+           forward_active_flows, reverse_active_flows);
+    printf("Flow Directions - Total: Forward=%d, Reverse=%d\n", 
+           forward_all_flows, reverse_all_flows);
+    printf("============================================\n");
+    */
     
-    // 中英文输出
-    printf("活跃流: %d | 所有流: %d | 不活跃流: %d\n", 
-           active_flows, all_flows, all_flows - active_flows);
-    printf("Active flows: %d | All flows: %d | Inactive flows: %d\n", 
-           active_flows, all_flows, all_flows - active_flows);
-           
-    printf("活跃流方向统计: 正向: %d, 反向: %d\n", forward_active_flows, reverse_active_flows);
-    printf("Active flow directions: Forward: %d, Reverse: %d\n", forward_active_flows, reverse_active_flows);
-    
-    printf("所有流方向统计: 正向: %d, 反向: %d\n", forward_all_flows, reverse_all_flows);
-    printf("All flow directions: Forward: %d, Reverse: %d\n", forward_all_flows, reverse_all_flows);
-    printf("===============================\n");
-
     // Clean up
     if (handle) {
         pcap_close(handle);
@@ -1118,8 +1172,23 @@ int run_live_capture(const char *ifname) {
     // 停止工作线程
     stop_worker_threads();
 
-    // 输出流统计信息
+    // 输出流统计信息 - 已注释掉
+    /*
     printf("====== Flow Statistics ======\n");
+    
+    // 使用get_total_conversation_count统计对话总数
+    uint32_t total_conversations = get_total_conversation_count();
+    uint32_t tcp_conversations = get_tcp_conversation_count();
+    uint32_t udp_conversations = get_udp_conversation_count();
+    
+    // 统计活跃流和所有流的数量
+    int active_flows = count_active_flows();
+    int all_flows = count_all_flows();
+    
+    printf("Conversations: Total=%u (TCP=%u, UDP=%u)\n", 
+           total_conversations, tcp_conversations, udp_conversations);
+    printf("Flows: Active=%d, Total=%d, Inactive=%d\n", 
+           active_flows, all_flows, all_flows - active_flows);
     
     // 计算活跃流和所有流的方向统计
     int forward_active_flows = 0, reverse_active_flows = 0;
@@ -1128,22 +1197,12 @@ int run_live_capture(const char *ifname) {
     int forward_all_flows = 0, reverse_all_flows = 0;
     count_all_flow_directions(&forward_all_flows, &reverse_all_flows);
     
-    // 统计活跃流和所有流的数量
-    int active_flows = count_active_flows();
-    int all_flows = count_all_flows();
-    
-    // 中英文输出
-    printf("活跃流: %d | 所有流: %d | 不活跃流: %d\n", 
-           active_flows, all_flows, all_flows - active_flows);
-    printf("Active flows: %d | All flows: %d | Inactive flows: %d\n", 
-           active_flows, all_flows, all_flows - active_flows);
-           
-    printf("活跃流方向统计: 正向: %d, 反向: %d\n", forward_active_flows, reverse_active_flows);
-    printf("Active flow directions: Forward: %d, Reverse: %d\n", forward_active_flows, reverse_active_flows);
-    
-    printf("所有流方向统计: 正向: %d, 反向: %d\n", forward_all_flows, reverse_all_flows);
-    printf("All flow directions: Forward: %d, Reverse: %d\n", forward_all_flows, reverse_all_flows);
-    printf("===============================\n");
+    printf("Flow Directions - Active: Forward=%d, Reverse=%d\n", 
+           forward_active_flows, reverse_active_flows);
+    printf("Flow Directions - Total: Forward=%d, Reverse=%d\n", 
+           forward_all_flows, reverse_all_flows);
+    printf("============================================\n");
+    */
 
 cleanup:
     // Cleanup resources in reverse order of creation
@@ -1219,6 +1278,47 @@ void print_final_stats(void) {
     printf("Packets per Second:     %lu\n", system_stats.packets_per_second);
     printf("======================================\n");
     
+    // 使用get_total_conversation_count统计对话总数
+    uint32_t total_conversations = get_total_conversation_count();
+    uint32_t tcp_conversations = get_tcp_conversation_count();
+    uint32_t udp_conversations = get_udp_conversation_count();
+    
+    // 获取活跃流和所有流的数量
+    int active_flow_count = count_active_flows();
+    int all_flow_count = count_all_flows();
+    
+    // 在非安静模式下打印对话统计
+    if (!quiet_mode) {
+        printf("\n============= Conversation Statistics =============\n");
+        printf("Total Conversations:    %u\n", total_conversations);
+        printf("  TCP Conversations:    %u\n", tcp_conversations);
+        printf("  UDP Conversations:    %u\n", udp_conversations);
+        printf("Active Flows:           %d\n", active_flow_count);
+        printf("Total Flows:            %d\n", all_flow_count);
+        printf("Inactive Flows:         %d\n", all_flow_count - active_flow_count);
+        printf("==================================================\n");
+    }
+    
+    // 统计流方向
+    int forward_all_flows = 0, reverse_all_flows = 0;
+    count_all_flow_directions(&forward_all_flows, &reverse_all_flows);
+    
+    if (!quiet_mode) {
+        printf("\n============= Flow Direction Statistics =============\n");
+        printf("Total Flow Directions: Forward: %d, Reverse: %d\n", 
+               forward_all_flows, reverse_all_flows);
+        
+        // 打印活跃流方向统计
+        int forward_active_flows = 0, reverse_active_flows = 0;
+        count_flow_directions(&forward_active_flows, &reverse_active_flows);
+        printf("Active Flow Directions: Forward: %d, Reverse: %d\n", 
+               forward_active_flows, reverse_active_flows);
+        printf("====================================================\n");
+    }
+    
+    // 添加Wireshark风格的对话统计
+    print_wireshark_conversation_stats();
+    
     // 收集总数据包和字节统计
     uint64_t total_packets = 0;
     uint64_t total_bytes = 0;
@@ -1229,30 +1329,8 @@ void print_final_stats(void) {
     uint64_t total_tcp_bytes = 0;
     uint64_t total_udp_bytes = 0;
     
-    // 获取活跃流和所有流的数量
-    int active_flow_count = count_active_flows();
-    int all_flow_count = count_all_flows();
-    
-    // 在非安静模式下打印标题
     if (!quiet_mode) {
         printf("\n============= Final Flow Statistics (Time Ordered) at %s =============\n", ctime(&current_time));
-        printf("Active Flows: %d | Total Flows (including inactive): %d\n", 
-               active_flow_count, all_flow_count);
-    }
-    
-    // 统计流方向
-    int forward_all_flows = 0, reverse_all_flows = 0;
-    count_all_flow_directions(&forward_all_flows, &reverse_all_flows);
-    
-    if (!quiet_mode) {
-        printf("Total Flow Directions: Forward: %d, Reverse: %d\n", 
-               forward_all_flows, reverse_all_flows);
-        
-        // 打印活跃流方向统计
-        int forward_active_flows = 0, reverse_active_flows = 0;
-        count_flow_directions(&forward_active_flows, &reverse_active_flows);
-        printf("Active Flow Directions: Forward: %d, Reverse: %d\n", 
-               forward_active_flows, reverse_active_flows);
     }
     
     // 分配内存来存储所有流信息
@@ -1495,21 +1573,29 @@ void print_final_stats(void) {
     free(flows);
     
     if (!quiet_mode) {
-        printf("\nSummary Statistics:\n");
-        printf("Total Flows:      %lu\n", (unsigned long)flow_count);
-        printf("  TCP Flows:      %lu\n", (unsigned long)total_tcp_flows);
-        printf("  UDP Flows:      %lu\n", (unsigned long)total_udp_flows);
-        printf("Total Packets:    %lu\n", (unsigned long)total_packets);
-        printf("  TCP Packets:    %lu\n", (unsigned long)total_tcp_packets);
-        printf("  UDP Packets:    %lu\n", (unsigned long)total_udp_packets);
-        printf("Total Bytes:      %lu (%.2f MB)\n", 
+        printf("\n============= Final Summary Statistics =============\n");
+        printf("Conversation Summary:\n");
+        printf("  Total Conversations:  %u\n", total_conversations);
+        printf("    TCP Conversations:  %u\n", tcp_conversations);
+        printf("    UDP Conversations:  %u\n", udp_conversations);
+        printf("\nFlow Summary:\n");
+        printf("  Total Flows:          %lu\n", (unsigned long)flow_count);
+        printf("    TCP Flows:          %lu\n", (unsigned long)total_tcp_flows);
+        printf("    UDP Flows:          %lu\n", (unsigned long)total_udp_flows);
+        printf("    Active Flows:       %d\n", active_flow_count);
+        printf("    Inactive Flows:     %d\n", all_flow_count - active_flow_count);
+        printf("\nPacket Summary:\n");
+        printf("  Total Packets:        %lu\n", (unsigned long)total_packets);
+        printf("    TCP Packets:        %lu\n", (unsigned long)total_tcp_packets);
+        printf("    UDP Packets:        %lu\n", (unsigned long)total_udp_packets);
+        printf("\nByte Summary:\n");
+        printf("  Total Bytes:          %lu (%.2f MB)\n", 
                (unsigned long)total_bytes, total_bytes / (1024.0 * 1024.0));
-        printf("  TCP Bytes:      %lu (%.2f MB)\n", 
+        printf("    TCP Bytes:          %lu (%.2f MB)\n", 
                (unsigned long)total_tcp_bytes, total_tcp_bytes / (1024.0 * 1024.0));
-        printf("  UDP Bytes:      %lu (%.2f MB)\n", 
+        printf("    UDP Bytes:          %lu (%.2f MB)\n", 
                (unsigned long)total_udp_bytes, total_udp_bytes / (1024.0 * 1024.0));
-        printf("Active Flows:     %d\n", active_flow_count);
-        printf("Inactive Flows:   %d\n", all_flow_count - active_flow_count);
+        printf("===================================================\n");
     }
     
     if (csv_fp) {
@@ -1524,6 +1610,8 @@ void print_final_stats(void) {
     if (!quiet_mode) {
         printf("\n=============================================================\n\n");
     }
+    
+
 }
 
 // 打印使用帮助
@@ -1543,6 +1631,7 @@ void print_usage(const char *prog_name) {
     printf("  -o, --output <csv-file>     Export features to CSV file\n");
     printf("  -l, --loop <count>          Loop pcap file N times (0 = infinite, default: 1)\n");
     printf("  -w, --wait <seconds>        Wait N seconds between loops (default: 0)\n");
+    printf("  -v, --verbose <level>       Debug level: 0=none, 1=basic, 2=detailed (default: 0)\n");
     printf("  -q, --quiet                 Quiet mode, don't print statistics to screen\n");
     printf("  -h, --help                  Show this help message\n");
 }
@@ -1586,12 +1675,13 @@ int main(int argc, char **argv) {
         {"output",        required_argument, 0, 'o'},
         {"loop",          required_argument, 0, 'l'},
         {"wait",          required_argument, 0, 'w'},
+        {"verbose",       required_argument, 0, 'v'},
         {"quiet",         no_argument,       0, 'q'},
         {"help",          no_argument,       0, 'h'},
         {0, 0, 0, 0}
     };
 
-    while ((c = getopt_long(argc, argv, "i:r:d:s:p:c:t:o:l:w:qh", long_options, NULL)) != -1) {
+    while ((c = getopt_long(argc, argv, "i:r:d:s:p:c:t:o:l:w:v:qh", long_options, NULL)) != -1) {
         switch (c) {
             case 'i':
                 ifname = optarg;
@@ -1663,6 +1753,17 @@ int main(int argc, char **argv) {
                     return 1;
                 }
                 printf("Setting loop delay to %d seconds\n", loop_delay);
+                break;
+            case 'v':
+                {
+                    int debug_level = atoi(optarg);
+                    if (debug_level < 0 || debug_level > 2) {
+                        fprintf(stderr, "Debug level must be 0, 1, or 2\n");
+                        return 1;
+                    }
+                    set_debug_level(debug_level);
+                    printf("Setting debug level to %d\n", debug_level);
+                }
                 break;
             case 'q':
                 quiet_mode = 1;
