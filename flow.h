@@ -23,22 +23,22 @@ int get_debug_level();
 
 // =================== 流管理参数 ===================
 
-// 流超时配置
-#define FLOW_TIMEOUT_NS (40 * 1000000000ULL)    // 流过期时间 (40秒)
-#define TCP_FLOW_TIMEOUT_NS (5 * 1000000000ULL) // TCP流5秒超时，更积极地分割会话
+// 流超时配置 - 调整为更接近Wireshark的默认设置
+#define FLOW_TIMEOUT_NS (120 * 1000000000ULL)    // 流过期时间 (120秒，类似Wireshark)
+#define TCP_FLOW_TIMEOUT_NS (120 * 1000000000ULL) // TCP流120秒超时，与Wireshark一致
 
 // cicflowmeter 活跃超时配置
 #define ACTIVE_TIMEOUT_NS (5 * 1000000ULL)       // 活跃超时时间 (5毫秒 = 0.005秒)
 #define CLUMP_TIMEOUT_NS (1 * 1000000000ULL)     // 集群超时时间 (1秒)，用于子流和批量传输分割
 #define BULK_BOUND 4                             // 批量传输阈值 (4个数据包)
 
-// TCP流分段设置
-#define TCP_SEGMENT_ON_IDLE 1               // 空闲超时时分段
-#define TCP_IDLE_TIMEOUT_NS (1 * 1000000000ULL) // TCP空闲超时 (1秒)
+// TCP流分段设置 - 更保守的设置
+#define TCP_SEGMENT_ON_IDLE 0               // 禁用空闲超时分段，减少过度分割
+#define TCP_IDLE_TIMEOUT_NS (30 * 1000000000ULL) // TCP空闲超时 (30秒)
 
-// TCP标志位分段设置
-#define TCP_SEGMENT_ON_FLAGS 1              // 根据TCP标志位分段（启用）
-#define TCP_FLAGS_THRESH 10                 // 10个标志位变化视为新的子流
+// TCP标志位分段设置 - 更保守
+#define TCP_SEGMENT_ON_FLAGS 0              // 禁用TCP标志位分段
+#define TCP_FLAGS_THRESH 20                 // 20个标志位变化视为新的子流（更保守）
 
 // 启用流清理
 #define ENABLE_FLOW_CLEANUP 1

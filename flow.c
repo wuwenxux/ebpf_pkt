@@ -342,7 +342,7 @@ void update_conversation_completeness(struct flow_node *node, uint8_t tcp_flags)
         if (tcp_flags & TCP_FLAG_ACK) {
             node->completeness |= TCP_COMPLETENESS_SYNACK;
             node->tcp_state = TCP_CONV_ESTABLISHED;
-    } else {
+        } else {
             node->tcp_state = TCP_CONV_INIT;
         }
     }
@@ -357,20 +357,20 @@ void update_conversation_completeness(struct flow_node *node, uint8_t tcp_flags)
     if (tcp_flags & TCP_FLAG_FIN) {
         node->completeness |= TCP_COMPLETENESS_FIN;
         node->tcp_state = TCP_CONV_CLOSING;
-        // 标记会话已完成
+        // 标记会话已完成 - 类似Wireshark的逻辑
         node->stats.session_completed = 1;
     }
     
     if (tcp_flags & TCP_FLAG_RST) {
         node->completeness |= TCP_COMPLETENESS_RST;
         node->tcp_state = TCP_CONV_RESET;
-        // 标记会话已完成
+        // 标记会话已完成 - 类似Wireshark的逻辑
         node->stats.session_completed = 1;
     }
     
-    // 检查数据载荷
+    // 检查数据载荷 - 简化逻辑
     if ((tcp_flags & TCP_FLAG_PSH) || 
-        (!(tcp_flags & TCP_FLAG_SYN) && !(tcp_flags & TCP_FLAG_FIN) && !(tcp_flags & TCP_FLAG_RST) && (tcp_flags & TCP_FLAG_ACK))) {
+        (!(tcp_flags & (TCP_FLAG_SYN | TCP_FLAG_FIN | TCP_FLAG_RST)) && (tcp_flags & TCP_FLAG_ACK))) {
         node->completeness |= TCP_COMPLETENESS_DATA;
     }
 }
@@ -403,45 +403,36 @@ struct flow_stats* get_or_create_conversation(const struct flow_key *key, int *i
     
     while (node) {
         if (memcmp(&node->key, &normalized_key, sizeof(struct flow_key)) == 0) {
-            // 找到现有会话，检查是否需要创建新会话
+            // 找到现有会话 - 简化的重用检测逻辑，类似Wireshark
             bool should_create_new_session = false;
-            uint64_t time_diff = packet_timestamp - node->stats.last_seen;
             
-            // 根据协议设置不同的超时阈值
-            uint64_t timeout_threshold = (key->protocol == IPPROTO_TCP) ? TCP_FLOW_TIMEOUT_NS : FLOW_TIMEOUT_NS;
-            
-            if (time_diff > timeout_threshold) {
-                should_create_new_session = true;
-                DEBUG_PRINT(2, "会话超时，创建新会话 (时间差: %" PRIu64 " ns, 阈值: %" PRIu64 " ns)\n", 
-                           time_diff, timeout_threshold);
-            } else if (key->protocol == IPPROTO_TCP) {
-                // TCP端口重用检测 - 基于Wireshark的逻辑
+            if (key->protocol == IPPROTO_TCP) {
+                // **简化**: 只在明确的会话结束后才创建新会话
                 if ((tcp_flags & TCP_FLAG_SYN) && !(tcp_flags & TCP_FLAG_ACK)) {
-                    // 新的SYN包
-                    if (node->stats.tcp_session_ended || 
-                        (node->stats.tcp_base_seq_set && node->stats.total_packets > 3)) {
+                    // 新的SYN包 - 只有在会话已明确结束时才创建新会话
+                    if (node->stats.session_completed) {
                         should_create_new_session = true;
-                        DEBUG_PRINT(2, "检测到TCP端口重用，创建新会话\n");
+                        DEBUG_PRINT(2, "检测到TCP会话结束后的新SYN，创建新会话\n");
                     }
+                }
+            } else {
+                // UDP: 使用更长的超时时间，减少会话重置
+                uint64_t time_diff = packet_timestamp - node->stats.last_seen;
+                if (time_diff > (300 * 1000000000ULL)) { // 5分钟超时
+                    should_create_new_session = true;
+                    DEBUG_PRINT(2, "UDP会话超时，创建新会话\n");
                 }
             }
             
             if (should_create_new_session) {
                 // 重置会话统计，但保留会话ID分配逻辑
-                uint32_t old_tcp_id = node->stats.tcp_conversation_id;
-                uint32_t old_udp_id = node->stats.udp_conversation_id;
-                uint64_t old_total_packets = node->stats.total_packets;
-                uint64_t old_total_bytes = node->stats.total_bytes;
-                
                 memset(&node->stats, 0, sizeof(struct flow_stats));
                 
                 // **使用新函数**: 为相应协议分配对话ID
                 assign_conversation_id_for_protocol(&node->stats, key->protocol);
                 
-                DEBUG_PRINT(2, "重置会话统计: TCP ID %u->%u, UDP ID %u->%u, 旧包数: %" PRIu64 ", 旧字节数: %" PRIu64 "\n",
-                           old_tcp_id, node->stats.tcp_conversation_id, 
-                           old_udp_id, node->stats.udp_conversation_id, 
-                           old_total_packets, old_total_bytes);
+                DEBUG_PRINT(2, "重置会话统计: TCP ID %u, UDP ID %u\n",
+                           node->stats.tcp_conversation_id, node->stats.udp_conversation_id);
             }
             
             // 更新时间戳和会话完整性
@@ -450,9 +441,6 @@ struct flow_stats* get_or_create_conversation(const struct flow_key *key, int *i
                 if (!node->stats.tcp_base_seq_set && (tcp_flags & TCP_FLAG_SYN)) {
                     // 设置TCP基础序列号（从TCP头部获取）
                     node->stats.tcp_base_seq_set = true;
-                }
-                if (tcp_flags & (TCP_FLAG_RST | TCP_FLAG_FIN)) {
-                    node->stats.tcp_session_ended = true;
                 }
             }
             
