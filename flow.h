@@ -627,4 +627,82 @@ void print_tshark_style_stats();            // 打印tshark风格的统计信息
 extern int quiet_mode;       // 安静模式变量
 extern int tshark_stats_mode; // tshark兼容统计模式变量
 
+// =================== 函数声明 ===================
+
+// 流表管理
+void flow_table_init(void);
+void flow_table_destroy(void);
+uint32_t hash_flow_key(const struct flow_key *key);
+struct flow_node *flow_table_insert_with_timestamp(const struct flow_key *key, uint64_t packet_timestamp);
+
+// 对话管理
+struct flow_stats* get_or_create_conversation(const struct flow_key *key, int *is_reverse_ptr, uint64_t packet_timestamp, uint8_t tcp_flags);
+struct flow_stats* get_or_create_udp_conversation(const struct flow_key *key, int *is_reverse_ptr, uint64_t packet_timestamp);
+
+// UDP流管理 - Wireshark风格
+void reset_udp_stream_counter(void);
+uint32_t get_next_udp_stream_id(void);
+int verify_udp_conversation_count(void);
+void print_udp_conversation_details(void);
+
+// 包处理
+void process_packet(const struct iphdr *ip, const void *transport_hdr, uint64_t packet_timestamp);
+
+// 统计函数
+void update_flow_stats(struct flow_stats *stats, uint32_t pkt_size, int is_reverse, uint64_t packet_timestamp);
+void update_udp_stats(struct flow_stats *stats, uint32_t pkt_size, int is_reverse, uint64_t packet_timestamp);
+
+// 对话计数器管理
+void reset_conversation_counters(void);
+uint32_t get_tcp_conversation_count(void);
+uint32_t get_udp_conversation_count(void);
+uint32_t get_total_conversation_count(void);
+uint32_t assign_tcp_conversation_id(void);
+uint32_t assign_udp_conversation_id(void);
+
+// Wireshark风格统计
+int count_wireshark_tcp_conversations(void);
+int count_wireshark_udp_conversations(void);
+int count_wireshark_all_conversations(void);
+void count_tcp_conversations_by_completeness(int *complete, int *incomplete, int *partial);
+void print_wireshark_conversation_stats(void);
+
+// 向后兼容函数
+int count_tshark_tcp_conversations(void);
+int count_tshark_udp_conversations(void);
+int count_all_flows(void);
+int count_active_flows(void);
+void count_flow_directions(int *forward_flows, int *reverse_flows);
+void count_all_flow_directions(int *forward_flows, int *reverse_flows);
+
+// TCP会话统计
+int count_tcp_sessions_by_lifecycle(void);
+void count_tcp_sessions_by_state(int *init_sessions, int *established_sessions, 
+                                 int *closing_sessions, int *reset_sessions, int *unknown_sessions);
+
+// 流特征计算
+void calculate_flow_features(const struct flow_stats *stats, struct flow_features *features);
+
+// 打印函数
+void print_simple_stats(void);
+void print_flow_stats(void);
+
+// 清理函数
+void cleanup_flows(void);
+
+// 时间处理
+uint64_t get_current_time(void);
+void ns_to_timespec(uint64_t timestamp_ns, struct timespec *ts);
+void set_flow_start_time_from_timestamp(struct flow_stats *stats, uint64_t timestamp_ns);
+double time_diff(const struct timespec *end, const struct timespec *start);
+
+// 调试控制
+void set_debug_level(int level);
+int get_debug_level(void);
+
+// 时间戳数组管理
+void timestamp_array_init(timestamp_array_t *arr);
+void timestamp_array_add(timestamp_array_t *arr, uint64_t timestamp);
+void timestamp_array_free(timestamp_array_t *arr);
+
 #endif /* FLOW_H */

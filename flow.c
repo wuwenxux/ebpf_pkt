@@ -235,9 +235,14 @@ void flow_table_init() {
     mempool_init(&global_pool);
     memset(flow_table, 0, sizeof(flow_table));
     init_protocol_handlers();
+    
+    // **重要**: 重置所有对话计数器，包括UDP流计数器
     reset_conversation_counters();
+    reset_udp_stream_counter();
     
     flow_table_initialized = 1;
+    
+    DEBUG_PRINT(1, "流表初始化完成，所有计数器已重置\n");
 }
 
 uint32_t hash_flow_key(const struct flow_key *key) {
@@ -376,6 +381,13 @@ void update_conversation_completeness(struct flow_node *node, uint8_t tcp_flags)
 }
 
 struct flow_stats* get_or_create_conversation(const struct flow_key *key, int *is_reverse_ptr, uint64_t packet_timestamp, uint8_t tcp_flags) {
+    // **重要**: 根据协议类型使用不同的处理逻辑
+    if (key->protocol == IPPROTO_UDP) {
+        // UDP使用Wireshark风格的稳定对话管理
+        return get_or_create_udp_conversation(key, is_reverse_ptr, packet_timestamp);
+    }
+    
+    // TCP继续使用原有的复杂逻辑（已优化）
     // 标准化流键 - 确保较小的IP地址作为源地址
     struct flow_key normalized_key;
     bool is_reverse = false;
@@ -414,13 +426,6 @@ struct flow_stats* get_or_create_conversation(const struct flow_key *key, int *i
                         should_create_new_session = true;
                         DEBUG_PRINT(2, "检测到TCP会话结束后的新SYN，创建新会话\n");
                     }
-                }
-            } else {
-                // UDP: 使用更长的超时时间，减少会话重置
-                uint64_t time_diff = packet_timestamp - node->stats.last_seen;
-                if (time_diff > (300 * 1000000000ULL)) { // 5分钟超时
-                    should_create_new_session = true;
-                    DEBUG_PRINT(2, "UDP会话超时，创建新会话\n");
                 }
             }
             
@@ -596,10 +601,6 @@ int count_wireshark_tcp_conversations() {
     return get_tcp_conversation_count();
 }
 
-int count_wireshark_udp_conversations() {
-    return get_udp_conversation_count();
-}
-
 int count_wireshark_all_conversations() {
     return get_total_conversation_count();
 }
@@ -640,17 +641,27 @@ void count_tcp_conversations_by_completeness(int *complete, int *incomplete, int
 void print_wireshark_conversation_stats() {
     printf("\n================== Wireshark风格对话统计 ==================\n");
     
-    // 直接使用已统计好的计数器
+    // 使用优化后的计数器
     uint32_t tcp_conv = get_tcp_conversation_count();
-    uint32_t udp_conv = get_udp_conversation_count();
-    uint32_t total_conv = get_total_conversation_count();
+    uint32_t udp_conv = count_wireshark_udp_conversations();  // **使用新的UDP统计函数**
+    uint32_t total_conv = tcp_conv + udp_conv;  // **修正**: 分别计算总数
     
     printf("对话统计摘要:\n");
     printf("  TCP对话: %u\n", tcp_conv);
-    printf("  UDP对话: %u\n", udp_conv);
+    printf("  UDP对话: %u (基于Wireshark stream机制)\n", udp_conv);
     printf("  总对话数: %u\n", total_conv);
     printf("  说明: 基于Wireshark的conversation table机制\n");
-    printf("        - 超时分割阈值: %" PRIu64 "秒\n", (uint64_t)(FLOW_TIMEOUT_NS / 1000000000ULL));
+    printf("        - TCP: 基于会话状态和完整性\n");
+    printf("        - UDP: 基于稳定的stream ID分配\n");
+    printf("\n");
+    
+    // UDP对话计数验证
+    int udp_manual_count = verify_udp_conversation_count();
+    if (udp_manual_count != udp_conv) {
+        printf("⚠️  UDP对话计数不一致: 计数器=%u, 实际=%d\n", udp_conv, udp_manual_count);
+    } else {
+        printf("✅ UDP对话计数一致性验证通过\n");
+    }
     printf("\n");
     
     // TCP对话完整性分析
@@ -663,7 +674,7 @@ void print_wireshark_conversation_stats() {
     printf("  不完整对话: %d\n", incomplete);
     printf("\n");
     
-    // 详细对话列表 (类似tshark -z conv,tcp) - 修复列对齐问题
+    // 详细对话列表 (类似tshark -z conv,tcp)
     printf("TCP对话详情 (前15个):\n");
     printf("%-15s %-6s %-15s %-6s %-8s %-8s %-8s %-8s %-12s %-12s\n",
            "地址A", "端口A", "地址B", "端口B", "包数A→B", "字节A→B", "包数B→A", "字节B→A", "流持续时间", "状态");
@@ -710,8 +721,12 @@ void print_wireshark_conversation_stats() {
         printf("... (显示前15个TCP对话，总共%u个)\n", tcp_conv);
     }
     
+    // **新增**: 打印UDP对话详情
+    print_udp_conversation_details();
+    
     printf("\n注意: 此统计基于Wireshark的conversation table机制\n");
-    printf("每个唯一的5-tuple创建一个对话\n");
+    printf("TCP: 每个唯一的5-tuple + 会话状态创建一个对话\n");
+    printf("UDP: 每个唯一的5-tuple创建一个稳定的stream ID\n");
     printf("================== 统计结束 ==================\n");
 }
 
@@ -764,10 +779,13 @@ void flow_table_destroy() {
     
     mempool_destroy(&global_pool);
     
-    // 重置对话计数器，确保下次统计从0开始
+    // **重要**: 重置对话计数器，确保下次统计从0开始
     reset_conversation_counters();
+    reset_udp_stream_counter();
     
     flow_table_initialized = 0;
+    
+    DEBUG_PRINT(1, "流表销毁完成，所有计数器已重置\n");
 }
 
 void cleanup_flows() {
@@ -1110,4 +1128,174 @@ void count_tcp_sessions_by_state(int *init_sessions, int *established_sessions,
             node = node->next;
         }
     }
+}
+
+// =================== Wireshark风格的UDP对话管理 ===================
+
+/**
+ * 基于Wireshark packet-udp.c的UDP对话创建逻辑
+ * 参考: init_udp_conversation_data() 和 get_udp_conversation_data()
+ */
+struct udp_conversation_data {
+    uint32_t stream_id;
+    uint64_t first_frame_time;
+    uint64_t last_frame_time;
+    uint32_t packet_count;
+    bool conversation_established;
+};
+
+// UDP流计数器 - 类似Wireshark的udp_stream_count
+static uint32_t udp_stream_counter = 0;
+
+/**
+ * 重置UDP流计数器
+ */
+void reset_udp_stream_counter() {
+    udp_stream_counter = 0;
+}
+
+/**
+ * 获取下一个UDP流ID - 类似Wireshark的实现
+ */
+uint32_t get_next_udp_stream_id() {
+    return ++udp_stream_counter;
+}
+
+/**
+ * Wireshark风格的UDP对话查找和创建
+ * 基于find_or_create_conversation_strat()的逻辑
+ */
+struct flow_stats* get_or_create_udp_conversation(const struct flow_key *key, int *is_reverse_ptr, uint64_t packet_timestamp) {
+    // 标准化流键 - 确保较小的IP地址作为源地址
+    struct flow_key normalized_key;
+    bool is_reverse = false;
+    
+    if (key->src_ip < key->dst_ip || 
+        (key->src_ip == key->dst_ip && key->src_port < key->dst_port)) {
+        normalized_key = *key;
+        is_reverse = false;
+    } else {
+        normalized_key.src_ip = key->dst_ip;
+        normalized_key.dst_ip = key->src_ip;
+        normalized_key.src_port = key->dst_port;
+        normalized_key.dst_port = key->src_port;
+        normalized_key.protocol = key->protocol;
+        is_reverse = true;
+    }
+    
+    if (is_reverse_ptr) {
+        *is_reverse_ptr = is_reverse;
+    }
+    
+    // 查找现有会话
+    uint32_t idx = hash_flow_key(&normalized_key);
+    struct flow_node *node = flow_table[idx];
+    
+    while (node) {
+        if (memcmp(&node->key, &normalized_key, sizeof(struct flow_key)) == 0) {
+            // 找到现有UDP会话
+            // **Wireshark风格**: UDP会话一旦创建就保持稳定，不轻易重置
+            
+            // 更新时间戳
+            node->stats.last_seen = packet_timestamp;
+            node->last_packet_time = packet_timestamp;
+            
+            DEBUG_PRINT(3, "重用UDP会话: stream_id=%u\n", node->stats.udp_conversation_id);
+            return &node->stats;
+        }
+        node = node->next;
+    }
+    
+    // 创建新的UDP会话 - 类似Wireshark的init_udp_conversation_data()
+    struct flow_node *new_node = flow_table_insert_with_timestamp(&normalized_key, packet_timestamp);
+    if (!new_node) {
+        return NULL;
+    }
+    
+    // **关键**: 为UDP分配唯一的流ID，类似Wireshark的udp_stream_count++
+    new_node->stats.udp_conversation_id = get_next_udp_stream_id();
+    
+    // 初始化UDP会话数据
+    new_node->stats.session_completed = 0;  // UDP没有明确的会话结束
+    new_node->first_packet_time = packet_timestamp;
+    new_node->last_packet_time = packet_timestamp;
+    
+    DEBUG_PRINT(2, "创建新UDP会话: stream_id=%u, src=%08x:%u, dst=%08x:%u\n", 
+               new_node->stats.udp_conversation_id,
+               ntohl(normalized_key.src_ip), ntohs(normalized_key.src_port),
+               ntohl(normalized_key.dst_ip), ntohs(normalized_key.dst_port));
+    
+    return &new_node->stats;
+}
+
+// =================== Wireshark风格的UDP统计函数 ===================
+
+/**
+ * 获取UDP对话数量 - 基于Wireshark的udp_stream_count逻辑
+ */
+int count_wireshark_udp_conversations() {
+    // **关键**: 直接返回UDP流计数器，类似Wireshark的get_udp_stream_count()
+    return udp_stream_counter;
+}
+
+/**
+ * 验证UDP对话计数的一致性
+ */
+int verify_udp_conversation_count() {
+    int manual_count = 0;
+    
+    // 手动统计UDP流节点数量，用于验证
+    for (int i = 0; i < HASH_TABLE_SIZE; i++) {
+        struct flow_node *node = flow_table[i];
+        while (node) {
+            if (node->key.protocol == IPPROTO_UDP && node->stats.udp_conversation_id > 0) {
+                manual_count++;
+            }
+            node = node->next;
+        }
+    }
+    
+    DEBUG_PRINT(2, "UDP对话计数验证: 计数器=%u, 手动统计=%d\n", 
+               udp_stream_counter, manual_count);
+    
+    return manual_count;
+}
+
+/**
+ * 打印UDP对话详细信息 - 类似Wireshark的conversation table
+ */
+void print_udp_conversation_details() {
+    printf("\nUDP对话详情 (类似Wireshark conversation table):\n");
+    printf("%-15s %-6s %-15s %-6s %-8s %-8s %-8s %-8s %-10s\n",
+           "地址A", "端口A", "地址B", "端口B", "包数A→B", "字节A→B", "包数B→A", "字节B→A", "流ID");
+    printf("=============== ====== =============== ====== ======== ======== ======== ======== ==========\n");
+    
+    int udp_conv_printed = 0;
+    
+    for (int i = 0; i < HASH_TABLE_SIZE && udp_conv_printed < 15; i++) {
+        struct flow_node *node = flow_table[i];
+        while (node && udp_conv_printed < 15) {
+            if (node->key.protocol == IPPROTO_UDP && node->stats.udp_conversation_id > 0) {
+                struct in_addr src_addr = {.s_addr = node->key.src_ip};
+                struct in_addr dst_addr = {.s_addr = node->key.dst_ip};
+                
+                printf("%-15s %-6u %-15s %-6u %-8lu %-8lu %-8lu %-8lu %-10u\n",
+                       inet_ntoa(src_addr), ntohs(node->key.src_port),
+                       inet_ntoa(dst_addr), ntohs(node->key.dst_port),
+                       node->stats.fwd_packets, node->stats.fwd_bytes,
+                       node->stats.bwd_packets, node->stats.bwd_bytes,
+                       node->stats.udp_conversation_id);
+                
+                udp_conv_printed++;
+            }
+            node = node->next;
+        }
+    }
+    
+    if (udp_conv_printed == 15 && udp_stream_counter > 15) {
+        printf("... (显示前15个UDP对话，总共%u个)\n", udp_stream_counter);
+    }
+    
+    printf("\n注意: 此统计基于Wireshark的UDP stream机制\n");
+    printf("每个唯一的UDP 5-tuple创建一个稳定的stream ID\n");
 }
