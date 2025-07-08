@@ -14,7 +14,6 @@
 #include <sys/time.h>
 #include <math.h>
 #include <linux/igmp.h>
-#include <pthread.h>
 #include <stdatomic.h>
 
 #include "flow.h"

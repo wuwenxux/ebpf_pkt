@@ -524,7 +524,7 @@ void sig_handler(int sig) {
         //     print_final_stats();
         // }
         
-        // Give some time for threads to finish
+        // Give some time for cleanup to finish
         sleep(1);
         alarm(5); // Set a 5-second timeout
     } else {
