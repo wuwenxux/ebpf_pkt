@@ -9,7 +9,6 @@
 #include <time.h>
 #include <fcntl.h>
 #include <sys/file.h>
-#include <pthread.h>  // 添加pthread库支持
 
 // System monitoring headers
 #include <sys/resource.h>
@@ -51,8 +50,6 @@ typedef unsigned char u_char;
 #define PREFETCH_LOCALITY_NONE 0
 
 // 多线程相关配置
-#define DEFAULT_NUM_THREADS 4    // 默认工作线程数
-#define MAX_NUM_THREADS 32       // 最大工作线程数
 #define PACKET_QUEUE_SIZE 10000  // 数据包队列大小
 
 // ANSI转义序列用于终端控制
@@ -88,7 +85,6 @@ volatile int running = 1;
 
 // 函数前向声明
 void print_final_stats(void);
-static void stop_worker_threads(void);
 
 // flow_table_initialized是flow.c中的变量，我们在这里声明为外部变量
 extern int flow_table_initialized;
@@ -129,7 +125,6 @@ static int cleanup_interval = DEFAULT_CLEANUP_INTERVAL;  // 使用从cicflowmete
 static int duration = DEFAULT_DURATION;  // in seconds, 0 means run indefinitely
 static time_t start_time;                // program start time
 static int lock_fd = -1;                // 文件锁描述符
-static int num_threads = DEFAULT_NUM_THREADS; // 工作线程数量
 static const char *csv_file = DEFAULT_CSV_FILE; // CSV输出文件路径
 static int loop_count = DEFAULT_LOOP_COUNT;     // pcap循环播放次数，0表示无限循环
 static int loop_delay = 0;                      // 每次循环之间的延迟（秒）
@@ -363,12 +358,6 @@ static uint64_t packet_queue_size(lockfree_queue_t *queue) {
     return tail - head;
 }
 
-// 线程相关
-static pthread_t *worker_threads = NULL;
-static pthread_t stats_thread;       // 统计线程
-static pthread_mutex_t stats_mutex = PTHREAD_MUTEX_INITIALIZER; // 统计互斥锁
-static pthread_mutex_t flow_table_mutex = PTHREAD_MUTEX_INITIALIZER; // 流表互斥锁
-
 // 包处理计数器
 static volatile uint64_t total_packets_processed = 0;
 static volatile uint64_t total_bytes_processed = 0;
@@ -391,11 +380,9 @@ struct perf_buffer_opts opts = {
 // Add a global flag to track if cleanup has been done
 static int cleanup_done = 0;
 
-// 线程安全版本的流表访问函数
-static void thread_safe_process_packet(const struct iphdr *ip, uint16_t src_port, uint16_t dst_port, 
-                                     uint32_t tcp_seq, uint8_t tcp_flags, uint64_t timestamp) {
-    pthread_mutex_lock(&flow_table_mutex);
-    
+// 直接处理数据包函数（单线程版本）
+static void process_packet_direct(const struct iphdr *ip, uint16_t src_port, uint16_t dst_port, 
+                                uint32_t tcp_seq, uint8_t tcp_flags, uint64_t timestamp) {
     // 创建传输层头部信息用于传递给process_packet
     if (ip->protocol == IPPROTO_TCP) {
         // 对于TCP，我们需要传递序列号和标志位
@@ -415,105 +402,9 @@ static void thread_safe_process_packet(const struct iphdr *ip, uint16_t src_port
         process_packet(ip, &udp_info, timestamp);
     }
     
-    pthread_mutex_unlock(&flow_table_mutex);
-    
     // 更新统计信息
     __sync_fetch_and_add(&total_packets_processed, 1);
     __sync_fetch_and_add(&total_bytes_processed, ntohs(ip->tot_len));
-}
-
-// 工作线程函数，从队列中获取数据包并处理
-static void *worker_thread_func(void *arg) {
-    packet_data_t packet;
-    int idle_count = 0;
-    const int max_idle = 1000; // 最大空闲次数
-    
-    while (running) {
-        // 从队列中获取数据包
-        int result = packet_queue_dequeue(&packet_queue, &packet);
-        
-        if (result == 0) {
-            // 成功获取数据包，重置空闲计数
-            idle_count = 0;
-            
-            // 预取数据包内容以提高性能
-            PREFETCH(&packet.ip_header);
-            PREFETCH(&packet.transport_header);
-            
-            // 处理数据包
-            if (packet.ip_header.protocol == IPPROTO_TCP) {
-                // 从存储的TCP头部数据中提取标志位
-                struct tcphdr *tcp_header = (struct tcphdr *)packet.transport_header.tcp.flags_byte;
-                uint8_t tcp_flags = *((uint8_t*)tcp_header + 13);  // TCP标志位在第13字节
-                uint32_t tcp_seq = packet.transport_header.tcp.seq;
-                
-                thread_safe_process_packet(&packet.ip_header, 
-                                         packet.transport_header.tcp.source,
-                                         packet.transport_header.tcp.dest,
-                                         tcp_seq, tcp_flags, packet.timestamp);
-            } else if (packet.ip_header.protocol == IPPROTO_UDP) {
-                thread_safe_process_packet(&packet.ip_header,
-                                         packet.transport_header.udp.source,
-                                         packet.transport_header.udp.dest,
-                                         0, 0, packet.timestamp);  // UDP没有序列号和标志位
-            }
-        } else {
-            // 队列为空或出错，增加空闲计数
-            idle_count++;
-            
-            // 如果空闲时间过长，让出CPU
-            if (idle_count > max_idle) {
-                usleep(100); // 100微秒
-                idle_count = 0;
-            } else {
-                // 短暂yield
-                __asm__ __volatile__("pause" ::: "memory");
-            }
-            
-            // 检查是否应该退出
-            if (!running) break;
-        }
-    }
-    
-    return NULL;
-}
-
-// 统计线程函数，定期打印流统计信息
-static void *stats_thread_func(void *arg) {
-    time_t last_stats_time = 0;
-    time_t last_cleanup_time = 0;
-    
-    while (running) {
-        // 睡眠一小段时间检查是否需要打印统计信息
-        usleep(250000); // 250ms
-        
-        time_t current_time = time(NULL);
-        
-        // 检查是否需要打印统计信息
-        if (current_time - last_stats_time >= stats_interval) {
-            pthread_mutex_lock(&stats_mutex);
-            print_flow_stats();
-            last_stats_time = current_time;
-            pthread_mutex_unlock(&stats_mutex);
-        }
-        
-        // 检查是否需要清理过期流
-        if (current_time - last_cleanup_time >= cleanup_interval) {
-            pthread_mutex_lock(&flow_table_mutex);
-            cleanup_flows();
-            last_cleanup_time = current_time;
-            pthread_mutex_unlock(&flow_table_mutex);
-        }
-        
-        // 检查是否超过指定运行时间
-        if (duration > 0 && current_time - start_time >= duration) {
-            printf("Reached specified duration of %d seconds. Exiting...\n", duration);
-            running = 0;
-            break;
-        }
-    }
-    
-    return NULL;
 }
 
 static void cleanup(void) {
@@ -521,13 +412,6 @@ static void cleanup(void) {
         return;
     }
     cleanup_done = 1;
-    
-    // 停止worker线程
-    if (worker_threads != NULL) {
-        stop_worker_threads();
-        free(worker_threads);
-        worker_threads = NULL;
-    }
     
     // 销毁数据包队列
     packet_queue_destroy(&packet_queue);
@@ -702,59 +586,6 @@ static int check_single_instance(void) {
     return 0;
 }
 
-// 创建并启动工作线程
-static int start_worker_threads() {
-    worker_threads = (pthread_t *)malloc(num_threads * sizeof(pthread_t));
-    if (!worker_threads) {
-        fprintf(stderr, "Failed to allocate memory for worker threads\n");
-        return -1;
-    }
-    
-    // 创建工作线程
-    for (int i = 0; i < num_threads; i++) {
-        if (pthread_create(&worker_threads[i], NULL, worker_thread_func, NULL) != 0) {
-            fprintf(stderr, "Failed to create worker thread %d\n", i);
-            return -1;
-        }
-        
-        // 设置线程亲和性，将线程分配到不同的CPU核心
-        cpu_set_t cpuset;
-        CPU_ZERO(&cpuset);
-        CPU_SET(i % sysconf(_SC_NPROCESSORS_ONLN), &cpuset);
-        pthread_setaffinity_np(worker_threads[i], sizeof(cpu_set_t), &cpuset);
-    }
-    
-    // 创建统计线程
-    if (pthread_create(&stats_thread, NULL, stats_thread_func, NULL) != 0) {
-        fprintf(stderr, "Failed to create stats thread\n");
-        return -1;
-    }
-    
-    return 0;
-}
-
-// 停止所有工作线程
-static void stop_worker_threads() {
-    if (!worker_threads) {
-        return;
-    }
-    
-    // 设置运行标志为停止
-    running = 0;
-    
-    // 等待所有工作线程退出
-    for (int i = 0; i < num_threads; i++) {
-        pthread_join(worker_threads[i], NULL);
-    }
-    
-    // 等待统计线程退出
-    pthread_join(stats_thread, NULL);
-    
-    // 释放线程资源
-    free(worker_threads);
-    worker_threads = NULL;
-}
-
 // 修改后的BPF数据处理函数，将数据包添加到队列
 static void handle_batch(void *ctx, int cpu, void *data, __u32 size) {
     const struct packet_info *pkts = data;
@@ -895,13 +726,6 @@ int process_pcap_file(const char *pcap_file) {
     // Initialize flow tracking
     flow_table_init();
     
-    // 启动工作线程
-    if (start_worker_threads() != 0) {
-        fprintf(stderr, "Failed to start worker threads\n");
-        return -1;
-    }
-    
-    printf("Started %d worker threads for packet processing\n", num_threads);
     printf("Processing pcap file: %s\n", pcap_file);
     
     if (loop_count == 0) {
@@ -1005,48 +829,26 @@ int process_pcap_file(const char *pcap_file) {
     }
     
     while (packet_queue_size(&packet_queue) > 0 && running) {
-        usleep(10000); // 10ms
-    }
-    
-    // 停止工作线程
-    stop_worker_threads();
-
-    // 输出流统计信息 - 已注释掉
-    /*
-    printf("====== Conversation & Flow Statistics ======\n");
-    
-    // 使用get_total_conversation_count统计对话总数
-    uint32_t total_conversations = get_total_conversation_count();
-    uint32_t tcp_conversations = get_tcp_conversation_count();
-    uint32_t udp_conversations = get_udp_conversation_count();
-    
-    // 统计活跃流和所有流的数量
-    int active_flows = count_active_flows();
-    int all_flows = count_all_flows();
-    
-    printf("Conversations: Total=%u (TCP=%u, UDP=%u)\n", 
-           total_conversations, tcp_conversations, udp_conversations);
-    printf("Flows: Active=%d, Total=%d, Inactive=%d\n", 
-           active_flows, all_flows, all_flows - active_flows);
-    
-    // 计算活跃流和所有流的方向统计
-    int forward_active_flows = 0, reverse_active_flows = 0;
-    count_flow_directions(&forward_active_flows, &reverse_active_flows);
-    
-    int forward_all_flows = 0, reverse_all_flows = 0;
-    count_all_flow_directions(&forward_all_flows, &reverse_all_flows);
-    
-    printf("Flow Directions - Active: Forward=%d, Reverse=%d\n", 
-           forward_active_flows, reverse_active_flows);
-    printf("Flow Directions - Total: Forward=%d, Reverse=%d\n", 
-           forward_all_flows, reverse_all_flows);
-    printf("============================================\n");
-    */
-    
-    // Clean up
-    if (handle) {
-        pcap_close(handle);
-        handle = NULL;
+        packet_data_t packet;
+        if (packet_queue_dequeue(&packet_queue, &packet) == 0) {
+            // 直接处理数据包
+            if (packet.ip_header.protocol == IPPROTO_TCP) {
+                // 从存储的TCP头部数据中提取标志位
+                struct tcphdr *tcp_header = (struct tcphdr *)packet.transport_header.tcp.flags_byte;
+                uint8_t tcp_flags = *((uint8_t*)tcp_header + 13);  // TCP标志位在第13字节
+                uint32_t tcp_seq = packet.transport_header.tcp.seq;
+                
+                process_packet_direct(&packet.ip_header, 
+                                    packet.transport_header.tcp.source,
+                                    packet.transport_header.tcp.dest,
+                                    tcp_seq, tcp_flags, packet.timestamp);
+            } else if (packet.ip_header.protocol == IPPROTO_UDP) {
+                process_packet_direct(&packet.ip_header,
+                                    packet.transport_header.udp.source,
+                                    packet.transport_header.udp.dest,
+                                    0, 0, packet.timestamp);  // UDP没有序列号和标志位
+            }
+        }
     }
     
     // 调用统一清理函数
@@ -1077,13 +879,7 @@ int run_live_capture(const char *ifname) {
         printf("Will capture traffic for %d seconds\n", duration);
     }
     
-    // 启动工作线程
-    if (start_worker_threads() != 0) {
-        fprintf(stderr, "Failed to start worker threads\n");
-        return -1;
-    }
-    
-    printf("Started %d worker threads for packet processing\n", num_threads);
+    printf("Processing pcap file: %s\n", ifname);
 
     /* 1. Load BPF program */
     obj = bpf_object__open_file("bpf_program.o", NULL);
@@ -1166,44 +962,28 @@ int run_live_capture(const char *ifname) {
     
     // 等待队列处理完所有数据包
     while (packet_queue_size(&packet_queue) > 0 && running) {
-        usleep(10000); // 10ms
+        packet_data_t packet;
+        if (packet_queue_dequeue(&packet_queue, &packet) == 0) {
+            // 直接处理数据包
+            if (packet.ip_header.protocol == IPPROTO_TCP) {
+                // 从存储的TCP头部数据中提取标志位
+                struct tcphdr *tcp_header = (struct tcphdr *)packet.transport_header.tcp.flags_byte;
+                uint8_t tcp_flags = *((uint8_t*)tcp_header + 13);  // TCP标志位在第13字节
+                uint32_t tcp_seq = packet.transport_header.tcp.seq;
+                
+                process_packet_direct(&packet.ip_header, 
+                                    packet.transport_header.tcp.source,
+                                    packet.transport_header.tcp.dest,
+                                    tcp_seq, tcp_flags, packet.timestamp);
+            } else if (packet.ip_header.protocol == IPPROTO_UDP) {
+                process_packet_direct(&packet.ip_header,
+                                    packet.transport_header.udp.source,
+                                    packet.transport_header.udp.dest,
+                                    0, 0, packet.timestamp);  // UDP没有序列号和标志位
+            }
+        }
     }
     
-    // 停止工作线程
-    stop_worker_threads();
-
-    // 输出流统计信息 - 已注释掉
-    /*
-    printf("====== Flow Statistics ======\n");
-    
-    // 使用get_total_conversation_count统计对话总数
-    uint32_t total_conversations = get_total_conversation_count();
-    uint32_t tcp_conversations = get_tcp_conversation_count();
-    uint32_t udp_conversations = get_udp_conversation_count();
-    
-    // 统计活跃流和所有流的数量
-    int active_flows = count_active_flows();
-    int all_flows = count_all_flows();
-    
-    printf("Conversations: Total=%u (TCP=%u, UDP=%u)\n", 
-           total_conversations, tcp_conversations, udp_conversations);
-    printf("Flows: Active=%d, Total=%d, Inactive=%d\n", 
-           active_flows, all_flows, all_flows - active_flows);
-    
-    // 计算活跃流和所有流的方向统计
-    int forward_active_flows = 0, reverse_active_flows = 0;
-    count_flow_directions(&forward_active_flows, &reverse_active_flows);
-    
-    int forward_all_flows = 0, reverse_all_flows = 0;
-    count_all_flow_directions(&forward_all_flows, &reverse_all_flows);
-    
-    printf("Flow Directions - Active: Forward=%d, Reverse=%d\n", 
-           forward_active_flows, reverse_active_flows);
-    printf("Flow Directions - Total: Forward=%d, Reverse=%d\n", 
-           forward_all_flows, reverse_all_flows);
-    printf("============================================\n");
-    */
-
 cleanup:
     // Cleanup resources in reverse order of creation
     if (pb) {
@@ -1626,8 +1406,6 @@ void print_usage(const char *prog_name) {
            DEFAULT_STATS_PACKETS);
     printf("  -c, --cleanup <seconds>     Flow cleanup interval (default: %d seconds)\n", 
            DEFAULT_CLEANUP_INTERVAL);
-    printf("  -t, --threads <count>       Number of worker threads (default: %d)\n",
-           DEFAULT_NUM_THREADS);
     printf("  -o, --output <csv-file>     Export features to CSV file\n");
     printf("  -l, --loop <count>          Loop pcap file N times (0 = infinite, default: 1)\n");
     printf("  -w, --wait <seconds>        Wait N seconds between loops (default: 0)\n");
@@ -1671,7 +1449,6 @@ int main(int argc, char **argv) {
         {"stats-interval", required_argument, 0, 's'},
         {"packets",       required_argument, 0, 'p'},
         {"cleanup",       required_argument, 0, 'c'},
-        {"threads",       required_argument, 0, 't'},
         {"output",        required_argument, 0, 'o'},
         {"loop",          required_argument, 0, 'l'},
         {"wait",          required_argument, 0, 'w'},
@@ -1681,7 +1458,7 @@ int main(int argc, char **argv) {
         {0, 0, 0, 0}
     };
 
-    while ((c = getopt_long(argc, argv, "i:r:d:s:p:c:t:o:l:w:v:qh", long_options, NULL)) != -1) {
+    while ((c = getopt_long(argc, argv, "i:r:d:s:p:c:o:l:w:v:qh", long_options, NULL)) != -1) {
         switch (c) {
             case 'i':
                 ifname = optarg;
@@ -1720,19 +1497,6 @@ int main(int argc, char **argv) {
                     return 1;
                 }
                 printf("Setting cleanup interval to %d seconds\n", cleanup_interval);
-                break;
-            case 't':
-                num_threads = atoi(optarg);
-                if (num_threads <= 0) {
-                    fprintf(stderr, "Thread count must be a positive number\n");
-                    return 1;
-                }
-                if (num_threads > MAX_NUM_THREADS) {
-                    fprintf(stderr, "Thread count cannot exceed %d, setting to %d\n", 
-                            MAX_NUM_THREADS, MAX_NUM_THREADS);
-                    num_threads = MAX_NUM_THREADS;
-                }
-                printf("Setting worker thread count to %d\n", num_threads);
                 break;
             case 'o':
                 csv_file = optarg;

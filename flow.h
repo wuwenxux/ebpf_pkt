@@ -592,9 +592,6 @@ void update_flow_bulk_cic(struct flow_stats *stats, uint32_t payload_size, int i
 // 对话计数器重置函数 (类似Wireshark的tcp_init())
 void reset_conversation_counters();
 
-// 获取对话计数函数 (类似Wireshark的get_tcp_stream_count())
-uint32_t get_tcp_conversation_count();
-uint32_t get_udp_conversation_count();  
 
 // 分配对话ID函数 (类似Wireshark的tcpd->stream = tcp_stream_count++)
 uint32_t assign_tcp_conversation_id();
@@ -667,13 +664,7 @@ int count_wireshark_all_conversations(void);
 void count_tcp_conversations_by_completeness(int *complete, int *incomplete, int *partial);
 void print_wireshark_conversation_stats(void);
 
-// 向后兼容函数
-int count_tshark_tcp_conversations(void);
-int count_tshark_udp_conversations(void);
-int count_all_flows(void);
-int count_active_flows(void);
-void count_flow_directions(int *forward_flows, int *reverse_flows);
-void count_all_flow_directions(int *forward_flows, int *reverse_flows);
+
 
 // TCP会话统计
 int count_tcp_sessions_by_lifecycle(void);
@@ -704,5 +695,15 @@ int get_debug_level(void);
 void timestamp_array_init(timestamp_array_t *arr);
 void timestamp_array_add(timestamp_array_t *arr, uint64_t timestamp);
 void timestamp_array_free(timestamp_array_t *arr);
+
+// 五元组会话统计函数
+void count_sessions_by_five_tuple();
+
+// Wireshark风格会话打印函数
+void print_all_wireshark_sessions();
+
+// **新增**: tshark风格会话计数和验证函数
+int count_tshark_style_tcp_sessions();
+void verify_tshark_style_counting();
 
 #endif /* FLOW_H */
