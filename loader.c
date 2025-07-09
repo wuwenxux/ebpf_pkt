@@ -678,6 +678,16 @@ void process_pcap_packet(const u_char *packet, const struct pcap_pkthdr *header)
     // 复制IP头
     memcpy(&packet_data.ip_header, ip, sizeof(struct iphdr));
     
+    // 调试信息已关闭
+    // static int debug_count = 0;
+    // if (debug_count < 10) {
+    //     struct in_addr src_addr = {.s_addr = ip->saddr};
+    //     struct in_addr dst_addr = {.s_addr = ip->daddr};
+    //     printf("PCAP DEBUG: Packet %d - IP: %s -> %s, Protocol: %d\n", 
+    //            debug_count + 1, inet_ntoa(src_addr), inet_ntoa(dst_addr), ip->protocol);
+    //     debug_count++;
+    // }
+    
     // 提取并转换时间戳为纳秒
     packet_data.timestamp = (uint64_t)header->ts.tv_sec * 1000000000ULL + (uint64_t)header->ts.tv_usec * 1000ULL;
     
@@ -1290,10 +1300,10 @@ void print_final_stats(void) {
         }
         
         if (csv_fp) {
-            // 基本流信息
+            // 基本流信息 - 使用原始端口号和IP地址
             fprintf(csv_fp, "%d,%s,%d,%s,%d,%d,%.6f,%s,%d,",
-                   flow->flow_id, flow->src_ip, node->key.src_port, 
-                   flow->dst_ip, node->key.dst_port,
+                   flow->flow_id, flow->src_ip, node->original_src_port, 
+                   flow->dst_ip, node->original_dst_port,
                    node->key.protocol, flow->duration, flow->start_time_str, flow->is_active);
             
             // 方向统计

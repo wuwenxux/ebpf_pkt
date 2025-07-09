@@ -525,6 +525,12 @@ struct flow_node {
     uint8_t in_use;         // 标记是否使用中
     uint8_t tcp_state;      // TCP连接状态
     
+    // =================== 原始端口号字段（用于CSV输出）===================
+    uint16_t original_src_port;     // 原始源端口号（数据包中的实际端口）
+    uint16_t original_dst_port;     // 原始目标端口号（数据包中的实际端口）
+    uint32_t original_src_ip;       // 原始源IP地址
+    uint32_t original_dst_ip;       // 原始目标IP地址
+    
     // =================== Wireshark风格的对话字段 ===================
     uint32_t conversation_id;       // 对话ID (类似Wireshark的stream)
     uint8_t  completeness;          // 对话完整性标志

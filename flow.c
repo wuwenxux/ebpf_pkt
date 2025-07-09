@@ -281,6 +281,12 @@ struct flow_node *flow_table_insert_with_timestamp(const struct flow_key *key, u
     // 使用传入的已标准化的key (确保双向conversation一致性)
     node->key = *key;
     
+    // 初始化原始端口号和IP地址（默认为标准化后的值）
+    node->original_src_port = key->src_port;
+    node->original_dst_port = key->dst_port;
+    node->original_src_ip = key->src_ip;
+    node->original_dst_ip = key->dst_ip;
+    
     // 初始化统计结构
     memset(&node->stats, 0, sizeof(struct flow_stats));
     
@@ -384,13 +390,23 @@ struct flow_stats* get_or_create_conversation(const struct flow_key *key, int *i
         return get_or_create_udp_conversation(key, is_reverse_ptr, packet_timestamp);
     }
     
+    // 保存原始端口号和IP地址（用于CSV输出）
+    uint16_t original_src_port = key->src_port;
+    uint16_t original_dst_port = key->dst_port;
+    uint32_t original_src_ip = key->src_ip;
+    uint32_t original_dst_ip = key->dst_ip;
+    
     // TCP继续使用原有的复杂逻辑（已优化）
     // 标准化流键 - 确保较小的IP地址作为源地址
     struct flow_key normalized_key;
     bool is_reverse = false;
     
-    if (key->src_ip < key->dst_ip || 
-        (key->src_ip == key->dst_ip && key->src_port < key->dst_port)) {
+    // 修复IP地址字节序比较问题 - 转换为主机字节序进行比较
+    uint32_t src_ip_host = ntohl(key->src_ip);
+    uint32_t dst_ip_host = ntohl(key->dst_ip);
+    
+    if (src_ip_host < dst_ip_host || 
+        (src_ip_host == dst_ip_host && key->src_port < key->dst_port)) {
         normalized_key = *key;
         is_reverse = false;
     } else {
@@ -448,6 +464,12 @@ struct flow_stats* get_or_create_conversation(const struct flow_key *key, int *i
                 // 这样可以保持历史会话记录，更符合tshark行为
                 struct flow_node *new_session_node = flow_table_insert_with_timestamp(&normalized_key, packet_timestamp);
                 if (new_session_node) {
+                    // 设置原始端口号和IP地址
+                    new_session_node->original_src_port = original_src_port;
+                    new_session_node->original_dst_port = original_dst_port;
+                    new_session_node->original_src_ip = original_src_ip;
+                    new_session_node->original_dst_ip = original_dst_ip;
+                    
                     // 初始化TCP相关字段
                     if ((tcp_flags & TCP_FLAG_SYN)) {
                         new_session_node->stats.tcp_base_seq_set = true;
@@ -485,6 +507,12 @@ struct flow_stats* get_or_create_conversation(const struct flow_key *key, int *i
     if (!new_node) {
         return NULL;
     }
+    
+    // 设置原始端口号和IP地址
+    new_node->original_src_port = original_src_port;
+    new_node->original_dst_port = original_dst_port;
+    new_node->original_src_ip = original_src_ip;
+    new_node->original_dst_ip = original_dst_ip;
     
     // 初始化TCP相关字段
     if (key->protocol == IPPROTO_TCP && (tcp_flags & TCP_FLAG_SYN)) {
@@ -592,6 +620,21 @@ void process_packet(const struct iphdr *ip, const void *transport_hdr, uint64_t 
     key.src_ip = ip->saddr;
     key.dst_ip = ip->daddr;
     key.protocol = ip->protocol;
+    
+    // 添加详细调试信息，检查IP地址原始字节和主机序
+    // static int debug_count = 0;
+    // if (debug_count < 10) {
+    //     char src_ip_str[INET_ADDRSTRLEN];
+    //     char dst_ip_str[INET_ADDRSTRLEN];
+    //     inet_ntop(AF_INET, &ip->saddr, src_ip_str, sizeof(src_ip_str));
+    //     inet_ntop(AF_INET, &ip->daddr, dst_ip_str, sizeof(dst_ip_str));
+    //     printf("DEBUG: Packet %d - src raw: %08x, dst raw: %08x | src host: %08x, dst host: %08x | %s -> %s\n",
+    //         debug_count + 1,
+    //         ip->saddr, ip->daddr,
+    //         ntohl(ip->saddr), ntohl(ip->daddr),
+    //         src_ip_str, dst_ip_str);
+    //     debug_count++;
+    // }
     
     uint8_t flags = 0;
     
@@ -1142,8 +1185,12 @@ struct flow_stats* get_or_create_udp_conversation(const struct flow_key *key, in
     struct flow_key normalized_key;
     bool is_reverse = false;
     
-    if (key->src_ip < key->dst_ip || 
-        (key->src_ip == key->dst_ip && key->src_port < key->dst_port)) {
+    // 修复IP地址字节序比较问题 - 转换为主机字节序进行比较
+    uint32_t src_ip_host = ntohl(key->src_ip);
+    uint32_t dst_ip_host = ntohl(key->dst_ip);
+    
+    if (src_ip_host < dst_ip_host || 
+        (src_ip_host == dst_ip_host && key->src_port < key->dst_port)) {
         normalized_key = *key;
         is_reverse = false;
     } else {
@@ -1432,18 +1479,35 @@ void count_sessions_by_five_tuple() {
     
     int display_count = (stats_count < 20) ? stats_count : 20;
     for (int i = 0; i < display_count; i++) {
-        struct in_addr src_addr = {.s_addr = stats_array[i].key.src_ip};
-        struct in_addr dst_addr = {.s_addr = stats_array[i].key.dst_ip};
-        
+        char src_ip_str[INET_ADDRSTRLEN];
+        char dst_ip_str[INET_ADDRSTRLEN];
+        inet_ntop(AF_INET, &stats_array[i].key.src_ip, src_ip_str, sizeof(src_ip_str));
+        inet_ntop(AF_INET, &stats_array[i].key.dst_ip, dst_ip_str, sizeof(dst_ip_str));
         double duration_ms = 0.0;
         if (stats_array[i].last_seen > stats_array[i].first_seen) {
             duration_ms = (stats_array[i].last_seen - stats_array[i].first_seen) / 1000000.0;
         }
+        // 查找对应的flow_node以获取原始端口号
+        uint16_t original_src_port = stats_array[i].key.src_port;
+        uint16_t original_dst_port = stats_array[i].key.dst_port;
+        
+        // 在flow_table中查找对应的节点以获取原始端口号
+        for (int j = 0; j < HASH_TABLE_SIZE; j++) {
+            struct flow_node *node = flow_table[j];
+            while (node) {
+                if (memcmp(&node->key, &stats_array[i].key, sizeof(struct flow_key)) == 0) {
+                    original_src_port = node->original_src_port;
+                    original_dst_port = node->original_dst_port;
+                    break;
+                }
+                node = node->next;
+            }
+        }
         
         printf("%-4d %-15s %-6u %-15s %-6u %-8s %-8u %-10u %-10u %-12lu %-12lu %-15.2f\n",
                i + 1,
-               inet_ntoa(src_addr), ntohs(stats_array[i].key.src_port),
-               inet_ntoa(dst_addr), ntohs(stats_array[i].key.dst_port),
+               src_ip_str, ntohs(original_src_port),
+               dst_ip_str, ntohs(original_dst_port),
                stats_array[i].protocol_name,
                stats_array[i].session_count,
                stats_array[i].tcp_sessions,
