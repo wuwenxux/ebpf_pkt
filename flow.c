@@ -405,10 +405,26 @@ struct flow_stats* get_or_create_conversation(const struct flow_key *key, int *i
     uint32_t src_ip_host = ntohl(key->src_ip);
     uint32_t dst_ip_host = ntohl(key->dst_ip);
     
+    // 添加调试输出
+    static int debug_count = 0;
+    if (debug_count < 10) {
+        char src_ip_str[INET_ADDRSTRLEN];
+        char dst_ip_str[INET_ADDRSTRLEN];
+        inet_ntop(AF_INET, &key->src_ip, src_ip_str, sizeof(src_ip_str));
+        inet_ntop(AF_INET, &key->dst_ip, dst_ip_str, sizeof(dst_ip_str));
+        printf("DEBUG: Packet %d - Original: %s:%d -> %s:%d (src_host: %08x, dst_host: %08x)\n",
+               debug_count + 1, src_ip_str, key->src_port, dst_ip_str, key->dst_port,
+               src_ip_host, dst_ip_host);
+        debug_count++;
+    }
+    
     if (src_ip_host < dst_ip_host || 
         (src_ip_host == dst_ip_host && key->src_port < key->dst_port)) {
         normalized_key = *key;
         is_reverse = false;
+        if (debug_count <= 10) {
+            printf("DEBUG: No normalization needed\n");
+        }
     } else {
         normalized_key.src_ip = key->dst_ip;
         normalized_key.dst_ip = key->src_ip;
@@ -416,6 +432,14 @@ struct flow_stats* get_or_create_conversation(const struct flow_key *key, int *i
         normalized_key.dst_port = key->src_port;
         normalized_key.protocol = key->protocol;
         is_reverse = true;
+        if (debug_count <= 10) {
+            char norm_src_ip_str[INET_ADDRSTRLEN];
+            char norm_dst_ip_str[INET_ADDRSTRLEN];
+            inet_ntop(AF_INET, &normalized_key.src_ip, norm_src_ip_str, sizeof(norm_src_ip_str));
+            inet_ntop(AF_INET, &normalized_key.dst_ip, norm_dst_ip_str, sizeof(norm_dst_ip_str));
+            printf("DEBUG: Normalized to: %s:%d -> %s:%d\n",
+                   norm_src_ip_str, normalized_key.src_port, norm_dst_ip_str, normalized_key.dst_port);
+        }
     }
     
     if (is_reverse_ptr) {
@@ -1638,6 +1662,14 @@ void print_all_wireshark_sessions() {
                 struct in_addr src_addr = {.s_addr = node->key.src_ip};
                 struct in_addr dst_addr = {.s_addr = node->key.dst_ip};
                 
+                // 添加调试输出
+                char src_ip_str[INET_ADDRSTRLEN];
+                char dst_ip_str[INET_ADDRSTRLEN];
+                inet_ntop(AF_INET, &node->key.src_ip, src_ip_str, sizeof(src_ip_str));
+                inet_ntop(AF_INET, &node->key.dst_ip, dst_ip_str, sizeof(dst_ip_str));
+                printf("DEBUG: Flow table entry - src: %s:%d, dst: %s:%d\n", 
+                       src_ip_str, node->key.src_port, dst_ip_str, node->key.dst_port);
+                
                 // 计算会话持续时间 (毫秒)
                 double duration_ms = 0.0;
                 if (node->last_packet_time > node->first_packet_time) {
@@ -1677,8 +1709,8 @@ void print_all_wireshark_sessions() {
                 
                 printf("%-4u %-15s %-6u %-15s %-6u %-8s %-10lu %-10lu %-10lu %-10lu %-12lu %-12lu %-10.2f %-15s\n",
                        session_id,
-                       inet_ntoa(src_addr), ntohs(node->key.src_port),
-                       inet_ntoa(dst_addr), ntohs(node->key.dst_port),
+                       src_ip_str, ntohs(node->key.src_port),
+                       dst_ip_str, ntohs(node->key.dst_port),
                        "TCP",
                        node->stats.fwd_packets, node->stats.fwd_bytes,
                        node->stats.bwd_packets, node->stats.bwd_bytes,
@@ -1698,6 +1730,12 @@ void print_all_wireshark_sessions() {
             if (node->key.protocol == IPPROTO_UDP) {
                 struct in_addr src_addr = {.s_addr = node->key.src_ip};
                 struct in_addr dst_addr = {.s_addr = node->key.dst_ip};
+                
+                // 添加调试输出
+                char src_ip_str[INET_ADDRSTRLEN];
+                char dst_ip_str[INET_ADDRSTRLEN];
+                inet_ntop(AF_INET, &node->key.src_ip, src_ip_str, sizeof(src_ip_str));
+                inet_ntop(AF_INET, &node->key.dst_ip, dst_ip_str, sizeof(dst_ip_str));
                 
                 // 计算会话持续时间 (毫秒)
                 double duration_ms = 0.0;
@@ -1719,8 +1757,8 @@ void print_all_wireshark_sessions() {
                 
                 printf("%-4u %-15s %-6u %-15s %-6u %-8s %-10lu %-10lu %-10lu %-10lu %-12lu %-12lu %-10.2f %-15s\n",
                        session_id,
-                       inet_ntoa(src_addr), ntohs(node->key.src_port),
-                       inet_ntoa(dst_addr), ntohs(node->key.dst_port),
+                       src_ip_str, ntohs(node->key.src_port),
+                       dst_ip_str, ntohs(node->key.dst_port),
                        "UDP",
                        node->stats.fwd_packets, node->stats.fwd_bytes,
                        node->stats.bwd_packets, node->stats.bwd_bytes,
@@ -1740,6 +1778,12 @@ void print_all_wireshark_sessions() {
             if (node->key.protocol != IPPROTO_TCP && node->key.protocol != IPPROTO_UDP) {
                 struct in_addr src_addr = {.s_addr = node->key.src_ip};
                 struct in_addr dst_addr = {.s_addr = node->key.dst_ip};
+                
+                // 添加调试输出
+                char src_ip_str[INET_ADDRSTRLEN];
+                char dst_ip_str[INET_ADDRSTRLEN];
+                inet_ntop(AF_INET, &node->key.src_ip, src_ip_str, sizeof(src_ip_str));
+                inet_ntop(AF_INET, &node->key.dst_ip, dst_ip_str, sizeof(dst_ip_str));
                 
                 // 计算会话持续时间 (毫秒)
                 double duration_ms = 0.0;
@@ -1779,8 +1823,8 @@ void print_all_wireshark_sessions() {
                 
                 printf("%-4u %-15s %-6u %-15s %-6u %-8s %-10lu %-10lu %-10lu %-10lu %-12lu %-12lu %-10.2f %-15s\n",
                        session_id,
-                       inet_ntoa(src_addr), ntohs(node->key.src_port),
-                       inet_ntoa(dst_addr), ntohs(node->key.dst_port),
+                       src_ip_str, ntohs(node->key.src_port),
+                       dst_ip_str, ntohs(node->key.dst_port),
                        protocol_name,
                        node->stats.fwd_packets, node->stats.fwd_bytes,
                        node->stats.bwd_packets, node->stats.bwd_bytes,
