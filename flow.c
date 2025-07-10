@@ -87,8 +87,8 @@ uint32_t assign_udp_conversation_id() {
 
 void handle_tcp(const void *transport_hdr, struct flow_key *key, uint8_t *flags) {
     const struct tcphdr *tcp = (const struct tcphdr*)transport_hdr;
-    key->src_port = ntohs(tcp->source);
-    key->dst_port = ntohs(tcp->dest);
+    key->src_port = tcp->source;  // 已经是主机字节序
+    key->dst_port = tcp->dest;    // 已经是主机字节序
     
     // 提取TCP标志
     *flags = 0;
@@ -102,8 +102,8 @@ void handle_tcp(const void *transport_hdr, struct flow_key *key, uint8_t *flags)
 
 void handle_udp(const void *transport_hdr, struct flow_key *key, uint8_t *flags) {
     const struct udphdr *udp = (const struct udphdr*)transport_hdr;
-    key->src_port = ntohs(udp->source);
-    key->dst_port = ntohs(udp->dest);
+    key->src_port = udp->source;  // 已经是主机字节序
+    key->dst_port = udp->dest;    // 已经是主机字节序
     *flags = 0; // UDP没有标志
 }
 
@@ -405,26 +405,11 @@ struct flow_stats* get_or_create_conversation(const struct flow_key *key, int *i
     uint32_t src_ip_host = ntohl(key->src_ip);
     uint32_t dst_ip_host = ntohl(key->dst_ip);
     
-    // 添加调试输出
-    static int debug_count = 0;
-    if (debug_count < 10) {
-        char src_ip_str[INET_ADDRSTRLEN];
-        char dst_ip_str[INET_ADDRSTRLEN];
-        inet_ntop(AF_INET, &key->src_ip, src_ip_str, sizeof(src_ip_str));
-        inet_ntop(AF_INET, &key->dst_ip, dst_ip_str, sizeof(dst_ip_str));
-        printf("DEBUG: Packet %d - Original: %s:%d -> %s:%d (src_host: %08x, dst_host: %08x)\n",
-               debug_count + 1, src_ip_str, key->src_port, dst_ip_str, key->dst_port,
-               src_ip_host, dst_ip_host);
-        debug_count++;
-    }
-    
+    // 端口号已经是主机字节序（通过ntohs转换），直接比较
     if (src_ip_host < dst_ip_host || 
         (src_ip_host == dst_ip_host && key->src_port < key->dst_port)) {
         normalized_key = *key;
         is_reverse = false;
-        if (debug_count <= 10) {
-            printf("DEBUG: No normalization needed\n");
-        }
     } else {
         normalized_key.src_ip = key->dst_ip;
         normalized_key.dst_ip = key->src_ip;
@@ -432,14 +417,6 @@ struct flow_stats* get_or_create_conversation(const struct flow_key *key, int *i
         normalized_key.dst_port = key->src_port;
         normalized_key.protocol = key->protocol;
         is_reverse = true;
-        if (debug_count <= 10) {
-            char norm_src_ip_str[INET_ADDRSTRLEN];
-            char norm_dst_ip_str[INET_ADDRSTRLEN];
-            inet_ntop(AF_INET, &normalized_key.src_ip, norm_src_ip_str, sizeof(norm_src_ip_str));
-            inet_ntop(AF_INET, &normalized_key.dst_ip, norm_dst_ip_str, sizeof(norm_dst_ip_str));
-            printf("DEBUG: Normalized to: %s:%d -> %s:%d\n",
-                   norm_src_ip_str, normalized_key.src_port, norm_dst_ip_str, normalized_key.dst_port);
-        }
     }
     
     if (is_reverse_ptr) {
@@ -488,11 +465,20 @@ struct flow_stats* get_or_create_conversation(const struct flow_key *key, int *i
                 // 这样可以保持历史会话记录，更符合tshark行为
                 struct flow_node *new_session_node = flow_table_insert_with_timestamp(&normalized_key, packet_timestamp);
                 if (new_session_node) {
-                    // 设置原始端口号和IP地址
+                                    // 设置原始端口号和IP地址 - 根据标准化结果调整
+                if (is_reverse) {
+                    // 如果标准化时交换了IP地址，原始端口号也要相应交换
+                    new_session_node->original_src_port = original_dst_port;
+                    new_session_node->original_dst_port = original_src_port;
+                    new_session_node->original_src_ip = original_dst_ip;
+                    new_session_node->original_dst_ip = original_src_ip;
+                } else {
+                    // 没有交换，使用原始值
                     new_session_node->original_src_port = original_src_port;
                     new_session_node->original_dst_port = original_dst_port;
                     new_session_node->original_src_ip = original_src_ip;
                     new_session_node->original_dst_ip = original_dst_ip;
+                }
                     
                     // 初始化TCP相关字段
                     if ((tcp_flags & TCP_FLAG_SYN)) {
@@ -502,7 +488,6 @@ struct flow_stats* get_or_create_conversation(const struct flow_key *key, int *i
                     // 更新对话完整性
                     update_conversation_completeness(new_session_node, tcp_flags);
                     
-                    DEBUG_PRINT(2, "创建新TCP会话节点: ID %u\n", new_session_node->stats.tcp_conversation_id);
                     return &new_session_node->stats;
                 }
             }
@@ -532,11 +517,20 @@ struct flow_stats* get_or_create_conversation(const struct flow_key *key, int *i
         return NULL;
     }
     
-    // 设置原始端口号和IP地址
-    new_node->original_src_port = original_src_port;
-    new_node->original_dst_port = original_dst_port;
-    new_node->original_src_ip = original_src_ip;
-    new_node->original_dst_ip = original_dst_ip;
+    // 设置原始端口号和IP地址 - 根据标准化结果调整
+    if (is_reverse) {
+        // 如果标准化时交换了IP地址，原始端口号也要相应交换
+        new_node->original_src_port = original_dst_port;
+        new_node->original_dst_port = original_src_port;
+        new_node->original_src_ip = original_dst_ip;
+        new_node->original_dst_ip = original_src_ip;
+    } else {
+        // 没有交换，使用原始值
+        new_node->original_src_port = original_src_port;
+        new_node->original_dst_port = original_dst_port;
+        new_node->original_src_ip = original_src_ip;
+        new_node->original_dst_ip = original_dst_ip;
+    }
     
     // 初始化TCP相关字段
     if (key->protocol == IPPROTO_TCP && (tcp_flags & TCP_FLAG_SYN)) {
@@ -546,9 +540,6 @@ struct flow_stats* get_or_create_conversation(const struct flow_key *key, int *i
     // 更新对话完整性
     update_conversation_completeness(new_node, tcp_flags);
     
-    DEBUG_PRINT(2, "创建全新会话: TCP ID %u, UDP ID %u\n", 
-               new_node->stats.tcp_conversation_id, new_node->stats.udp_conversation_id);
-    
     return &new_node->stats;
 }
 
@@ -556,13 +547,6 @@ struct flow_stats* get_or_create_conversation(const struct flow_key *key, int *i
 
 void update_flow_stats(struct flow_stats *stats, uint32_t pkt_size, int is_reverse, uint64_t packet_timestamp) {
     if (!stats) return;
-    
-    // 添加调试信息
-    static int update_debug_count = 0;
-    if (update_debug_count < 5) {
-        DEBUG_PRINT(2, "DEBUG: update_flow_stats: pkt_size=%u, is_reverse=%d\n", pkt_size, is_reverse);
-        update_debug_count++;
-    }
     
     // 更新最后看到的时间戳
     stats->last_seen = packet_timestamp;
@@ -575,11 +559,6 @@ void update_flow_stats(struct flow_stats *stats, uint32_t pkt_size, int is_rever
         stats->bwd_packets++;
         stats->bwd_bytes += pkt_size;
         
-        if (update_debug_count <= 5) {
-            DEBUG_PRINT(2, "DEBUG: Updated bwd stats: packets=%" PRIu64 ", bytes=%" PRIu64 "\n", 
-                   stats->bwd_packets, stats->bwd_bytes);
-        }
-        
         if (pkt_size > stats->bwd_max_size) stats->bwd_max_size = pkt_size;
         if (pkt_size < stats->bwd_min_size) stats->bwd_min_size = pkt_size;
         
@@ -591,11 +570,6 @@ void update_flow_stats(struct flow_stats *stats, uint32_t pkt_size, int is_rever
         // 正向流统计
         stats->fwd_packets++;
         stats->fwd_bytes += pkt_size;
-        
-        if (update_debug_count <= 5) {
-            DEBUG_PRINT(2, "DEBUG: Updated fwd stats: packets=%" PRIu64 ", bytes=%" PRIu64 "\n", 
-                   stats->fwd_packets, stats->fwd_bytes);
-        }
         
         if (pkt_size > stats->fwd_max_size) stats->fwd_max_size = pkt_size;
         if (pkt_size < stats->fwd_min_size) stats->fwd_min_size = pkt_size;
@@ -677,6 +651,14 @@ void process_packet(const struct iphdr *ip, const void *transport_hdr, uint64_t 
         
         // 更新流统计
         update_flow_stats(stats, pkt_size, is_reverse, packet_timestamp);
+        
+        // 更新TCP标志统计
+        if (key.protocol == IPPROTO_TCP) {
+            update_tcp_flags(stats, flags, is_reverse);
+        }
+        
+        // 更新活跃/空闲状态
+        update_active_idle(stats, packet_timestamp);
         
         // 如果是UDP，也更新UDP特定统计
         if (key.protocol == IPPROTO_UDP) {
@@ -1098,6 +1080,52 @@ void calculate_flow_features(const struct flow_stats *stats, struct flow_feature
     features->fwd_init_win_bytes = stats->fwd_init_win_bytes;
     features->bwd_init_win_bytes = stats->bwd_init_win_bytes;
     
+    // 计算活跃状态特征
+    if (stats->active_count > 0) {
+        double active_total = 0, active_min = UINT64_MAX, active_max = 0, active_sum_sq = 0;
+        
+        for (size_t i = 0; i < stats->active_count; i++) {
+            double val = stats->active[i] / 1000000.0; // 纳秒转毫秒
+            active_total += val;
+            if (val < active_min) active_min = val;
+            if (val > active_max) active_max = val;
+        }
+        
+        features->active_mean = active_total / stats->active_count;
+        features->active_min = active_min;
+        features->active_max = active_max;
+        
+        // 计算标准差
+        for (size_t i = 0; i < stats->active_count; i++) {
+            double val = stats->active[i] / 1000000.0;
+            active_sum_sq += pow(val - features->active_mean, 2);
+        }
+        features->active_std = sqrt(active_sum_sq / stats->active_count);
+    }
+    
+    // 计算空闲状态特征
+    if (stats->idle_count > 0) {
+        double idle_total = 0, idle_min = UINT64_MAX, idle_max = 0, idle_sum_sq = 0;
+        
+        for (size_t i = 0; i < stats->idle_count; i++) {
+            double val = stats->idle[i] / 1000000.0; // 纳秒转毫秒
+            idle_total += val;
+            if (val < idle_min) idle_min = val;
+            if (val > idle_max) idle_max = val;
+        }
+        
+        features->idle_mean = idle_total / stats->idle_count;
+        features->idle_min = idle_min;
+        features->idle_max = idle_max;
+        
+        // 计算标准差
+        for (size_t i = 0; i < stats->idle_count; i++) {
+            double val = stats->idle[i] / 1000000.0;
+            idle_sum_sq += pow(val - features->idle_mean, 2);
+        }
+        features->idle_std = sqrt(idle_sum_sq / stats->idle_count);
+    }
+    
     // 格式化开始时间字符串
     struct tm *start_tm = localtime(&stats->start_time.tv_sec);
     if (start_tm) {
@@ -1213,6 +1241,7 @@ struct flow_stats* get_or_create_udp_conversation(const struct flow_key *key, in
     uint32_t src_ip_host = ntohl(key->src_ip);
     uint32_t dst_ip_host = ntohl(key->dst_ip);
     
+    // 端口号已经是主机字节序（通过ntohs转换），直接比较
     if (src_ip_host < dst_ip_host || 
         (src_ip_host == dst_ip_host && key->src_port < key->dst_port)) {
         normalized_key = *key;
@@ -1255,6 +1284,21 @@ struct flow_stats* get_or_create_udp_conversation(const struct flow_key *key, in
         return NULL;
     }
     
+    // 设置原始端口号和IP地址 - 根据标准化结果调整
+    if (is_reverse) {
+        // 如果标准化时交换了IP地址，原始端口号也要相应交换
+        new_node->original_src_port = key->dst_port;
+        new_node->original_dst_port = key->src_port;
+        new_node->original_src_ip = key->dst_ip;
+        new_node->original_dst_ip = key->src_ip;
+    } else {
+        // 没有交换，使用原始值
+        new_node->original_src_port = key->src_port;
+        new_node->original_dst_port = key->dst_port;
+        new_node->original_src_ip = key->src_ip;
+        new_node->original_dst_ip = key->dst_ip;
+    }
+    
     // **关键**: 为UDP分配唯一的流ID，类似Wireshark的udp_stream_count++
     new_node->stats.udp_conversation_id = get_next_udp_stream_id();
     
@@ -1262,11 +1306,6 @@ struct flow_stats* get_or_create_udp_conversation(const struct flow_key *key, in
     new_node->stats.session_completed = 0;  // UDP没有明确的会话结束
     new_node->first_packet_time = packet_timestamp;
     new_node->last_packet_time = packet_timestamp;
-    
-    DEBUG_PRINT(2, "创建新UDP会话: stream_id=%u, src=%08x:%u, dst=%08x:%u\n", 
-               new_node->stats.udp_conversation_id,
-               ntohl(normalized_key.src_ip), ntohs(normalized_key.src_port),
-               ntohl(normalized_key.dst_ip), ntohs(normalized_key.dst_port));
     
     return &new_node->stats;
 }
@@ -1323,8 +1362,8 @@ void print_udp_conversation_details() {
                 struct in_addr dst_addr = {.s_addr = node->key.dst_ip};
                 
                 printf("%-15s %-6u %-15s %-6u %-8lu %-8lu %-8lu %-8lu %-10u\n",
-                       inet_ntoa(src_addr), ntohs(node->key.src_port),
-                       inet_ntoa(dst_addr), ntohs(node->key.dst_port),
+                       inet_ntoa(src_addr), node->original_src_port,
+                       inet_ntoa(dst_addr), node->original_dst_port,
                        node->stats.fwd_packets, node->stats.fwd_bytes,
                        node->stats.bwd_packets, node->stats.bwd_bytes,
                        node->stats.udp_conversation_id);
@@ -1530,8 +1569,8 @@ void count_sessions_by_five_tuple() {
         
         printf("%-4d %-15s %-6u %-15s %-6u %-8s %-8u %-10u %-10u %-12lu %-12lu %-15.2f\n",
                i + 1,
-               src_ip_str, ntohs(original_src_port),
-               dst_ip_str, ntohs(original_dst_port),
+               src_ip_str, original_src_port,
+               dst_ip_str, original_dst_port,
                stats_array[i].protocol_name,
                stats_array[i].session_count,
                stats_array[i].tcp_sessions,
@@ -1662,14 +1701,6 @@ void print_all_wireshark_sessions() {
                 struct in_addr src_addr = {.s_addr = node->key.src_ip};
                 struct in_addr dst_addr = {.s_addr = node->key.dst_ip};
                 
-                // 添加调试输出
-                char src_ip_str[INET_ADDRSTRLEN];
-                char dst_ip_str[INET_ADDRSTRLEN];
-                inet_ntop(AF_INET, &node->key.src_ip, src_ip_str, sizeof(src_ip_str));
-                inet_ntop(AF_INET, &node->key.dst_ip, dst_ip_str, sizeof(dst_ip_str));
-                printf("DEBUG: Flow table entry - src: %s:%d, dst: %s:%d\n", 
-                       src_ip_str, node->key.src_port, dst_ip_str, node->key.dst_port);
-                
                 // 计算会话持续时间 (毫秒)
                 double duration_ms = 0.0;
                 if (node->last_packet_time > node->first_packet_time) {
@@ -1707,10 +1738,15 @@ void print_all_wireshark_sessions() {
                     }
                 }
                 
+                char src_ip_str[INET_ADDRSTRLEN];
+                char dst_ip_str[INET_ADDRSTRLEN];
+                inet_ntop(AF_INET, &node->key.src_ip, src_ip_str, sizeof(src_ip_str));
+                inet_ntop(AF_INET, &node->key.dst_ip, dst_ip_str, sizeof(dst_ip_str));
+                
                 printf("%-4u %-15s %-6u %-15s %-6u %-8s %-10lu %-10lu %-10lu %-10lu %-12lu %-12lu %-10.2f %-15s\n",
                        session_id,
-                       src_ip_str, ntohs(node->key.src_port),
-                       dst_ip_str, ntohs(node->key.dst_port),
+                       src_ip_str, node->original_src_port,
+                       dst_ip_str, node->original_dst_port,
                        "TCP",
                        node->stats.fwd_packets, node->stats.fwd_bytes,
                        node->stats.bwd_packets, node->stats.bwd_bytes,
@@ -1731,7 +1767,6 @@ void print_all_wireshark_sessions() {
                 struct in_addr src_addr = {.s_addr = node->key.src_ip};
                 struct in_addr dst_addr = {.s_addr = node->key.dst_ip};
                 
-                // 添加调试输出
                 char src_ip_str[INET_ADDRSTRLEN];
                 char dst_ip_str[INET_ADDRSTRLEN];
                 inet_ntop(AF_INET, &node->key.src_ip, src_ip_str, sizeof(src_ip_str));
@@ -1757,8 +1792,8 @@ void print_all_wireshark_sessions() {
                 
                 printf("%-4u %-15s %-6u %-15s %-6u %-8s %-10lu %-10lu %-10lu %-10lu %-12lu %-12lu %-10.2f %-15s\n",
                        session_id,
-                       src_ip_str, ntohs(node->key.src_port),
-                       dst_ip_str, ntohs(node->key.dst_port),
+                       src_ip_str, node->original_src_port,
+                       dst_ip_str, node->original_dst_port,
                        "UDP",
                        node->stats.fwd_packets, node->stats.fwd_bytes,
                        node->stats.bwd_packets, node->stats.bwd_bytes,
@@ -1779,7 +1814,6 @@ void print_all_wireshark_sessions() {
                 struct in_addr src_addr = {.s_addr = node->key.src_ip};
                 struct in_addr dst_addr = {.s_addr = node->key.dst_ip};
                 
-                // 添加调试输出
                 char src_ip_str[INET_ADDRSTRLEN];
                 char dst_ip_str[INET_ADDRSTRLEN];
                 inet_ntop(AF_INET, &node->key.src_ip, src_ip_str, sizeof(src_ip_str));
@@ -1823,8 +1857,8 @@ void print_all_wireshark_sessions() {
                 
                 printf("%-4u %-15s %-6u %-15s %-6u %-8s %-10lu %-10lu %-10lu %-10lu %-12lu %-12lu %-10.2f %-15s\n",
                        session_id,
-                       src_ip_str, ntohs(node->key.src_port),
-                       dst_ip_str, ntohs(node->key.dst_port),
+                       src_ip_str, node->original_src_port,
+                       dst_ip_str, node->original_dst_port,
                        protocol_name,
                        node->stats.fwd_packets, node->stats.fwd_bytes,
                        node->stats.bwd_packets, node->stats.bwd_bytes,
@@ -1918,4 +1952,64 @@ void verify_tshark_style_counting() {
     }
     
     printf("========================================================\n\n");
+}
+
+void update_tcp_flags(struct flow_stats *stats, uint8_t tcp_flags, int is_reverse) {
+    if (!stats) return;
+    
+    if (is_reverse) {
+        // 反向流标志统计
+        if (tcp_flags & TCP_FIN) stats->tcp_flags.bwd_fin_count++;
+        if (tcp_flags & TCP_SYN) stats->tcp_flags.bwd_syn_count++;
+        if (tcp_flags & TCP_RST) stats->tcp_flags.bwd_rst_count++;
+        if (tcp_flags & TCP_PSH) stats->tcp_flags.bwd_psh_count++;
+        if (tcp_flags & TCP_ACK) stats->tcp_flags.bwd_ack_count++;
+        if (tcp_flags & TCP_URG) stats->tcp_flags.bwd_urg_count++;
+        if (tcp_flags & TCP_CWR) stats->tcp_flags.bwd_cwr_count++;
+        if (tcp_flags & TCP_ECE) stats->tcp_flags.bwd_ece_count++;
+    } else {
+        // 正向流标志统计
+        if (tcp_flags & TCP_FIN) stats->tcp_flags.fwd_fin_count++;
+        if (tcp_flags & TCP_SYN) stats->tcp_flags.fwd_syn_count++;
+        if (tcp_flags & TCP_RST) stats->tcp_flags.fwd_rst_count++;
+        if (tcp_flags & TCP_PSH) stats->tcp_flags.fwd_psh_count++;
+        if (tcp_flags & TCP_ACK) stats->tcp_flags.fwd_ack_count++;
+        if (tcp_flags & TCP_URG) stats->tcp_flags.fwd_urg_count++;
+        if (tcp_flags & TCP_CWR) stats->tcp_flags.fwd_cwr_count++;
+        if (tcp_flags & TCP_ECE) stats->tcp_flags.fwd_ece_count++;
+    }
+}
+
+void update_active_idle(struct flow_stats *stats, uint64_t current_time) {
+    if (!stats) return;
+    
+    // 初始化活跃/空闲时间数组
+    if (!stats->active) {
+        stats->active = malloc(MAX_TIMESTAMPS * sizeof(uint64_t));
+        stats->active_count = 0;
+    }
+    if (!stats->idle) {
+        stats->idle = malloc(MAX_TIMESTAMPS * sizeof(uint64_t));
+        stats->idle_count = 0;
+    }
+    
+    // 计算与上一个包的时间间隔
+    if (stats->last_seen > 0) {
+        uint64_t time_diff = current_time - stats->last_seen;
+        
+        if (time_diff <= ACTIVE_TIMEOUT_NS) {
+            // 活跃状态
+            if (stats->active_count < MAX_TIMESTAMPS) {
+                stats->active[stats->active_count++] = time_diff;
+            }
+        } else {
+            // 空闲状态
+            if (stats->idle_count < MAX_TIMESTAMPS) {
+                stats->idle[stats->idle_count++] = time_diff;
+            }
+        }
+    }
+    
+    // 更新最后看到的时间
+    stats->last_seen = current_time;
 }

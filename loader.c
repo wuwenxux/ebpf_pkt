@@ -387,8 +387,8 @@ static void process_packet_direct(const struct iphdr *ip, uint16_t src_port, uin
     if (ip->protocol == IPPROTO_TCP) {
         // 对于TCP，我们需要传递序列号和标志位
         struct tcphdr tcp_info = {0};
-        tcp_info.source = htons(src_port);
-        tcp_info.dest = htons(dst_port);
+        tcp_info.source = ntohs(src_port);  // 转换为主机字节序
+        tcp_info.dest = ntohs(dst_port);    // 转换为主机字节序
         tcp_info.seq = htonl(tcp_seq);
         *((uint8_t*)&tcp_info + 13) = tcp_flags;  // 设置TCP标志位
         
@@ -396,8 +396,8 @@ static void process_packet_direct(const struct iphdr *ip, uint16_t src_port, uin
     } else if (ip->protocol == IPPROTO_UDP) {
         // 对于UDP，只需要端口信息
         struct udphdr udp_info = {0};
-        udp_info.source = htons(src_port);
-        udp_info.dest = htons(dst_port);
+        udp_info.source = ntohs(src_port);  // 转换为主机字节序
+        udp_info.dest = ntohs(dst_port);    // 转换为主机字节序
         
         process_packet(ip, &udp_info, timestamp);
     }
@@ -631,8 +631,8 @@ static void handle_batch(void *ctx, int cpu, void *data, __u32 size) {
         uint8_t is_tcp = (pkt->protocol == IPPROTO_TCP);
         
         // 设置传输层信息
-        packet_data.transport_header.tcp.source = htons(pkt->src_port);
-        packet_data.transport_header.tcp.dest = htons(pkt->dst_port);
+        packet_data.transport_header.tcp.source = pkt->src_port;
+        packet_data.transport_header.tcp.dest = pkt->dst_port;
         
         // 仅当协议为TCP时设置标志位
         packet_data.transport_header.tcp.flags_byte[13] = pkt->tcp_flags & is_tcp;
@@ -1236,8 +1236,8 @@ void print_final_stats(void) {
         // 非安静模式下打印流信息
         if (!quiet_mode) {
             char src[30], dst[30];
-            snprintf(src, sizeof(src), "%s:%d", flow->src_ip, node->key.src_port);
-            snprintf(dst, sizeof(dst), "%s:%d", flow->dst_ip, node->key.dst_port);
+            snprintf(src, sizeof(src), "%s:%d", flow->src_ip, node->original_src_port);
+            snprintf(dst, sizeof(dst), "%s:%d", flow->dst_ip, node->original_dst_port);
             
             printf("%-5d %-25s %-25s %-10s %-15.2f %-15s %-10s %-10lu %-10lu\n", 
                    flow->flow_id, src, dst, 
@@ -1352,10 +1352,22 @@ void print_final_stats(void) {
                    total_fin, total_syn, total_rst, total_psh, total_ack);
             
             // TCP窗口信息
-            fprintf(csv_fp, "%u,%u,%d\n",
+            fprintf(csv_fp, "%u,%u,",
                    node->stats.fwd_init_win_bytes,
-                   node->stats.bwd_init_win_bytes,
-                   flow->is_active);
+                   node->stats.bwd_init_win_bytes);
+            
+            // 活跃状态特征
+            fprintf(csv_fp, "%.6f,%.6f,%.6f,%.6f,",
+                   flow->features.active_mean, flow->features.active_std,
+                   flow->features.active_max, flow->features.active_min);
+            
+            // 空闲状态特征
+            fprintf(csv_fp, "%.6f,%.6f,%.6f,%.6f,",
+                   flow->features.idle_mean, flow->features.idle_std,
+                   flow->features.idle_max, flow->features.idle_min);
+            
+            // 流活跃状态
+            fprintf(csv_fp, "%d\n", flow->is_active);
         }
     }
     
