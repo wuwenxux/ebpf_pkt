@@ -387,7 +387,9 @@ struct flow_stats* get_or_create_conversation(const struct flow_key *key, int *i
     // **重要**: 根据协议类型使用不同的处理逻辑
     if (key->protocol == IPPROTO_UDP) {
         // UDP使用Wireshark风格的稳定对话管理
-        return get_or_create_udp_conversation(key, is_reverse_ptr, packet_timestamp);
+        struct flow_stats* udp_stats = get_or_create_udp_conversation(key, is_reverse_ptr, packet_timestamp);
+        DEBUG_PRINT(3, "DEBUG: get_or_create_conversation(UDP) 返回: %p\n", (void*)udp_stats);
+        return udp_stats;
     }
     
     // 保存原始端口号和IP地址（用于CSV输出）
@@ -506,6 +508,7 @@ struct flow_stats* get_or_create_conversation(const struct flow_key *key, int *i
             // 更新对话完整性
             update_conversation_completeness(node, tcp_flags);
             
+            DEBUG_PRINT(3, "DEBUG: 命中现有 node: %p, 返回 stats: %p\n", (void*)node, (void*)&node->stats);
             return &node->stats;
         }
         node = node->next;
@@ -513,6 +516,7 @@ struct flow_stats* get_or_create_conversation(const struct flow_key *key, int *i
     
     // 创建新会话
     struct flow_node *new_node = flow_table_insert_with_timestamp(&normalized_key, packet_timestamp);
+    DEBUG_PRINT(3, "DEBUG: 新建 new_node: %p, 返回 stats: %p\n", (void*)new_node, (void*)&new_node->stats);
     if (!new_node) {
         return NULL;
     }
@@ -743,9 +747,6 @@ void print_wireshark_conversation_stats() {
     printf("TCP: 每个唯一的5-tuple + 会话状态创建一个对话\n");
     printf("UDP: 每个唯一的5-tuple创建一个稳定的stream ID\n");
     printf("================== 统计结束 ==================\n");
-    
-    // **新增**: 打印五元组会话统计
-    count_sessions_by_five_tuple();
     
     // **新增**: tshark风格验证
     verify_tshark_style_counting();
@@ -979,29 +980,29 @@ void calculate_flow_features(const struct flow_stats *stats, struct flow_feature
     
     memset(features, 0, sizeof(struct flow_features));
     
-    // 基本统计
-    features->fwd_packets = stats->fwd_packets;
-    features->bwd_packets = stats->bwd_packets;
-    features->fwd_bytes = stats->fwd_bytes;
-    features->bwd_bytes = stats->bwd_bytes;
+    // 基本统计 - 使用flow_features结构体中定义的字段名称
+    features->tot_fw_pk = stats->fwd_packets;
+    features->tot_bw_pk = stats->bwd_packets;
+    features->tot_1_fw_pk = stats->fwd_bytes;
+    features->tot_1_bw_pk = stats->bwd_bytes;
     
     // 包大小统计
-    features->fwd_max_size = stats->fwd_max_size;
-    features->fwd_min_size = (stats->fwd_min_size == UINT32_MAX) ? 0 : stats->fwd_min_size;
-    features->bwd_max_size = stats->bwd_max_size;
-    features->bwd_min_size = (stats->bwd_min_size == UINT32_MAX) ? 0 : stats->bwd_min_size;
+    features->fwd_pkt_1_max = stats->fwd_max_size;
+    features->fwd_pkt_1_min = (stats->fwd_min_size == UINT32_MAX) ? 0 : stats->fwd_min_size;
+    features->bwd_pkt_1_max = stats->bwd_max_size;
+    features->bwd_pkt_1_min = (stats->bwd_min_size == UINT32_MAX) ? 0 : stats->bwd_min_size;
     
     // 计算平均包大小
     if (stats->fwd_packets > 0) {
-        features->fwd_avg_size = (double)stats->fwd_bytes / stats->fwd_packets;
-        features->fwd_std_size = sqrt(stats->fwd_sum_squares / stats->fwd_packets - 
-                                     features->fwd_avg_size * features->fwd_avg_size);
+        features->fwd_pkt_1_avg = (double)stats->fwd_bytes / stats->fwd_packets;
+        features->fwd_pkt_1_std = sqrt(stats->fwd_sum_squares / stats->fwd_packets - 
+                                     features->fwd_pkt_1_avg * features->fwd_pkt_1_avg);
     }
     
     if (stats->bwd_packets > 0) {
-        features->bwd_avg_size = (double)stats->bwd_bytes / stats->bwd_packets;
-        features->bwd_std_size = sqrt(stats->bwd_sum_squares / stats->bwd_packets - 
-                                     features->bwd_avg_size * features->bwd_avg_size);
+        features->bwd_pkt_1_avg = (double)stats->bwd_bytes / stats->bwd_packets;
+        features->bwd_pkt_1_std = sqrt(stats->bwd_sum_squares / stats->bwd_packets - 
+                                     features->bwd_pkt_1_avg * features->bwd_pkt_1_avg);
     }
     
     uint64_t total_packets = stats->fwd_packets + stats->bwd_packets;
@@ -1029,102 +1030,109 @@ void calculate_flow_features(const struct flow_stats *stats, struct flow_feature
     }
     
     if (end_time > start_time) {
-        features->duration = (end_time - start_time) / 1000000000.0; // 转换为秒
+        features->fl_dur = (end_time - start_time) / 1000000000.0; // 转换为秒
     }
     
     // 计算流量率
-    if (features->duration > 0) {
-        features->byte_rate = total_bytes / features->duration;
-        features->packet_rate = total_packets / features->duration;
-        features->fwd_packet_rate = stats->fwd_packets / features->duration;
-        features->bwd_packet_rate = stats->bwd_packets / features->duration;
+    if (features->fl_dur > 0) {
+        features->fl_byt_s = total_bytes / features->fl_dur;
+        features->fl_pkt_s = total_packets / features->fl_dur;
     }
     
     // 计算包间隔时间统计
     calculate_iat_stats(&stats->fwd_timestamps, 
-                       &features->fwd_iat_total, &features->fwd_iat_mean, 
-                       &features->fwd_iat_std, &features->fwd_iat_max, &features->fwd_iat_min);
+                       &features->fw_iat_tot, &features->fw_iat_avg, 
+                       &features->fw_iat_std, &features->fw_iat_max, &features->fw_iat_min);
     
     calculate_iat_stats(&stats->bwd_timestamps, 
-                       &features->bwd_iat_total, &features->bwd_iat_mean, 
-                       &features->bwd_iat_std, &features->bwd_iat_max, &features->bwd_iat_min);
+                       &features->bw_iat_tot, &features->bw_iat_avg, 
+                       &features->bw_iat_std, &features->bw_iat_max, &features->bw_iat_min);
     
-    // TCP标志统计
-    features->tcp_flags.fwd_fin_count = stats->tcp_flags.fwd_fin_count;
-    features->tcp_flags.fwd_syn_count = stats->tcp_flags.fwd_syn_count;
-    features->tcp_flags.fwd_rst_count = stats->tcp_flags.fwd_rst_count;
-    features->tcp_flags.fwd_psh_count = stats->tcp_flags.fwd_psh_count;
-    features->tcp_flags.fwd_ack_count = stats->tcp_flags.fwd_ack_count;
-    features->tcp_flags.fwd_urg_count = stats->tcp_flags.fwd_urg_count;
+    // 计算流间隔时间统计（合并正向和反向的时间戳）
+    timestamp_array_t combined_timestamps;
+    timestamp_array_init(&combined_timestamps);
     
-    features->tcp_flags.bwd_fin_count = stats->tcp_flags.bwd_fin_count;
-    features->tcp_flags.bwd_syn_count = stats->tcp_flags.bwd_syn_count;
-    features->tcp_flags.bwd_rst_count = stats->tcp_flags.bwd_rst_count;
-    features->tcp_flags.bwd_psh_count = stats->tcp_flags.bwd_psh_count;
-    features->tcp_flags.bwd_ack_count = stats->tcp_flags.bwd_ack_count;
-    features->tcp_flags.bwd_urg_count = stats->tcp_flags.bwd_urg_count;
-    
-    // 总标志计数
-    features->fin_flag_cnt = features->tcp_flags.fwd_fin_count + features->tcp_flags.bwd_fin_count;
-    features->syn_flag_cnt = features->tcp_flags.fwd_syn_count + features->tcp_flags.bwd_syn_count;
-    features->rst_flag_cnt = features->tcp_flags.fwd_rst_count + features->tcp_flags.bwd_rst_count;
-    features->psh_flag_cnt = features->tcp_flags.fwd_psh_count + features->tcp_flags.bwd_psh_count;
-    features->ack_flag_cnt = features->tcp_flags.fwd_ack_count + features->tcp_flags.bwd_ack_count;
-    features->urg_flag_cnt = features->tcp_flags.fwd_urg_count + features->tcp_flags.bwd_urg_count;
-    
-    // 头部字节数
-    features->fwd_header_bytes = stats->fwd_header_bytes;
-    features->bwd_header_bytes = stats->bwd_header_bytes;
-    
-    // 初始窗口字节数
-    features->fwd_init_win_bytes = stats->fwd_init_win_bytes;
-    features->bwd_init_win_bytes = stats->bwd_init_win_bytes;
-    
-    // 计算活跃状态特征
-    if (stats->active_count > 0) {
-        double active_total = 0, active_min = UINT64_MAX, active_max = 0, active_sum_sq = 0;
-        
-        for (size_t i = 0; i < stats->active_count; i++) {
-            double val = stats->active[i] / 1000000.0; // 纳秒转毫秒
-            active_total += val;
-            if (val < active_min) active_min = val;
-            if (val > active_max) active_max = val;
-        }
-        
-        features->active_mean = active_total / stats->active_count;
-        features->active_min = active_min;
-        features->active_max = active_max;
-        
-        // 计算标准差
-        for (size_t i = 0; i < stats->active_count; i++) {
-            double val = stats->active[i] / 1000000.0;
-            active_sum_sq += pow(val - features->active_mean, 2);
-        }
-        features->active_std = sqrt(active_sum_sq / stats->active_count);
+    // 添加所有时间戳
+    for (size_t i = 0; i < stats->fwd_timestamps.count; i++) {
+        timestamp_array_add(&combined_timestamps, stats->fwd_timestamps.times[i]);
+    }
+    for (size_t i = 0; i < stats->bwd_timestamps.count; i++) {
+        timestamp_array_add(&combined_timestamps, stats->bwd_timestamps.times[i]);
     }
     
-    // 计算空闲状态特征
-    if (stats->idle_count > 0) {
-        double idle_total = 0, idle_min = UINT64_MAX, idle_max = 0, idle_sum_sq = 0;
-        
-        for (size_t i = 0; i < stats->idle_count; i++) {
-            double val = stats->idle[i] / 1000000.0; // 纳秒转毫秒
-            idle_total += val;
-            if (val < idle_min) idle_min = val;
-            if (val > idle_max) idle_max = val;
-        }
-        
-        features->idle_mean = idle_total / stats->idle_count;
-        features->idle_min = idle_min;
-        features->idle_max = idle_max;
-        
-        // 计算标准差
-        for (size_t i = 0; i < stats->idle_count; i++) {
-            double val = stats->idle[i] / 1000000.0;
-            idle_sum_sq += pow(val - features->idle_mean, 2);
-        }
-        features->idle_std = sqrt(idle_sum_sq / stats->idle_count);
+    // 计算流间隔时间统计
+    calculate_iat_stats(&combined_timestamps, 
+                       NULL, &features->fl_iat_avg, 
+                       &features->fl_iat_std, &features->fl_iat_max, &features->fl_iat_min);
+    
+    timestamp_array_free(&combined_timestamps);
+    
+    // TCP标志统计 - 使用flow_features结构体中定义的字段
+    features->fw_hdr_len = stats->fwd_header_bytes;
+    features->bw_hdr_len = stats->bwd_header_bytes;
+    
+    // 计算新增字段的值
+    
+    // 包率计算
+    if (features->fl_dur > 0) {
+        features->fw_pkt_s = stats->fwd_packets / features->fl_dur;
+        features->bw_pkt_s = stats->bwd_packets / features->fl_dur;
+    } else {
+        features->fw_pkt_s = 0.0;
+        features->bw_pkt_s = 0.0;
     }
+    
+    // 流长度特征
+    features->pkt_len_min = (features->fwd_pkt_1_min < features->bwd_pkt_1_min) ? features->fwd_pkt_1_min : features->bwd_pkt_1_min;
+    features->pkt_len_max = (features->fwd_pkt_1_max > features->bwd_pkt_1_max) ? features->fwd_pkt_1_max : features->bwd_pkt_1_max;
+    features->pkt_len_avg = (features->fwd_pkt_1_avg + features->bwd_pkt_1_avg) / 2.0;
+    features->pkt_len_std = (features->fwd_pkt_1_std + features->bwd_pkt_1_std) / 2.0;
+    features->pkt_len_va = 0; // 数据包到达的最小间隔时间，暂时设为0
+    
+    // 上传下载比例
+    if (stats->bwd_bytes > 0) {
+        features->down_up_ratio = (double)stats->fwd_bytes / stats->bwd_bytes;
+    } else {
+        features->down_up_ratio = 0.0;
+    }
+    
+    // 数据包平均长度 - 使用已存在的变量
+    if (total_packets > 0) {
+        features->pkt_size_avg = (double)total_bytes / total_packets;
+    } else {
+        features->pkt_size_avg = 0.0;
+    }
+    
+    // 前向和反向平均长度
+    if (stats->fwd_packets > 0) {
+        features->fw_seg_avg = (double)stats->fwd_bytes / stats->fwd_packets;
+    } else {
+        features->fw_seg_avg = 0.0;
+    }
+    
+    if (stats->bwd_packets > 0) {
+        features->bw_seg_avg = (double)stats->bwd_bytes / stats->bwd_packets;
+    } else {
+        features->bw_seg_avg = 0.0;
+    }
+    
+    // 子流特征 - 简化计算
+    features->subfl_fw_pk = (double)stats->fwd_packets; // 前向子流中的数据包数
+    features->subfl_fw_byt = (double)stats->fwd_bytes;  // 前向子流的平均字节数
+    features->subfl_bw_pk = (double)stats->bwd_packets; // 反向子流中的数据包数
+    features->subfl_bw_byt = (double)stats->bwd_bytes;  // 反向子流的平均字节数
+    
+    // TCP相关特征
+    features->fw_win_byt = stats->fwd_init_win_bytes;
+    features->fw_act_pkt = stats->fwd_tcp_payload_bytes; // 前向具有至少1字节TCP数据有效载荷的数据包数量
+    features->fw_seg_min = stats->fwd_min_segment; // 前向观察到的最小段大小
+    
+
+    
+
+    
+    // 注意：active_mean, active_min, active_max, active_std, idle_mean, idle_min, idle_max, idle_std
+    // 这些字段在flow_features结构体中不存在，所以移除了相关计算
     
     // 格式化开始时间字符串
     struct tm *start_tm = localtime(&stats->start_time.tv_sec);
@@ -1132,6 +1140,22 @@ void calculate_flow_features(const struct flow_stats *stats, struct flow_feature
         strftime(features->start_time_str, sizeof(features->start_time_str), 
                 "%Y-%m-%d %H:%M:%S", start_tm);
     }
+    
+    // ====== 补全并计算所有flow_features字段 ======
+    // 平均包大小
+    uint64_t total_pkts = features->tot_fw_pk + features->tot_bw_pk;
+    uint64_t total_bytes_feat = features->tot_1_fw_pk + features->tot_1_bw_pk;
+    if (total_pkts > 0) {
+        features->avg_packet_size = (double)total_bytes_feat / total_pkts;
+    } else {
+        features->avg_packet_size = 0;
+    }
+    // 流长度特征
+    features->pkt_len_min = (features->fwd_pkt_1_min < features->bwd_pkt_1_min) ? features->fwd_pkt_1_min : features->bwd_pkt_1_min;
+    features->pkt_len_max = (features->fwd_pkt_1_max > features->bwd_pkt_1_max) ? features->fwd_pkt_1_max : features->bwd_pkt_1_max;
+    features->pkt_len_avg = (features->fwd_pkt_1_avg + features->bwd_pkt_1_avg) / 2.0;
+    features->pkt_len_std = (features->fwd_pkt_1_std + features->bwd_pkt_1_std) / 2.0;
+    features->pkt_len_va = 0; // 如有包到达间隔可计算，否则置0
 }
 
 // 添加新的TCP会话统计函数，基于会话完成度
@@ -1604,7 +1628,6 @@ void count_sessions_by_five_tuple() {
            stats_count > 0 ? (multi_session_tuples * 100.0 / stats_count) : 0.0);
     printf("  高会话五元组(>5个): %d (%.1f%%)\n", high_session_tuples, 
            stats_count > 0 ? (high_session_tuples * 100.0 / stats_count) : 0.0);
-    printf("\n");
     
     // 协议分布统计
     int tcp_tuples = 0, udp_tuples = 0, other_tuples = 0;
@@ -1633,8 +1656,11 @@ void count_sessions_by_five_tuple() {
     printf("• 这提供了更细粒度的流量分析\n");
     printf("================== 五元组统计结束 ==================\n");
     
-    // 清理内存
-    free(stats_array);
+    // 释放内存
+    if (stats_array) {
+        free(stats_array);
+        stats_array = NULL;
+    }
 }
 
 // =================== Wireshark风格的会话打印函数 ===================
@@ -1698,8 +1724,6 @@ void print_all_wireshark_sessions() {
         struct flow_node *node = flow_table[i];
         while (node) {
             if (node->key.protocol == IPPROTO_TCP) {
-                struct in_addr src_addr = {.s_addr = node->key.src_ip};
-                struct in_addr dst_addr = {.s_addr = node->key.dst_ip};
                 
                 // 计算会话持续时间 (毫秒)
                 double duration_ms = 0.0;
@@ -1764,8 +1788,6 @@ void print_all_wireshark_sessions() {
         struct flow_node *node = flow_table[i];
         while (node) {
             if (node->key.protocol == IPPROTO_UDP) {
-                struct in_addr src_addr = {.s_addr = node->key.src_ip};
-                struct in_addr dst_addr = {.s_addr = node->key.dst_ip};
                 
                 char src_ip_str[INET_ADDRSTRLEN];
                 char dst_ip_str[INET_ADDRSTRLEN];
@@ -1811,8 +1833,6 @@ void print_all_wireshark_sessions() {
         struct flow_node *node = flow_table[i];
         while (node) {
             if (node->key.protocol != IPPROTO_TCP && node->key.protocol != IPPROTO_UDP) {
-                struct in_addr src_addr = {.s_addr = node->key.src_ip};
-                struct in_addr dst_addr = {.s_addr = node->key.dst_ip};
                 
                 char src_ip_str[INET_ADDRSTRLEN];
                 char dst_ip_str[INET_ADDRSTRLEN];

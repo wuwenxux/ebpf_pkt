@@ -5,6 +5,7 @@
 #include <stdbool.h>
 #include <time.h>
 #include <unistd.h>
+#include <float.h>
 #include <arpa/inet.h>
 #include <netinet/ip.h>
 #include <netinet/tcp.h>
@@ -12,10 +13,34 @@
 #include <sys/time.h>
 #include <math.h>
 #include <stdatomic.h>
+#include <stdarg.h>
 
 #include "transport_session.h"
 #include "flow.h"
 #include "mempool.h"
+
+// =================== 日志系统实现 ===================
+
+// 全局日志级别变量
+log_level_t global_log_level = LOG_LEVEL_DEBUG;
+
+// 设置日志级别
+void set_log_level(log_level_t level) {
+    global_log_level = level;
+}
+
+// 日志消息函数
+void log_msg(log_level_t level, const char *fmt, ...) {
+    if (level > global_log_level) return;
+    
+    const char *level_str[] = {"ERROR", "WARN", "INFO", "DEBUG"};
+    fprintf(stderr, "[%s] ", level_str[level]);
+    
+    va_list args;
+    va_start(args, fmt);
+    vfprintf(stderr, fmt, args);
+    va_end(args);
+}
 
 // TCP标志定义
 #define TCP_FLAG_FIN 0x01
@@ -105,7 +130,7 @@ int init_lockfree_memory_pool(memory_pool_t *pool, uint32_t block_count, size_t 
     
     memset(pool->pool_memory, 0, block_count * block_size);
     
-    printf("Lockfree memory pool initialized: %u blocks of %zu bytes each\n", block_count, block_size);
+    log_msg(LOG_LEVEL_INFO, "Lockfree memory pool initialized: %u blocks of %zu bytes each\n", block_count, block_size);
     return 0;
 }
 
@@ -126,8 +151,8 @@ void cleanup_lockfree_memory_pool(memory_pool_t *pool) {
     atomic_store(&pool->used_count, 0);
     atomic_store(&pool->next_free_hint, 0);
     
-    printf("Lockfree memory pool cleaned up\n");
-    printf("Final stats - Allocations: %lu, Deallocations: %lu, Max usage: %u\n",
+    log_msg(LOG_LEVEL_INFO, "Lockfree memory pool cleaned up\n");
+    log_msg(LOG_LEVEL_INFO, "Final stats - Allocations: %lu, Deallocations: %lu, Max usage: %u\n",
            atomic_load(&pool->allocation_count),
            atomic_load(&pool->deallocation_count),
            atomic_load(&pool->max_usage));
@@ -501,8 +526,10 @@ transport_session_t *create_transport_session_with_state(const struct flow_key *
     }
     
     // 检查会话数量限制
-    if (atomic_load(&global_session_manager->total_sessions) >= MAX_SESSIONS) {
-        printf("Warning: Maximum session limit reached (%d)\n", MAX_SESSIONS);
+    uint32_t current_limit = global_session_manager->max_sessions_limit ? 
+                            global_session_manager->max_sessions_limit : MAX_SESSIONS;
+    if (atomic_load(&global_session_manager->total_sessions) >= current_limit) {
+        log_msg(LOG_LEVEL_WARN, "Warning: Maximum session limit reached (%u)\n", current_limit);
         return NULL;
     }
     
@@ -732,14 +759,14 @@ int export_sessions_flow_features_to_csv(const char *filename) {
     fclose(fp);
     
     // 打印详细统计信息
-    printf("\n=== Session Export Statistics ===\n");
-    printf("Exported %d active sessions with detailed flow features to %s\n", exported_count, filename);
-    printf("Total active sessions: %u\n", total_active_sessions);
-    printf("TCP sessions: %u (%.1f%%)\n", tcp_session_count, 
+    log_msg(LOG_LEVEL_INFO, "\n=== Session Export Statistics ===\n");
+    log_msg(LOG_LEVEL_INFO, "Exported %d active sessions with detailed flow features to %s\n", exported_count, filename);
+    log_msg(LOG_LEVEL_INFO, "Total active sessions: %u\n", total_active_sessions);
+    log_msg(LOG_LEVEL_INFO, "TCP sessions: %u (%.1f%%)\n", tcp_session_count, 
            total_active_sessions > 0 ? (tcp_session_count * 100.0 / total_active_sessions) : 0.0);
-    printf("UDP sessions: %u (%.1f%%)\n", udp_session_count,
+    log_msg(LOG_LEVEL_INFO, "UDP sessions: %u (%.1f%%)\n", udp_session_count,
            total_active_sessions > 0 ? (udp_session_count * 100.0 / total_active_sessions) : 0.0);
-    printf("================================\n");
+    log_msg(LOG_LEVEL_INFO, "================================\n");
     
     // 打印内存池统计
     print_lockfree_pool_stats(&global_session_manager->session_pool);
@@ -773,15 +800,15 @@ int export_session_detailed_features(transport_session_t *session, FILE *fp) {
     // 写入简化的CSV行
     fprintf(fp, "%u,%s,%u,%s,%u,%u,"
                "%.9f,%.6f,%lu,%lu,"
-               "%.0f,%.0f,%.0f,%.0f,"
-               "%.2f,%.2f,%.0f,%.0f,"
+                                                               "%lu,%lu,%u,%u,"
+                               "%.2f,%.2f,%u,%u,"
                "%.2f,%.2f,%.2f,%.2f,"
                "%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,"
                "%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,"
                "%.2f,%.2f,%u,%u,%u,%u,"
-               "%u,%u,%.2f,%.2f,"
-               "%.0f,%.0f,%.2f,%.2f,"
-               "%.2f,%u,%u,%u,"
+                                                               "%.2f,%.2f,%.2f,%.2f,"
+                               "%u,%u,%.2f,%.2f,"
+                               "%.2f,%d,%u,%u,"
                "%u,%u,%u,%u,%u,"
                "%.2f,%.2f,%.2f,%.2f,"
                "Normal\n",
@@ -792,49 +819,49 @@ int export_session_detailed_features(transport_session_t *session, FILE *fp) {
                
                // 时间和基本统计
                (double)session->stats.first_packet / 1000000000.0, duration,
-               features->fwd_packets, features->bwd_packets,
+               features->tot_fw_pk, features->tot_bw_pk,
                
                // 包长度特征
-               (double)features->fwd_bytes, (double)features->bwd_bytes,
-               features->fwd_packet_length_max, features->fwd_packet_length_min,
-               features->fwd_packet_length_mean, features->fwd_packet_length_std,
-               features->bwd_packet_length_max, features->bwd_packet_length_min,
-               features->bwd_packet_length_mean, features->bwd_packet_length_std,
+               features->tot_1_fw_pk, features->tot_1_bw_pk,
+               features->fwd_pkt_1_max, features->fwd_pkt_1_min,
+               features->fwd_pkt_1_avg, features->fwd_pkt_1_std,
+               features->bwd_pkt_1_max, features->bwd_pkt_1_min,
+               features->bwd_pkt_1_avg, features->bwd_pkt_1_std,
                
                // 流速率特征
-               features->flow_bytes_per_sec, features->flow_packets_per_sec,
-               features->flow_iat_mean, features->flow_iat_std,
-               features->flow_iat_max, features->flow_iat_min,
+               features->fl_byt_s, features->fl_pkt_s,
+               features->fl_iat_avg, features->fl_iat_std,
+               features->fl_iat_max, features->fl_iat_min,
                
                // 前向IAT特征
-               features->fwd_iat_total, features->fwd_iat_mean,
-               features->fwd_iat_std, features->fwd_iat_max, features->fwd_iat_min,
+               features->fw_iat_tot, features->fw_iat_avg,
+               features->fw_iat_std, features->fw_iat_max, features->fw_iat_min,
                
                // 反向IAT特征
-               features->bwd_iat_total, features->bwd_iat_mean, features->bwd_iat_std,
-               features->bwd_iat_max, features->bwd_iat_min,
+               features->bw_iat_tot, features->bw_iat_avg, features->bw_iat_std,
+               features->bw_iat_max, features->bw_iat_min,
                
                // TCP标志特征
-               features->fwd_psh_flags, features->bwd_psh_flags,
-               features->fwd_urg_flags, features->bwd_urg_flags,
-               features->fwd_header_length, features->bwd_header_length,
+               0, 0,  // fwd_psh_count, bwd_psh_count - 在flow_features中不存在
+               0, 0,  // fwd_urg_count, bwd_urg_count - 在flow_features中不存在
+               (double)features->fw_hdr_len, (double)features->bw_hdr_len,
                
                // 包速率特征
-               features->fwd_packets_per_sec, features->bwd_packets_per_sec,
+               features->fl_pkt_s, features->fl_pkt_s,
                
                // 包长度统计
-               features->min_packet_length, features->max_packet_length,
-               features->packet_length_mean, features->packet_length_std,
-               features->packet_length_variance,
+               features->pkt_len_min, features->pkt_len_max,
+               features->pkt_len_avg, features->pkt_len_std,
+                               0.0,  // packet_length_variance - 在flow_features中不存在
                
                // 标志计数
-               features->fin_flag_count, features->syn_flag_count, features->rst_flag_count,
-               features->psh_flag_count, features->ack_flag_count, features->urg_flag_count,
-               features->cwe_flag_count, features->ece_flag_count,
+               0, 0, 0,  // fin_flag_count, syn_flag_count, rst_flag_count - 在flow_features中不存在
+               0, 0, 0,  // psh_flag_count, ack_flag_count, urg_flag_count - 在flow_features中不存在
+               0, 0,  // cwe_flag_count, ece_flag_count - 在flow_features中不存在
                
                // 其他特征
                features->down_up_ratio, features->avg_packet_size,
-               features->avg_fwd_segment_size, features->avg_bwd_segment_size);
+               features->fw_seg_avg, features->bw_seg_avg);
     
     return 0;
 }
@@ -886,9 +913,15 @@ int export_all_sessions_to_csv(const char *filename) {
     }
     
     fclose(fp);
-    printf("Exported %d active sessions (simple format) to %s\n", exported_count, filename);
+    log_msg(LOG_LEVEL_INFO, "Exported %d active sessions (simple format) to %s\n", exported_count, filename);
     return exported_count;
 }
+
+// =================== 内部辅助函数声明 ===================
+
+static transport_session_t *find_session_by_flow_key(const struct flow_key *key);
+static tcp_session_state_t determine_tcp_state_from_flags(uint8_t tcp_flags);
+static void sync_session_stats_from_conversation(transport_session_t *session);
 
 // =================== 内部辅助函数实现 ===================
 
@@ -1063,33 +1096,33 @@ static uint32_t generate_session_state_id(const struct flow_key *key, tcp_sessio
 void print_lockfree_pool_stats(const memory_pool_t *pool) {
     if (!pool) return;
     
-    printf("\n=== Lockfree Memory Pool Statistics ===\n");
-    printf("Total blocks: %u\n", pool->total_blocks);
-    printf("Used blocks: %u\n", atomic_load(&pool->used_count));
-    printf("Usage percentage: %u%%\n", get_lockfree_pool_usage_percent(pool));
-    printf("Max usage reached: %u blocks\n", atomic_load(&pool->max_usage));
-    printf("Total allocations: %lu\n", atomic_load(&pool->allocation_count));
-    printf("Total deallocations: %lu\n", atomic_load(&pool->deallocation_count));
-    printf("Current free hint: %u\n", atomic_load(&pool->next_free_hint));
-    printf("==========================================\n\n");
+    log_msg(LOG_LEVEL_INFO, "\n=== Lockfree Memory Pool Statistics ===\n");
+    log_msg(LOG_LEVEL_INFO, "Total blocks: %u\n", pool->total_blocks);
+    log_msg(LOG_LEVEL_INFO, "Used blocks: %u\n", atomic_load(&pool->used_count));
+    log_msg(LOG_LEVEL_INFO, "Usage percentage: %u%%\n", get_lockfree_pool_usage_percent(pool));
+    log_msg(LOG_LEVEL_INFO, "Max usage reached: %u blocks\n", atomic_load(&pool->max_usage));
+    log_msg(LOG_LEVEL_INFO, "Total allocations: %lu\n", atomic_load(&pool->allocation_count));
+    log_msg(LOG_LEVEL_INFO, "Total deallocations: %lu\n", atomic_load(&pool->deallocation_count));
+    log_msg(LOG_LEVEL_INFO, "Current free hint: %u\n", atomic_load(&pool->next_free_hint));
+    log_msg(LOG_LEVEL_INFO, "==========================================\n\n");
 }
 
 void print_session_manager_stats(const session_manager_t *manager) {
     if (!manager) return;
     
-    printf("\n=== Lockfree Session Manager Statistics ===\n");
-    printf("Total sessions: %u\n", atomic_load(&manager->total_sessions));
-    printf("Active sessions: %u\n", atomic_load(&manager->active_sessions));
-    printf("TCP sessions: %u\n", atomic_load(&manager->tcp_sessions));
-    printf("UDP sessions: %u\n", atomic_load(&manager->udp_sessions));
-    printf("Sessions created: %lu\n", atomic_load(&manager->sessions_created));
-    printf("Sessions destroyed: %lu\n", atomic_load(&manager->sessions_destroyed));
-    printf("Pool allocations: %lu\n", atomic_load(&manager->pool_allocations));
-    printf("Malloc allocations: %lu\n", atomic_load(&manager->malloc_allocations));
-    printf("Hash collisions: %lu\n", atomic_load(&manager->hash_collisions));
-    printf("Lookup operations: %lu\n", atomic_load(&manager->lookup_operations));
-    printf("Next session ID: %u\n", atomic_load(&manager->next_session_id));
-    printf("=============================================\n\n");
+    log_msg(LOG_LEVEL_INFO, "\n=== Lockfree Session Manager Statistics ===\n");
+    log_msg(LOG_LEVEL_INFO, "Total sessions: %u\n", atomic_load(&manager->total_sessions));
+    log_msg(LOG_LEVEL_INFO, "Active sessions: %u\n", atomic_load(&manager->active_sessions));
+    log_msg(LOG_LEVEL_INFO, "TCP sessions: %u\n", atomic_load(&manager->tcp_sessions));
+    log_msg(LOG_LEVEL_INFO, "UDP sessions: %u\n", atomic_load(&manager->udp_sessions));
+    log_msg(LOG_LEVEL_INFO, "Sessions created: %lu\n", atomic_load(&manager->sessions_created));
+    log_msg(LOG_LEVEL_INFO, "Sessions destroyed: %lu\n", atomic_load(&manager->sessions_destroyed));
+    log_msg(LOG_LEVEL_INFO, "Pool allocations: %lu\n", atomic_load(&manager->pool_allocations));
+    log_msg(LOG_LEVEL_INFO, "Malloc allocations: %lu\n", atomic_load(&manager->malloc_allocations));
+    log_msg(LOG_LEVEL_INFO, "Hash collisions: %lu\n", atomic_load(&manager->hash_collisions));
+    log_msg(LOG_LEVEL_INFO, "Lookup operations: %lu\n", atomic_load(&manager->lookup_operations));
+    log_msg(LOG_LEVEL_INFO, "Next session ID: %u\n", atomic_load(&manager->next_session_id));
+    log_msg(LOG_LEVEL_INFO, "=============================================\n\n");
 }
 
 // =================== 特征统计功能实现 =================
@@ -1103,85 +1136,106 @@ int calculate_session_features(transport_session_t *session) {
     // 重置特征结构
     memset(features, 0, sizeof(struct flow_features));
     
-    // 基本统计
-    features->fwd_packets = session->stats.fwd_packets;
-    features->bwd_packets = session->stats.bwd_packets;
-    features->fwd_bytes = session->stats.fwd_bytes;
-    features->bwd_bytes = session->stats.bwd_bytes;
+    // 基本统计 - 使用正确的flow_features字段名
+    features->tot_fw_pk = session->stats.packets_out;  // 正向包数
+    features->tot_bw_pk = session->stats.packets_in;   // 反向包数
+    features->tot_1_fw_pk = session->stats.bytes_out;  // 正向字节数
+    features->tot_1_bw_pk = session->stats.bytes_in;   // 反向字节数
     
-    // 计算基本特征
-    features->total_fwd_packets = features->fwd_packets;
-    features->total_bwd_packets = features->bwd_packets;
-    features->total_length_fwd_packets = (double)features->fwd_bytes;
-    features->total_length_bwd_packets = (double)features->bwd_bytes;
-    
-    // 包长度特征
-    if (features->fwd_packets > 0) {
-        features->fwd_packet_length_max = (double)session->stats.fwd_max_size;
-        features->fwd_packet_length_min = (double)session->stats.fwd_min_size;
-        features->fwd_packet_length_mean = (double)features->fwd_bytes / features->fwd_packets;
-        features->fwd_packet_length_std = sqrt(session->stats.fwd_sum_squares / features->fwd_packets - 
-                                             features->fwd_packet_length_mean * features->fwd_packet_length_mean);
+    // 计算持续时间
+    if (session->stats.last_packet > session->stats.first_packet) {
+        features->fl_dur = (session->stats.last_packet - session->stats.first_packet) / 1000000000.0; // 纳秒转秒
     }
     
-    if (features->bwd_packets > 0) {
-        features->bwd_packet_length_max = (double)session->stats.bwd_max_size;
-        features->bwd_packet_length_min = (double)session->stats.bwd_min_size;
-        features->bwd_packet_length_mean = (double)features->bwd_bytes / features->bwd_packets;
-        features->bwd_packet_length_std = sqrt(session->stats.bwd_sum_squares / features->bwd_packets - 
-                                             features->bwd_packet_length_mean * features->bwd_packet_length_mean);
+    // 生成开始时间字符串
+    time_t start_time_sec = session->stats.first_packet / 1000000000;
+    struct tm *tm_info = localtime(&start_time_sec);
+    strftime(features->start_time_str, sizeof(features->start_time_str), "%Y-%m-%d %H:%M:%S", tm_info);
+    
+    // 包大小特征 - 正向
+    if (session->stats.packets_out > 0) {
+        features->fwd_pkt_1_max = session->stats.max_packet_size_fwd;
+        features->fwd_pkt_1_min = session->stats.min_packet_size_fwd;
+        features->fwd_pkt_1_avg = (double)session->stats.bytes_out / session->stats.packets_out;
+        
+        // 计算标准差
+        if (session->stats.packets_out > 1) {
+            double variance = (session->stats.fwd_sum_squares / session->stats.packets_out) - 
+                             (features->fwd_pkt_1_avg * features->fwd_pkt_1_avg);
+            features->fwd_pkt_1_std = sqrt(variance > 0 ? variance : 0);
+        }
     }
     
-    // 流速率特征
-    double duration = (session->stats.last_packet - session->stats.first_packet) / 1000000000.0;
-    if (duration > 0) {
-        features->flow_bytes_per_sec = (features->fwd_bytes + features->bwd_bytes) / duration;
-        features->flow_packets_per_sec = (features->fwd_packets + features->bwd_packets) / duration;
-        features->fwd_packets_per_sec = features->fwd_packets / duration;
-        features->bwd_packets_per_sec = features->bwd_packets / duration;
+    // 包大小特征 - 反向
+    if (session->stats.packets_in > 0) {
+        features->bwd_pkt_1_max = session->stats.max_packet_size_bwd;
+        features->bwd_pkt_1_min = session->stats.min_packet_size_bwd;
+        features->bwd_pkt_1_avg = (double)session->stats.bytes_in / session->stats.packets_in;
+        
+        // 计算标准差
+        if (session->stats.packets_in > 1) {
+            double variance = (session->stats.bwd_sum_squares / session->stats.packets_in) - 
+                             (features->bwd_pkt_1_avg * features->bwd_pkt_1_avg);
+            features->bwd_pkt_1_std = sqrt(variance > 0 ? variance : 0);
+        }
+    }
+    
+    // 流量率特征
+    if (features->fl_dur > 0) {
+        features->fl_byt_s = (features->tot_1_fw_pk + features->tot_1_bw_pk) / features->fl_dur;
+        features->fl_pkt_s = (features->tot_fw_pk + features->tot_bw_pk) / features->fl_dur;
     }
     
     // 包长度统计
-    uint64_t total_packets = features->fwd_packets + features->bwd_packets;
+    uint64_t total_packets = features->tot_fw_pk + features->tot_bw_pk;
     if (total_packets > 0) {
-        features->min_packet_length = (session->stats.fwd_min_size < session->stats.bwd_min_size) ? 
-                                     session->stats.fwd_min_size : session->stats.bwd_min_size;
-        features->max_packet_length = (session->stats.fwd_max_size > session->stats.bwd_max_size) ? 
-                                     session->stats.fwd_max_size : session->stats.bwd_max_size;
-        features->packet_length_mean = (double)(features->fwd_bytes + features->bwd_bytes) / total_packets;
-        features->avg_packet_size = features->packet_length_mean;
+        features->pkt_len_min = (session->stats.min_packet_size_fwd < session->stats.min_packet_size_bwd) ? 
+                                session->stats.min_packet_size_fwd : session->stats.min_packet_size_bwd;
+        features->pkt_len_max = (session->stats.max_packet_size_fwd > session->stats.max_packet_size_bwd) ? 
+                                session->stats.max_packet_size_fwd : session->stats.max_packet_size_bwd;
+        features->pkt_len_avg = (double)(features->tot_1_fw_pk + features->tot_1_bw_pk) / total_packets;
+        features->avg_packet_size = features->pkt_len_avg;
+        
+        // 计算包长度标准差
+        double total_variance = 0.0;
+        if (session->stats.packets_out > 0) {
+            double fwd_variance = (session->stats.fwd_sum_squares / session->stats.packets_out) - 
+                                 (features->fwd_pkt_1_avg * features->fwd_pkt_1_avg);
+            total_variance += fwd_variance * session->stats.packets_out;
+        }
+        if (session->stats.packets_in > 0) {
+            double bwd_variance = (session->stats.bwd_sum_squares / session->stats.packets_in) - 
+                                 (features->bwd_pkt_1_avg * features->bwd_pkt_1_avg);
+            total_variance += bwd_variance * session->stats.packets_in;
+        }
+        features->pkt_len_std = sqrt(total_variance / total_packets);
+        features->pkt_len_va = features->pkt_len_std; // 包长度方差
     }
     
-    // TCP标志特征
-    features->fwd_psh_flags = session->stats.tcp_flags.fwd_psh_flags;
-    features->bwd_psh_flags = session->stats.tcp_flags.bwd_psh_flags;
-    features->fwd_urg_flags = session->stats.tcp_flags.fwd_urg_flags;
-    features->bwd_urg_flags = session->stats.tcp_flags.bwd_urg_flags;
-    features->fwd_header_length = session->stats.fwd_header_bytes;
-    features->bwd_header_length = session->stats.bwd_header_bytes;
+    // 头部长度特征
+    features->fw_hdr_len = session->stats.fwd_header_bytes;
+    features->bw_hdr_len = session->stats.bwd_header_bytes;
     
-    // 标志计数
-    features->fin_flag_count = session->stats.tcp_flags.fin_flag_count;
-    features->syn_flag_count = session->stats.tcp_flags.syn_flag_count;
-    features->rst_flag_count = session->stats.tcp_flags.rst_flag_count;
-    features->psh_flag_count = session->stats.tcp_flags.psh_flag_count;
-    features->ack_flag_count = session->stats.tcp_flags.ack_flag_count;
-    features->urg_flag_count = session->stats.tcp_flags.urg_flag_count;
-    features->cwe_flag_count = session->stats.tcp_flags.cwe_flag_count;
-    features->ece_flag_count = session->stats.tcp_flags.ece_flag_count;
+    // 窗口和段大小特征
+    features->fw_win_byt = session->stats.fwd_init_win_bytes;
+    features->bw_win_byt = session->stats.bwd_init_win_bytes;
+    features->fw_act_pkt = session->stats.fwd_tcp_payload_bytes;
+    features->fw_seg_min = session->stats.fwd_min_segment;
+    
+    // 段大小平均值
+    features->fw_seg_avg = features->fwd_pkt_1_avg;
+    features->bw_seg_avg = features->bwd_pkt_1_avg;
+    
+    // 子流特征 - 使用会话统计
+    features->subfl_fw_pk = session->stats.subflow_fwd_packets;
+    features->subfl_fw_byt = session->stats.subflow_fwd_bytes;
+    features->subfl_bw_pk = session->stats.subflow_bwd_packets;
+    features->subfl_bw_byt = session->stats.subflow_bwd_bytes;
     
     // 下行/上行比率
-    if (features->fwd_bytes > 0) {
-        features->down_up_ratio = (double)features->bwd_bytes / features->fwd_bytes;
+    if (features->tot_1_fw_pk > 0) {
+        features->down_up_ratio = (double)features->tot_1_bw_pk / features->tot_1_fw_pk;
     }
-    
-    // 段大小特征
-    features->avg_fwd_segment_size = features->fwd_packet_length_mean;
-    features->avg_bwd_segment_size = features->bwd_packet_length_mean;
-    
-    // 简化的批量传输特征
-    features->fwd_bulk_rate = features->fwd_packets_per_sec;
-    features->bwd_bulk_rate = features->bwd_packets_per_sec;
     
     // 计算IAT特征
     calculate_iat_features(session);
@@ -1197,21 +1251,21 @@ static void calculate_iat_features(transport_session_t *session) {
     // 计算正向IAT统计
     if (session->stats.fwd_timestamps.count > 1) {
         calculate_iat_stats_simple(&session->stats.fwd_timestamps,
-                                   &features->fwd_iat_mean, &features->fwd_iat_std,
-                                   &features->fwd_iat_max, &features->fwd_iat_min);
+                                                                       &features->fw_iat_avg, &features->fw_iat_std,
+                                    &features->fw_iat_max, &features->fw_iat_min);
         
         // 计算总时间
-        features->fwd_iat_total = features->fwd_iat_mean * (session->stats.fwd_timestamps.count - 1);
+        features->fw_iat_tot = features->fw_iat_avg * (session->stats.fwd_timestamps.count - 1);
     }
     
     // 计算反向IAT统计
     if (session->stats.bwd_timestamps.count > 1) {
         calculate_iat_stats_simple(&session->stats.bwd_timestamps,
-                                   &features->bwd_iat_mean, &features->bwd_iat_std,
-                                   &features->bwd_iat_max, &features->bwd_iat_min);
+                                                                       &features->bw_iat_avg, &features->bw_iat_std,
+                                    &features->bw_iat_max, &features->bw_iat_min);
         
         // 计算总时间
-        features->bwd_iat_total = features->bwd_iat_mean * (session->stats.bwd_timestamps.count - 1);
+        features->bw_iat_tot = features->bw_iat_avg * (session->stats.bwd_timestamps.count - 1);
     }
     
     // 计算流级别的IAT统计
@@ -1296,21 +1350,20 @@ static void calculate_flow_iat_stats(transport_session_t *session) {
         if (iat < min_iat) min_iat = iat;
     }
     
-    features->flow_iat_total = total_iat;
-    features->flow_iat_mean = total_iat / (total_count - 1);
-    features->flow_iat_max = max_iat;
-    features->flow_iat_min = min_iat;
-    features->min_packet_iat = min_iat;
+    features->fl_iat_avg = total_iat / (total_count - 1);
+    features->fl_iat_max = max_iat;
+    features->fl_iat_min = min_iat;
+    // min_packet_iat 在flow_features中不存在
     
     // 计算标准差
     double variance = 0.0;
     for (uint32_t i = 1; i < total_count; i++) {
         double iat = (all_timestamps[i] - all_timestamps[i-1]) / 1000000.0;
-        double diff = iat - features->flow_iat_mean;
+        double diff = iat - features->fl_iat_avg;
         variance += diff * diff;
     }
     
-    features->flow_iat_std = sqrt(variance / (total_count - 1));
+    features->fl_iat_std = sqrt(variance / (total_count - 1));
     
     free(all_timestamps);
 }
@@ -1365,9 +1418,17 @@ int transport_session_manager_init(void) {
     atomic_store(&session_id_counter, 1);
     atomic_store(&creation_sequence_counter, 1);
     
-    printf("Lockfree transport session manager initialized successfully\n");
-    printf("Memory pool: %d blocks, usage: %u%%\n", MEMORY_POOL_SIZE, 
+    // 设置默认配置
+    global_session_manager->max_sessions_limit = MAX_SESSIONS;
+    global_session_manager->session_timeout_ns = (uint32_t)SESSION_TIMEOUT_NS;
+    global_session_manager->cleanup_interval_ns = (uint32_t)SESSION_CLEANUP_INTERVAL_NS;
+    global_session_manager->load_factor_threshold = LOAD_FACTOR_THRESHOLD;
+    
+    log_msg(LOG_LEVEL_INFO, "Lockfree transport session manager initialized successfully\n");
+    log_msg(LOG_LEVEL_INFO, "Memory pool: %d blocks, usage: %u%%\n", MEMORY_POOL_SIZE, 
            get_lockfree_pool_usage_percent(&global_session_manager->session_pool));
+    log_msg(LOG_LEVEL_INFO, "Default config: max_sessions=%u, timeout=%u, cleanup=%u, load_threshold=%.2f\n",
+           MAX_SESSIONS, SESSION_TIMEOUT_NS, SESSION_CLEANUP_INTERVAL_NS, LOAD_FACTOR_THRESHOLD);
     return 0;
 }
 
@@ -1401,7 +1462,7 @@ void transport_session_manager_cleanup(void) {
     free(global_session_manager);
     global_session_manager = NULL;
     
-    printf("Lockfree transport session manager cleaned up\n");
+    log_msg(LOG_LEVEL_INFO, "Lockfree transport session manager cleaned up\n");
 }
 
 // =================== 基于Conversation的会话管理 ===================
@@ -1705,7 +1766,7 @@ int export_conversation_based_sessions_to_csv(const char *filename) {
                            duration, session->stats.total_packets, session->stats.total_bytes,
                            session->stats.packets_out, session->stats.packets_in,
                            session->stats.bytes_out, session->stats.bytes_in,
-                           session->stats.avg_packet_size, start_time_str, end_time_str,
+                           (double)session->stats.avg_packet_size, start_time_str, end_time_str,
                            state_str, "YES");
                 
                 exported_count++;
@@ -1716,11 +1777,33 @@ int export_conversation_based_sessions_to_csv(const char *filename) {
     
     fclose(fp);
     
-    printf("Exported %d conversation-based sessions to %s\n", exported_count, filename);
+    log_msg(LOG_LEVEL_INFO, "Exported %d conversation-based sessions to %s\n", exported_count, filename);
     return exported_count;
 }
 
 // =================== 基于Session的会话管理 ===================
+
+// 处理数据包并更新基于session的会话
+transport_session_t *process_packet_with_session(const struct flow_key *key, 
+                                                uint32_t packet_size,
+                                                uint8_t tcp_flags,
+                                                uint64_t timestamp) {
+    if (!key) return NULL;
+    
+    // 获取或创建会话
+    transport_session_t *session = get_or_create_session_from_flow(key, tcp_flags, timestamp);
+    if (!session) return NULL;
+    
+    // 确定数据包方向
+    bool is_reverse = false;
+    struct flow_key normalized_key;
+    normalize_flow_key(key, &normalized_key, &is_reverse);
+    
+    // 更新会话统计
+    update_session_from_flow(session, packet_size, is_reverse, timestamp);
+    
+    return session;
+}
 
 /**
  * 基于get_or_create_conversation创建或获取会话
@@ -1806,6 +1889,76 @@ transport_session_t *get_or_create_session_from_flow(const struct flow_key *key,
     return session;
 }
 
+// 更新基于flow的会话统计
+int update_session_from_flow(transport_session_t *session, uint32_t packet_size, 
+                            bool is_reverse, uint64_t timestamp) {
+    if (!session) return -1;
+    
+    // 更新基本统计
+    if (is_reverse) {
+        session->stats.packets_in++;
+        session->stats.bytes_in += packet_size;
+        session->stats.total_bytes_bwd += packet_size;
+        session->stats.packet_count_bwd++;
+        
+        // 更新包大小统计
+        if (packet_size > session->stats.max_packet_size_bwd) {
+            session->stats.max_packet_size_bwd = packet_size;
+        }
+        if (packet_size < session->stats.min_packet_size_bwd || session->stats.min_packet_size_bwd == 0) {
+            session->stats.min_packet_size_bwd = packet_size;
+        }
+        
+        // 更新时间戳数组
+        timestamp_array_add(&session->stats.bwd_timestamps, timestamp);
+        
+    } else {
+        session->stats.packets_out++;
+        session->stats.bytes_out += packet_size;
+        session->stats.total_bytes_fwd += packet_size;
+        session->stats.packet_count_fwd++;
+        
+        // 更新包大小统计
+        if (packet_size > session->stats.max_packet_size_fwd) {
+            session->stats.max_packet_size_fwd = packet_size;
+        }
+        if (packet_size < session->stats.min_packet_size_fwd || session->stats.min_packet_size_fwd == 0) {
+            session->stats.min_packet_size_fwd = packet_size;
+        }
+        
+        // 更新时间戳数组
+        timestamp_array_add(&session->stats.fwd_timestamps, timestamp);
+    }
+    
+    // 更新总体统计
+    session->stats.total_packets = session->stats.packets_in + session->stats.packets_out;
+    session->stats.total_bytes = session->stats.bytes_in + session->stats.bytes_out;
+    
+    // 更新包大小统计
+    if (packet_size > session->stats.max_packet_size) {
+        session->stats.max_packet_size = packet_size;
+    }
+    if (packet_size < session->stats.min_packet_size || session->stats.min_packet_size == 0) {
+        session->stats.min_packet_size = packet_size;
+    }
+    
+    // 计算平均包大小
+    if (session->stats.total_packets > 0) {
+        session->stats.avg_packet_size = session->stats.total_bytes / session->stats.total_packets;
+    }
+    
+    // 更新时间戳
+    session->stats.last_packet = timestamp;
+    
+    // 更新活动时间
+    struct timespec ts;
+    ts.tv_sec = timestamp / 1000000000ULL;
+    ts.tv_nsec = timestamp % 1000000000ULL;
+    session->last_activity = ts;
+    
+    return 0;
+}
+
 // =================== 测试主函数 ===================
 
 #ifdef SESSION_TEST_MAIN
@@ -1853,32 +2006,32 @@ static void generate_test_packets(test_packet_t *packets, int count) {
 }
 
 int main(void) {
-    printf("=== Transport Session Management Test ===\n");
+    log_msg(LOG_LEVEL_INFO, "=== Transport Session Management Test ===\n");
     
     // 初始化流表（来自flow.c）
     flow_table_init();
-    printf("Flow table initialized\n");
+    log_msg(LOG_LEVEL_INFO, "Flow table initialized\n");
     
     // 初始化会话管理器
     if (transport_session_manager_init() != 0) {
-        printf("Failed to initialize session manager\n");
+        log_msg(LOG_LEVEL_ERROR, "Failed to initialize session manager\n");
         return -1;
     }
-    printf("Session manager initialized successfully\n");
+    log_msg(LOG_LEVEL_INFO, "Session manager initialized successfully\n");
     
     // 生成测试包
     const int num_packets = 1000;
     test_packet_t *packets = malloc(num_packets * sizeof(test_packet_t));
     if (!packets) {
-        printf("Failed to allocate memory for test packets\n");
+        log_msg(LOG_LEVEL_ERROR, "Failed to allocate memory for test packets\n");
         return -1;
     }
     
     generate_test_packets(packets, num_packets);
-    printf("Generated %d test packets\n", num_packets);
+    log_msg(LOG_LEVEL_INFO, "Generated %d test packets\n", num_packets);
     
     // 处理包并创建基于conversation的会话
-    printf("\n=== Processing Packets with Conversation-based Sessions ===\n");
+    log_msg(LOG_LEVEL_INFO, "\n=== Processing Packets with Conversation-based Sessions ===\n");
     int sessions_created = 0;
     int packets_processed = 0;
     
@@ -1899,7 +2052,7 @@ int main(void) {
                 sessions_created++;
                 
                 if (sessions_created <= 5) {
-                    printf("Created session %u: %s:%u -> %s:%u (%s)\n",
+                    log_msg(LOG_LEVEL_INFO, "Created session %u: %s:%u -> %s:%u (%s)\n",
                            session->session_id,
                            inet_ntoa((struct in_addr){.s_addr = session->key.src_ip}),
                            ntohs(session->key.src_port),
@@ -1912,35 +2065,35 @@ int main(void) {
         
         // 每100个包打印一次进度
         if ((i + 1) % 100 == 0) {
-            printf("Processed %d packets, %d sessions created\n", i + 1, sessions_created);
+            log_msg(LOG_LEVEL_DEBUG, "Processed %d packets, %d sessions created\n", i + 1, sessions_created);
         }
     }
     
-    printf("\n=== Processing Complete ===\n");
-    printf("Total packets processed: %d\n", packets_processed);
-    printf("Total sessions created: %d\n", sessions_created);
-    printf("Active sessions: %u\n", get_active_session_count());
-    printf("TCP sessions: %u\n", get_tcp_session_count());
-    printf("UDP sessions: %u\n", get_udp_session_count());
+    log_msg(LOG_LEVEL_INFO, "\n=== Processing Complete ===\n");
+    log_msg(LOG_LEVEL_INFO, "Total packets processed: %d\n", packets_processed);
+    log_msg(LOG_LEVEL_INFO, "Total sessions created: %d\n", sessions_created);
+    log_msg(LOG_LEVEL_INFO, "Active sessions: %u\n", get_active_session_count());
+    log_msg(LOG_LEVEL_INFO, "TCP sessions: %u\n", get_tcp_session_count());
+    log_msg(LOG_LEVEL_INFO, "UDP sessions: %u\n", get_udp_session_count());
     
     // 导出会话统计
-    printf("\n=== Exporting Session Statistics ===\n");
+    log_msg(LOG_LEVEL_INFO, "\n=== Exporting Session Statistics ===\n");
     int exported = export_conversation_based_sessions_to_csv("conversation_sessions.csv");
-    printf("Exported %d sessions to conversation_sessions.csv\n", exported);
+    log_msg(LOG_LEVEL_INFO, "Exported %d sessions to conversation_sessions.csv\n", exported);
     
     // 同时导出传统格式进行对比
     int exported_traditional = export_all_sessions_to_csv("traditional_sessions.csv");
-    printf("Exported %d sessions to traditional_sessions.csv (for comparison)\n", exported_traditional);
+    log_msg(LOG_LEVEL_INFO, "Exported %d sessions to traditional_sessions.csv (for comparison)\n", exported_traditional);
     
     // 打印内存池统计
-    printf("\n=== Memory Pool Statistics ===\n");
+    log_msg(LOG_LEVEL_INFO, "\n=== Memory Pool Statistics ===\n");
     if (global_session_manager) {
         print_lockfree_pool_stats(&global_session_manager->session_pool);
         print_session_manager_stats(global_session_manager);
     }
     
     // 打印conversation统计（来自flow.c）
-    printf("\n=== Conversation Statistics ===\n");
+    log_msg(LOG_LEVEL_INFO, "\n=== Conversation Statistics ===\n");
     print_wireshark_conversation_stats();
     
     // 清理
@@ -1948,9 +2101,338 @@ int main(void) {
     transport_session_manager_cleanup();
     flow_table_destroy();
     
-    printf("\n=== Test Complete ===\n");
+    log_msg(LOG_LEVEL_INFO, "\n=== Test Complete ===\n");
     return 0;
 }
 
 #endif /* SESSION_TEST_MAIN */
+
+
+
+// =================== 新的CSV导出函数 ===================
+
+// CSV头部定义（包含所有flow_features字段）
+static const char* comprehensive_csv_header = 
+    "SessionID,SrcIP,SrcPort,DstIP,DstPort,Protocol,"
+    "FlowDuration,StartTime,"
+    "TotFwdPk,TotBwdPk,Tot1FwPk,Tot1BwPk,"
+    "FwdPkt1Max,FwdPkt1Min,FwdPkt1Avg,FwdPkt1Std,"
+    "BwdPkt1Max,BwdPkt1Min,BwdPkt1Avg,BwdPkt1Std,"
+    "FlBytS,FlPktS,"
+    "FlIatAvg,FlIatStd,FlIatMax,FlIatMin,"
+    "FwIatTot,FwIatAvg,FwIatStd,FwIatMax,FwIatMin,"
+    "BwIatTot,BwIatAvg,BwIatStd,BwIatMax,BwIatMin,"
+    "FwHdrLen,BwHdrLen,"
+    "PktLenMin,PktLenMax,PktLenAvg,PktLenStd,PktLenVa,"
+    "DownUpRatio,AvgPacketSize,FwSegAvg,BwSegAvg,"
+    "SubflFwPk,SubflFwByt,SubflBwPk,SubflBwByt,"
+    "FwWinByt,BwWinByt,FwActPkt,FwSegMin\n";
+
+int export_comprehensive_flow_features_to_csv(const char *filename) {
+    if (!global_session_manager) {
+        log_msg(LOG_LEVEL_ERROR, "Session manager not initialized\n");
+        return -1;
+    }
+    
+    FILE *fp = fopen(filename, "w");
+    if (!fp) {
+        log_msg(LOG_LEVEL_ERROR, "Failed to open file: %s\n", filename);
+        return -1;
+    }
+    
+    // 写入CSV头部
+    fprintf(fp, "%s", comprehensive_csv_header);
+    
+    int exported_count = 0;
+    uint32_t total_active_sessions = 0;
+    uint32_t tcp_session_count = 0;
+    uint32_t udp_session_count = 0;
+    
+    // 遍历所有会话
+    for (uint32_t i = 0; i < SESSION_HASH_SIZE; i++) {
+        transport_session_t *session = atomic_load_session_ptr(&global_session_manager->sessions[i]);
+        
+        while (session) {
+            if (atomic_load(&session->is_active)) {
+                total_active_sessions++;
+                
+                // 计算会话类型统计
+                if (session->key.protocol == IPPROTO_TCP) {
+                    tcp_session_count++;
+                } else if (session->key.protocol == IPPROTO_UDP) {
+                    udp_session_count++;
+                }
+                
+                // 计算综合流特征
+                calculate_session_features(session);
+                
+                // 导出会话数据
+                if (export_comprehensive_session_features(session, fp) == 0) {
+                    exported_count++;
+                }
+            }
+            
+            session = session->next;
+        }
+    }
+    
+    fclose(fp);
+    
+    // 打印详细统计信息
+    log_msg(LOG_LEVEL_INFO, "\n=== Comprehensive Flow Features Export Statistics ===\n");
+    log_msg(LOG_LEVEL_INFO, "Exported %d active sessions with comprehensive flow features to %s\n", exported_count, filename);
+    log_msg(LOG_LEVEL_INFO, "Total active sessions: %u\n", total_active_sessions);
+    log_msg(LOG_LEVEL_INFO, "TCP sessions: %u (%.1f%%)\n", tcp_session_count, 
+            total_active_sessions > 0 ? (tcp_session_count * 100.0 / total_active_sessions) : 0.0);
+    log_msg(LOG_LEVEL_INFO, "UDP sessions: %u (%.1f%%)\n", udp_session_count,
+            total_active_sessions > 0 ? (udp_session_count * 100.0 / total_active_sessions) : 0.0);
+    log_msg(LOG_LEVEL_INFO, "====================================================\n");
+    
+    return exported_count;
+}
+
+int export_comprehensive_session_features(transport_session_t *session, FILE *fp) {
+    if (!session || !fp) return -1;
+    
+    struct flow_features *features = &session->stats.features;
+    
+    // 转换IP地址为字符串
+    struct in_addr addr;
+    addr.s_addr = session->key.src_ip;
+    char src_ip_str[INET_ADDRSTRLEN];
+    inet_ntop(AF_INET, &addr, src_ip_str, INET_ADDRSTRLEN);
+    
+    addr.s_addr = session->key.dst_ip;
+    char dst_ip_str[INET_ADDRSTRLEN];
+    inet_ntop(AF_INET, &addr, dst_ip_str, INET_ADDRSTRLEN);
+    
+    // 写入CSV行 - 包含所有flow_features字段
+    fprintf(fp, "%u,%s,%u,%s,%u,%u,"
+                "%.6f,%s,"
+                "%lu,%lu,%lu,%lu,"
+                "%u,%u,%.2f,%.2f,%u,%u,%.2f,%.2f,"
+                "%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,"
+                "%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,"
+                "%.2f,%.2f,"
+                "%u,%u,%.2f,%.2f,%.2f,"
+                "%.2f,%.2f,%.2f,%.2f,"
+                "%.2f,%.2f,%.2f,%.2f,"
+                "%u,%u,%u,%u\n",
+                
+                // 基本信息 (五元组)
+                session->session_id, src_ip_str, ntohs(session->key.src_port), 
+                dst_ip_str, ntohs(session->key.dst_port), session->key.protocol,
+                
+                // 时间信息
+                features->fl_dur, features->start_time_str,
+                
+                // 基本统计 (flow_features)
+                features->tot_fw_pk, features->tot_bw_pk,
+                features->tot_1_fw_pk, features->tot_1_bw_pk,
+                
+                // 包大小特征
+                features->fwd_pkt_1_max, features->fwd_pkt_1_min,
+                features->fwd_pkt_1_avg, features->fwd_pkt_1_std,
+                features->bwd_pkt_1_max, features->bwd_pkt_1_min,
+                features->bwd_pkt_1_avg, features->bwd_pkt_1_std,
+                
+                // 流量率特征
+                features->fl_byt_s, features->fl_pkt_s,
+                
+                // 流间隔时间特征
+                features->fl_iat_avg, features->fl_iat_std,
+                features->fl_iat_max, features->fl_iat_min,
+                
+                // 前向IAT特征
+                features->fw_iat_tot, features->fw_iat_avg,
+                features->fw_iat_std, features->fw_iat_max, features->fw_iat_min,
+                
+                // 反向IAT特征
+                features->bw_iat_tot, features->bw_iat_avg, features->bw_iat_std,
+                features->bw_iat_max, features->bw_iat_min,
+                
+                // 头部长度
+                (double)features->fw_hdr_len, (double)features->bw_hdr_len,
+                
+                // 包长度统计
+                features->pkt_len_min, features->pkt_len_max,
+                features->pkt_len_avg, features->pkt_len_std, features->pkt_len_va,
+                
+                // 比率和平均值
+                features->down_up_ratio, features->avg_packet_size,
+                features->fw_seg_avg, features->bw_seg_avg,
+                
+                // 子流特征
+                features->subfl_fw_pk, features->subfl_fw_byt,
+                features->subfl_bw_pk, features->subfl_bw_byt,
+                
+                // 窗口和段大小特征
+                features->fw_win_byt, features->bw_win_byt,
+                features->fw_act_pkt, features->fw_seg_min);
+    
+    return 0;
+}
+
+// =================== 动态配置函数实现 ===================
+
+int set_session_manager_config(uint32_t max_sessions, uint32_t timeout_ns, 
+                              uint32_t cleanup_interval, double load_threshold) {
+    if (!global_session_manager) {
+        log_msg(LOG_LEVEL_ERROR, "Session manager not initialized\n");
+        return -1;
+    }
+    
+    // 验证参数
+    if (max_sessions == 0 || max_sessions > 10000000) {  // 最大1000万会话
+        log_msg(LOG_LEVEL_ERROR, "Invalid max_sessions: %u (must be 1-10000000)\n", max_sessions);
+        return -1;
+    }
+    
+    if (timeout_ns == 0 || timeout_ns > 3600000000000ULL) {  // 最大1小时
+        log_msg(LOG_LEVEL_ERROR, "Invalid timeout_ns: %u (must be 1-3600000000000)\n", timeout_ns);
+        return -1;
+    }
+    
+    if (cleanup_interval == 0 || cleanup_interval > 3600000000000ULL) {
+        log_msg(LOG_LEVEL_ERROR, "Invalid cleanup_interval: %u (must be 1-3600000000000)\n", cleanup_interval);
+        return -1;
+    }
+    
+    if (load_threshold <= 0.0 || load_threshold > 1.0) {
+        log_msg(LOG_LEVEL_ERROR, "Invalid load_threshold: %f (must be 0.0-1.0)\n", load_threshold);
+        return -1;
+    }
+    
+    // 更新配置
+    global_session_manager->max_sessions_limit = max_sessions;
+    global_session_manager->session_timeout_ns = timeout_ns;
+    global_session_manager->cleanup_interval_ns = cleanup_interval;
+    global_session_manager->load_factor_threshold = load_threshold;
+    
+    log_msg(LOG_LEVEL_INFO, "Session manager config updated: max_sessions=%u, timeout=%u, cleanup=%u, load_threshold=%.2f\n",
+            max_sessions, timeout_ns, cleanup_interval, load_threshold);
+    
+    return 0;
+}
+
+int get_session_manager_config(uint32_t *max_sessions, uint32_t *timeout_ns, 
+                              uint32_t *cleanup_interval, double *load_threshold) {
+    if (!global_session_manager) {
+        log_msg(LOG_LEVEL_ERROR, "Session manager not initialized\n");
+        return -1;
+    }
+    
+    if (max_sessions) *max_sessions = global_session_manager->max_sessions_limit;
+    if (timeout_ns) *timeout_ns = global_session_manager->session_timeout_ns;
+    if (cleanup_interval) *cleanup_interval = global_session_manager->cleanup_interval_ns;
+    if (load_threshold) *load_threshold = global_session_manager->load_factor_threshold;
+    
+    return 0;
+}
+
+double get_session_manager_load_factor(void) {
+    if (!global_session_manager) return 0.0;
+    
+    uint32_t active_sessions = atomic_load(&global_session_manager->active_sessions);
+    return (double)active_sessions / SESSION_HASH_SIZE;
+}
+
+uint32_t get_session_manager_hash_collision_rate(void) {
+    if (!global_session_manager) return 0;
+    
+    uint32_t total_lookups = atomic_load(&global_session_manager->lookup_operations);
+    uint32_t collisions = atomic_load(&global_session_manager->hash_collisions);
+    
+    if (total_lookups == 0) return 0;
+    return (collisions * 100) / total_lookups;  // 返回百分比
+}
+
+// =================== 智能配置建议函数 ===================
+
+void suggest_session_manager_config(uint64_t available_memory_mb, uint32_t expected_sessions) {
+    log_msg(LOG_LEVEL_INFO, "=== Session Manager Configuration Suggestions ===\n");
+    
+    // 基于可用内存的建议
+    uint64_t memory_bytes = available_memory_mb * 1024 * 1024;
+    uint32_t max_sessions_by_memory = memory_bytes / sizeof(transport_session_t);
+    
+    log_msg(LOG_LEVEL_INFO, "Available memory: %lu MB\n", available_memory_mb);
+    log_msg(LOG_LEVEL_INFO, "Max sessions by memory: %u\n", max_sessions_by_memory);
+    
+    // 基于预期会话数的哈希表大小建议
+    uint32_t suggested_hash_size = expected_sessions * 4;  // 4倍预期会话数
+    if (suggested_hash_size < 65536) suggested_hash_size = 65536;  // 最小64K
+    if (suggested_hash_size > 16777216) suggested_hash_size = 16777216;  // 最大16M
+    
+    log_msg(LOG_LEVEL_INFO, "Expected sessions: %u\n", expected_sessions);
+    log_msg(LOG_LEVEL_INFO, "Suggested hash size: %u\n", suggested_hash_size);
+    
+    // 建议的配置
+    uint32_t max_sessions = (max_sessions_by_memory < expected_sessions * 2) ? 
+                           max_sessions_by_memory : expected_sessions * 2;
+    
+    log_msg(LOG_LEVEL_INFO, "Recommended configuration:\n");
+    log_msg(LOG_LEVEL_INFO, "  - Max sessions: %u\n", max_sessions);
+    log_msg(LOG_LEVEL_INFO, "  - Hash size: %u\n", suggested_hash_size);
+    log_msg(LOG_LEVEL_INFO, "  - Session timeout: 300 seconds\n");
+    log_msg(LOG_LEVEL_INFO, "  - Cleanup interval: 60 seconds\n");
+    log_msg(LOG_LEVEL_INFO, "  - Load factor threshold: 0.75\n");
+    
+    log_msg(LOG_LEVEL_INFO, "==============================================\n");
+}
+
+// =================== 基于实际数据的配置建议函数 ===================
+
+void suggest_config_based_on_actual_sessions(uint32_t actual_tcp_sessions, uint32_t actual_udp_sessions) {
+    uint32_t total_sessions = actual_tcp_sessions + actual_udp_sessions;
+    
+    log_msg(LOG_LEVEL_INFO, "=== 基于实际会话数的配置建议 ===\n");
+    log_msg(LOG_LEVEL_INFO, "实际TCP会话数: %u\n", actual_tcp_sessions);
+    log_msg(LOG_LEVEL_INFO, "实际UDP会话数: %u\n", actual_udp_sessions);
+    log_msg(LOG_LEVEL_INFO, "总会话数: %u\n", total_sessions);
+    
+    // 计算建议的哈希表大小 (4倍会话数)
+    uint32_t suggested_hash_size = total_sessions * 4;
+    if (suggested_hash_size < 65536) suggested_hash_size = 65536;  // 最小64K
+    if (suggested_hash_size > 16777216) suggested_hash_size = 16777216;  // 最大16M
+    
+    // 计算建议的最大会话数 (3倍当前会话数)
+    uint32_t suggested_max_sessions = total_sessions * 3;
+    if (suggested_max_sessions < 100000) suggested_max_sessions = 100000;  // 最小10万
+    if (suggested_max_sessions > 10000000) suggested_max_sessions = 10000000;  // 最大1000万
+    
+    // 计算建议的内存池大小 (1.5倍当前会话数)
+    uint32_t suggested_pool_size = total_sessions * 3 / 2;
+    if (suggested_pool_size < 10000) suggested_pool_size = 10000;  // 最小1万
+    if (suggested_pool_size > 1000000) suggested_pool_size = 1000000;  // 最大100万
+    
+    log_msg(LOG_LEVEL_INFO, "\n建议配置:\n");
+    log_msg(LOG_LEVEL_INFO, "  - 哈希表大小: %u (%.1f倍会话数)\n", 
+            suggested_hash_size, (double)suggested_hash_size / total_sessions);
+    log_msg(LOG_LEVEL_INFO, "  - 最大会话数: %u (%.1f倍当前会话数)\n", 
+            suggested_max_sessions, (double)suggested_max_sessions / total_sessions);
+    log_msg(LOG_LEVEL_INFO, "  - 内存池大小: %u (%.1f倍当前会话数)\n", 
+            suggested_pool_size, (double)suggested_pool_size / total_sessions);
+    
+    // 性能预测
+    double current_load_factor = (double)total_sessions / SESSION_HASH_SIZE;
+    double suggested_load_factor = (double)total_sessions / suggested_hash_size;
+    
+    log_msg(LOG_LEVEL_INFO, "\n性能预测:\n");
+    log_msg(LOG_LEVEL_INFO, "  - 当前负载因子: %.4f\n", current_load_factor);
+    log_msg(LOG_LEVEL_INFO, "  - 建议负载因子: %.4f\n", suggested_load_factor);
+    log_msg(LOG_LEVEL_INFO, "  - 性能提升: %.1f倍\n", current_load_factor / suggested_load_factor);
+    
+    // 内存使用预测
+    uint64_t session_memory = total_sessions * sizeof(transport_session_t);
+    uint64_t hash_table_memory = suggested_hash_size * sizeof(void*);
+    uint64_t total_memory_mb = (session_memory + hash_table_memory) / (1024 * 1024);
+    
+    log_msg(LOG_LEVEL_INFO, "\n内存使用预测:\n");
+    log_msg(LOG_LEVEL_INFO, "  - 会话内存: %lu MB\n", session_memory / (1024 * 1024));
+    log_msg(LOG_LEVEL_INFO, "  - 哈希表内存: %lu MB\n", hash_table_memory / (1024 * 1024));
+    log_msg(LOG_LEVEL_INFO, "  - 总内存: %lu MB\n", total_memory_mb);
+    
+    log_msg(LOG_LEVEL_INFO, "==============================================\n");
+}
 

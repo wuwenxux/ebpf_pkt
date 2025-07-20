@@ -406,106 +406,75 @@ struct tcp_flag_features {
 // 扩展的特征集
 struct flow_features {
     // 基本特征
-    double duration;                // 持续时间
+    double fl_dur;                // 持续时间
     char start_time_str[64];        // 开始时间字符串(年月日时分秒)
-    uint64_t fwd_packets;           // 正向包数
-    uint64_t bwd_packets;           // 反向包数 
-    uint64_t fwd_bytes;             // 正向字节数
-    uint64_t bwd_bytes;             // 反向字节数
+    uint64_t tot_fw_pk;           // 正向包数
+    uint64_t tot_bw_pk;           // 反向包数 
+    uint64_t tot_1_fw_pk;             // 正向字节数
+    uint64_t tot_1_bw_pk;             // 反向字节数
     
     // 包大小特征
-    uint32_t fwd_max_size;          // 正向最大包大小
-    uint32_t fwd_min_size;          // 正向最小包大小
-    double fwd_avg_size;            // 正向包平均大小
-    double fwd_std_size;            // 正向包大小标准差
-    uint32_t bwd_max_size;          // 反向最大包大小
-    uint32_t bwd_min_size;          // 反向最小包大小
-    double bwd_avg_size;            // 反向包平均大小
-    double bwd_std_size;            // 反向包大小标准差
+    uint32_t fwd_pkt_1_max;          // 正向最大包大小
+    uint32_t fwd_pkt_1_min;          // 正向最小包大小
+    double fwd_pkt_1_avg;            // 正向包平均大小
+    double fwd_pkt_1_std;            // 正向包大小标准差
+    uint32_t bwd_pkt_1_max;          // 反向最大包大小
+    uint32_t bwd_pkt_1_min;          // 反向最小包大小
+    double bwd_pkt_1_avg;            // 反向包平均大小
+    double bwd_pkt_1_std;            // 反向包大小标准差
+    
     double avg_packet_size;         // 所有包的平均大小
 
     // 流量率特征
-    double byte_rate;               // 字节率
-    double packet_rate;             // 包率
-    double fwd_packet_rate;         // 每秒前向包数
-    double bwd_packet_rate;         // 每秒反向包数
-    double download_upload_ratio;   // 下载上传比例
-
+    double fl_byt_s;               // 字节率
+    double fl_pkt_s;             // 包率
+    double fw_pkt_s;             // 前向包率
+    double bw_pkt_s;             // 反向包率
+    // 包间隔时间特征 - 所有
+    double fl_iat_avg;           // 流间隔时间平均值
+    double fl_iat_std;            // 流间隔时间标准差
+    double fl_iat_max;            // 流间隔时间最大值
+    double fl_iat_min;            // 流间隔时间最小值
+  
     // 包间隔时间特征 - 正向
-    double fwd_iat_total;           // 前向包间隔时间总和
-    double fwd_iat_mean;            // 前向包间隔时间平均值
-    double fwd_iat_std;             // 前向包间隔时间标准差
-    double fwd_iat_max;             // 前向包间隔时间最大值
-    double fwd_iat_min;             // 前向包间隔时间最小值
+    double fw_iat_tot;           // 前向包间隔时间总和
+    double fw_iat_avg;            // 前向包间隔时间平均值
+    double fw_iat_std;             // 前向包间隔时间标准差
+    double fw_iat_max;             // 前向包间隔时间最大值
+    double fw_iat_min;             // 前向包间隔时间最小值
 
     // 包间隔时间特征 - 反向
-    double bwd_iat_total;           // 反向包间隔时间总和
-    double bwd_iat_mean;            // 反向包间隔时间平均值
-    double bwd_iat_std;             // 反向包间隔时间标准差
-    double bwd_iat_max;             // 反向包间隔时间最大值
-    double bwd_iat_min;             // 反向包间隔时间最小值
+    double bw_iat_tot;           // 反向包间隔时间总和
+    double bw_iat_avg;            // 反向包间隔时间平均值
+    double bw_iat_std;             // 反向包间隔时间标准差
+    double bw_iat_max;             // 反向包间隔时间最大值
+    double bw_iat_min;             // 反向包间隔时间最小值
 
-    // 包间隔时间特征 - 所有
-    double flow_iat_total;          // 流间隔时间总和
-    double flow_iat_mean;           // 流间隔时间平均值
-    double flow_iat_std;            // 流间隔时间标准差
-    double flow_iat_max;            // 流间隔时间最大值
-    double flow_iat_min;            // 流间隔时间最小值
-    double min_packet_iat;          // 数据包最小到达间隔时间
+  
+    uint64_t fw_hdr_len; //前向数据包头部总字节数
+    uint64_t bw_hdr_len; //反向数据包头部总字节数
 
     // 流长度特征
-    uint32_t flow_min_length;       // 流的最小长度
-    uint32_t flow_max_length;       // 流的最大长度
-    double flow_mean_length;        // 流的平均长度
-    double flow_std_length;         // 流的标准差长度
-
-    // TCP标志特征
-    struct tcp_flag_features tcp_flags;
-
-    // UDP特定特征
-    struct udp_features udp;
-
-    // TCP相关特征
-    uint32_t fwd_header_bytes;      // 用于前向数据包头部的总字节数
-    uint32_t bwd_header_bytes;      // 用于反向数据包头部的总字节数
-    double fwd_segment_avg_size;    // 前向数据segment平均尺寸
-    double bwd_segment_avg_size;    // 反向数据segment平均尺寸
-    double fwd_subflow_avg_pkts;    // 前向子流中的平均数据包数
-    double fwd_subflow_avg_bytes;   // 前向子流的平均字节数
-    double bwd_subflow_avg_pkts;    // 反向子流中的平均数据包数
-    double bwd_subflow_avg_bytes;   // 反向子流中的平均字节数
-    uint32_t fwd_init_win_bytes;    // 前向初始窗口中发送的字节数
-    uint32_t bwd_init_win_bytes;    // 反向初始窗口中发送的字节数
-    uint32_t fwd_tcp_payload_bytes; // 前向有效TCP载荷字节数
-    uint32_t fwd_min_segment;       // 前向观察到的最小segment大小
-
-    // 添加cicflowmeter项目特有的TCP特征
-    uint32_t fin_flag_cnt;          // FIN标志计数
-    uint32_t syn_flag_cnt;          // SYN标志计数
-    uint32_t rst_flag_cnt;          // RST标志计数
-    uint32_t psh_flag_cnt;          // PSH标志计数
-    uint32_t ack_flag_cnt;          // ACK标志计数
-    uint32_t urg_flag_cnt;          // URG标志计数
-    uint32_t ece_flag_cnt;          // ECE标志计数
-    uint32_t cwe_flag_count;        // CWE标志计数
-
-    // Active与Idle状态特征
-    double active_max;              // 活跃状态最大值
-    double active_min;              // 活跃状态最小值
-    double active_mean;             // 活跃状态平均值
-    double active_std;              // 活跃状态标准差
-    double idle_max;                // 空闲状态最大值
-    double idle_min;                // 空闲状态最小值
-    double idle_mean;               // 空闲状态平均值
-    double idle_std;                // 空闲状态标准差
-
-    // Bulk特征
-    double fwd_byts_b_avg;          // 前向bulk平均字节数
-    double fwd_pkts_b_avg;          // 前向bulk平均包数
-    double bwd_byts_b_avg;          // 反向bulk平均字节数
-    double bwd_pkts_b_avg;          // 反向bulk平均包数
-    double fwd_blk_rate_avg;        // 前向bulk平均速率
-    double bwd_blk_rate_avg;        // 反向bulk平均速率
+    uint32_t pkt_len_min;       // 流的最小长度
+    uint32_t pkt_len_max;       // 流的最大长度
+    double  pkt_len_avg;        // 流的平均长度
+    double  pkt_len_std;         // 流的标准差长度
+    double pkt_len_va;          //数据包最小到达间隔时间 
+    
+    double down_up_ratio; //下载上传比例
+    double pkt_size_avg; //数据包大小平均值
+    double fw_seg_avg; //前向分段平均大小
+    double bw_seg_avg;  //反向分段平均大小
+    double subfl_fw_pk; //前向子流中的平均数据包数
+    double subfl_fw_byt; //前向子流中的的平均数据包数
+    double subfl_bw_pk; //反向子流中的平均数据包数
+    double subfl_bw_byt; //反向子流中的的平均数据包数
+    
+    uint32_t fw_win_byt; //前向初始窗口中发送到字节数
+    uint32_t bw_win_byt; //反向初始窗口中发送到字节数
+    uint32_t fw_act_pkt; //前向具有至少1字节TCP数据有效载荷的数据包的数量
+    uint32_t fw_ack_pkt; //前向具有至少1字节TCP数据有效载荷的数据包数量
+    uint32_t fw_seg_min; //前向观察到的最小段大小
 };
 
 // TCP 连接状态定义
