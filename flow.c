@@ -296,6 +296,11 @@ struct flow_node *flow_table_insert_with_timestamp(const struct flow_key *key, u
     node->conversation_id = 0;
     node->first_packet_time = packet_timestamp;
     node->last_packet_time = packet_timestamp;
+    
+    // 设置flow_stats中的时间戳字段
+    node->stats.first_seen = packet_timestamp;
+    node->stats.last_seen = packet_timestamp;
+    
     node->packet_num = 0;
     node->create_flags = 0;
     
@@ -551,6 +556,11 @@ struct flow_stats* get_or_create_conversation(const struct flow_key *key, int *i
 
 void update_flow_stats(struct flow_stats *stats, uint32_t pkt_size, int is_reverse, uint64_t packet_timestamp) {
     if (!stats) return;
+    
+    // 如果是第一次更新，设置first_seen
+    if (stats->first_seen == 0) {
+        stats->first_seen = packet_timestamp;
+    }
     
     // 更新最后看到的时间戳
     stats->last_seen = packet_timestamp;
@@ -1012,25 +1022,18 @@ void calculate_flow_features(const struct flow_stats *stats, struct flow_feature
         features->avg_packet_size = (double)total_bytes / total_packets;
     }
     
-    // 计算持续时间（使用时间戳数组）
-    uint64_t start_time = 0, end_time = 0;
-    
-    if (stats->fwd_timestamps.count > 0) {
-        start_time = stats->fwd_timestamps.times[0];
-        end_time = stats->fwd_timestamps.times[stats->fwd_timestamps.count - 1];
-    }
-    
-    if (stats->bwd_timestamps.count > 0) {
-        if (start_time == 0 || stats->bwd_timestamps.times[0] < start_time) {
-            start_time = stats->bwd_timestamps.times[0];
-        }
-        if (stats->bwd_timestamps.times[stats->bwd_timestamps.count - 1] > end_time) {
-            end_time = stats->bwd_timestamps.times[stats->bwd_timestamps.count - 1];
-        }
-    }
-    
-    if (end_time > start_time) {
-        features->fl_dur = (end_time - start_time) / 1000000000.0; // 转换为秒
+    // 计算基于会话的持续时间 - 借鉴print_session_timing_info的逻辑（单位：毫秒）
+    // 直接使用first_seen和last_seen，这是最准确的时间记录方式
+    // 优势：
+    // 1. first_seen记录会话的第一个包时间戳
+    // 2. last_seen记录会话的最后一个包时间戳
+    // 3. 对于TCP会话，last_seen会在收到FIN/RST时更新
+    // 4. 对于UDP会话，last_seen会在最后一个包时更新
+    // 5. 这种计算方式与Wireshark的会话时间记录逻辑一致
+    if (stats->last_seen > stats->first_seen) {
+        features->fl_dur = (double)(stats->last_seen - stats->first_seen) / 1000000.0; // 纳秒转毫秒
+    } else {
+        features->fl_dur = 0.0; // 如果只有一个包或时间无效，持续时间为0
     }
     
     // 计算流量率
@@ -1572,7 +1575,7 @@ void count_sessions_by_five_tuple() {
         inet_ntop(AF_INET, &stats_array[i].key.dst_ip, dst_ip_str, sizeof(dst_ip_str));
         double duration_ms = 0.0;
         if (stats_array[i].last_seen > stats_array[i].first_seen) {
-            duration_ms = (stats_array[i].last_seen - stats_array[i].first_seen) / 1000000.0;
+            duration_ms = (double)(stats_array[i].last_seen - stats_array[i].first_seen) / 1000000.0;
         }
         // 查找对应的flow_node以获取原始端口号
         uint16_t original_src_port = stats_array[i].key.src_port;
@@ -2032,4 +2035,99 @@ void update_active_idle(struct flow_stats *stats, uint64_t current_time) {
     
     // 更新最后看到的时间
     stats->last_seen = current_time;
+}
+
+// =================== 会话时间记录函数 ===================
+
+/**
+ * 打印所有会话的开始和结束时间信息
+ */
+void print_session_timing_info() {
+    printf("\n================== 会话时间记录信息 ==================\n");
+    printf("每个会话的开始和结束时间:\n\n");
+    
+    int session_count = 0;
+    
+    for (int i = 0; i < HASH_TABLE_SIZE; i++) {
+        struct flow_node *node = flow_table[i];
+        while (node) {
+            session_count++;
+            
+            // 获取IP地址字符串
+            char src_ip_str[INET_ADDRSTRLEN];
+            char dst_ip_str[INET_ADDRSTRLEN];
+            inet_ntop(AF_INET, &node->key.src_ip, src_ip_str, sizeof(src_ip_str));
+            inet_ntop(AF_INET, &node->key.dst_ip, dst_ip_str, sizeof(dst_ip_str));
+            
+            // 计算会话持续时间（毫秒）
+            double duration_ms = 0.0;
+            if (node->stats.last_seen > node->stats.first_seen) {
+                duration_ms = (double)(node->stats.last_seen - node->stats.first_seen) / 1000000.0;
+            }
+            
+            // 格式化时间戳
+            struct tm *start_tm = localtime(&node->stats.start_time.tv_sec);
+            struct tm *end_tm = localtime(&node->stats.end_time.tv_sec);
+            
+            char start_time_str[64], end_time_str[64];
+            if (start_tm) {
+                strftime(start_time_str, sizeof(start_time_str), "%Y-%m-%d %H:%M:%S", start_tm);
+            } else {
+                strcpy(start_time_str, "Unknown");
+            }
+            
+            if (end_tm) {
+                strftime(end_time_str, sizeof(end_time_str), "%Y-%m-%d %H:%M:%S", end_tm);
+            } else {
+                strcpy(end_time_str, "Unknown");
+            }
+            
+            // 协议名称
+            const char *protocol_name;
+            switch (node->key.protocol) {
+                case IPPROTO_TCP:
+                    protocol_name = "TCP";
+                    break;
+                case IPPROTO_UDP:
+                    protocol_name = "UDP";
+                    break;
+                case IPPROTO_ICMP:
+                    protocol_name = "ICMP";
+                    break;
+                default:
+                    protocol_name = "OTHER";
+                    break;
+            }
+            
+            // 会话状态
+            const char *session_status;
+            if (node->stats.session_completed) {
+                session_status = "COMPLETED";
+            } else {
+                session_status = "ACTIVE";
+            }
+            
+            printf("会话 %d:\n", session_count);
+            printf("  五元组: %s:%d -> %s:%d (%s)\n", 
+                   src_ip_str, node->original_src_port,
+                   dst_ip_str, node->original_dst_port,
+                   protocol_name);
+            printf("  开始时间: %s (纳秒: %lu)\n", start_time_str, node->stats.first_seen);
+            printf("  结束时间: %s (纳秒: %lu)\n", end_time_str, node->stats.last_seen);
+            printf("  持续时间: %.6f 毫秒\n", duration_ms);
+            printf("  会话状态: %s\n", session_status);
+            printf("  包数: %lu (正向: %lu, 反向: %lu)\n", 
+                   node->stats.fwd_packets + node->stats.bwd_packets,
+                   node->stats.fwd_packets, node->stats.bwd_packets);
+            printf("  字节数: %lu (正向: %lu, 反向: %lu)\n", 
+                   node->stats.fwd_bytes + node->stats.bwd_bytes,
+                   node->stats.fwd_bytes, node->stats.bwd_bytes);
+            printf("\n");
+            
+            node = node->next;
+        }
+    }
+    
+    printf("总会话数: %d\n", session_count);
+    printf("================== 会话时间记录信息结束 ==================\n\n");
 }

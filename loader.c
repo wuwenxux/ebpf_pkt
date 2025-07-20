@@ -1,4 +1,3 @@
-#define _GNU_SOURCE /* For CLOCK_MONOTONIC */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -1543,6 +1542,9 @@ void print_final_stats(void) {
     // 添加Wireshark风格的对话统计
     print_wireshark_conversation_stats();
     
+    // 添加会话时间记录验证
+    //print_session_timing_info();
+    
     // 收集总数据包和字节统计
     uint64_t total_packets = 0;
     uint64_t total_bytes = 0;
@@ -1592,9 +1594,9 @@ void print_final_stats(void) {
             // 计算流持续时间
             flow->duration = time_diff(&node->stats.end_time, &node->stats.start_time);
             
-            // 格式化开始时间
+            // 格式化开始时间（可读格式）
             struct tm *start_tm = localtime(&node->stats.start_time.tv_sec);
-            strftime(flow->start_time_str, sizeof(flow->start_time_str), "%H:%M:%S", start_tm);
+            strftime(flow->start_time_str, sizeof(flow->start_time_str), "%Y-%m-%d %H:%M:%S", start_tm);
             
             // 准备IP地址字符串
             snprintf(flow->src_ip, sizeof(flow->src_ip), "%u.%u.%u.%u", NIPQUAD(node->key.src_ip));
@@ -1609,6 +1611,13 @@ void print_final_stats(void) {
             
             // 计算流特征 - 使用简化版本避免段错误
             memset(&flow->features, 0, sizeof(struct flow_features));
+            
+                        // 设置fl_dur - 使用与calculate_flow_features相同的逻辑（毫秒）
+            if (node->stats.last_seen > node->stats.first_seen) {
+                flow->features.fl_dur = (double)(node->stats.last_seen - node->stats.first_seen) / 1000000.0; // 纳秒转毫秒
+            } else {
+                flow->features.fl_dur = 0.0; // 如果只有一个包或时间无效，持续时间为0
+            }
             
             // 只设置基本字段
             flow->features.tot_fw_pk = node->stats.fwd_packets;
@@ -1796,11 +1805,11 @@ void print_final_stats(void) {
         
         if (csv_fp) {
             // 基本流信息 - 只包含你需要的字段
-            fprintf(csv_fp, "%s,%s,%d,%d,%d,%.6f,",
-                   flow->src_ip, flow->dst_ip,
-                   node->original_src_port, node->original_dst_port,
+            fprintf(csv_fp, "%s,%d,%s,%d,%d,%s,",
+                   flow->src_ip, node->original_src_port,
+                   flow->dst_ip, node->original_dst_port,
                    flow->protocol,
-                   (double)node->stats.start_time.tv_sec + (double)node->stats.start_time.tv_nsec / 1e9);
+                   flow->start_time_str);
             
             // 流持续时间
             fprintf(csv_fp, "%.6f,",
@@ -1847,8 +1856,8 @@ void print_final_stats(void) {
                    flow->features.pkt_len_avg, flow->features.pkt_len_std, flow->features.pkt_len_va,
                    flow->features.down_up_ratio, flow->features.pkt_size_avg,
                    flow->features.fw_seg_avg, flow->features.bw_seg_avg,
-                   flow->features.subfl_fw_pk, flow->features.subfl_fw_byt,
-                   flow->features.subfl_bw_pk, flow->features.subfl_bw_byt,
+                   (double)flow->features.subfl_fw_pk, (double)flow->features.subfl_fw_byt,
+                   (double)flow->features.subfl_bw_pk, (double)flow->features.subfl_bw_byt,
                    flow->features.fw_win_byt, flow->features.bw_win_byt,
                                        flow->features.fw_act_pkt, flow->features.fw_seg_min);
         }

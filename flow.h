@@ -203,6 +203,7 @@ struct flow_stats {
     // 时间相关
     struct timespec start_time;   // 会话开始时间
     struct timespec end_time;     // 最后报文时间
+    uint64_t first_seen;         // 第一个包的时间戳(ns)
     uint64_t last_seen;          // 上次看到的时间戳(ns)
     
     // 正向流（src->dst）
@@ -465,10 +466,10 @@ struct flow_features {
     double pkt_size_avg; //数据包大小平均值
     double fw_seg_avg; //前向分段平均大小
     double bw_seg_avg;  //反向分段平均大小
-    double subfl_fw_pk; //前向子流中的平均数据包数
-    double subfl_fw_byt; //前向子流中的的平均数据包数
-    double subfl_bw_pk; //反向子流中的平均数据包数
-    double subfl_bw_byt; //反向子流中的的平均数据包数
+    uint32_t subfl_fw_pk; //前向子流中的平均数据包数
+    uint32_t subfl_fw_byt; //前向子流中的的平均数据包数
+    uint32_t subfl_bw_pk; //反向子流中的平均数据包数
+    uint32_t subfl_bw_byt; //反向子流中的的平均数据包数
     
     uint32_t fw_win_byt; //前向初始窗口中发送到字节数
     uint32_t bw_win_byt; //反向初始窗口中发送到字节数
@@ -680,5 +681,8 @@ void print_all_wireshark_sessions();
 // **新增**: tshark风格会话计数和验证函数
 int count_tshark_style_tcp_sessions();
 void verify_tshark_style_counting();
+
+// **新增**: 会话时间记录函数
+void print_session_timing_info();
 
 #endif /* FLOW_H */

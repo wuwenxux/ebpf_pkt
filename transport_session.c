@@ -77,7 +77,6 @@ static int calculate_session_features(transport_session_t *session);
 // 无锁内存池函数声明
 static transport_session_t *lockfree_allocate_session_from_pool(void);
 static void lockfree_free_session_to_pool(transport_session_t *session);
-static uint32_t generate_session_state_id(const struct flow_key *key, tcp_session_state_t tcp_state, udp_session_state_t udp_state);
 static transport_session_t *lockfree_find_session_with_state(const struct flow_key *key, uint8_t state_id);
 
 // 原子操作辅助函数
@@ -975,6 +974,9 @@ static void update_session_statistics(transport_session_t *session, uint32_t pac
                                      bool is_inbound, uint64_t timestamp) {
     if (!session) return;
     
+    // 更新最后包时间戳
+    session->stats.last_packet = timestamp;
+    
     // 更新基本统计
     if (is_inbound) {
         session->stats.packets_in++;
@@ -1074,23 +1076,6 @@ static void calculate_session_features_export(const transport_session_t *session
     struct tm *tm_info = localtime(&start_time_sec);
     strftime(export_data->start_time, sizeof(export_data->start_time), "%Y-%m-%d %H:%M:%S", tm_info);
 }
-
-static uint32_t generate_session_state_id(const struct flow_key *key, tcp_session_state_t tcp_state, udp_session_state_t udp_state) {
-    uint32_t state_id = 0;
-    
-    if (key->protocol == IPPROTO_TCP) {
-        state_id = (uint32_t)tcp_state;
-    } else if (key->protocol == IPPROTO_UDP) {
-        state_id = (uint32_t)udp_state;
-    }
-    
-    // 组合五元组哈希和状态
-    uint32_t flow_hash = key->src_ip ^ key->dst_ip ^ 
-                        ((uint32_t)key->src_port << 16) ^ key->dst_port ^ key->protocol;
-    
-    return (flow_hash & 0xFFFFFF00) | (state_id & 0xFF);
-}
-
 // =================== 性能监控函数 ===================
 
 void print_lockfree_pool_stats(const memory_pool_t *pool) {
@@ -1142,12 +1127,18 @@ int calculate_session_features(transport_session_t *session) {
     features->tot_1_fw_pk = session->stats.bytes_out;  // 正向字节数
     features->tot_1_bw_pk = session->stats.bytes_in;   // 反向字节数
     
-    // 计算持续时间
+    // 重新计算流持续时间（fl_dur）
+    printf("DEBUG: first_packet=%lu, last_packet=%lu\n", 
+           session->stats.first_packet, session->stats.last_packet);
     if (session->stats.last_packet > session->stats.first_packet) {
-        features->fl_dur = (session->stats.last_packet - session->stats.first_packet) / 1000000000.0; // 纳秒转秒
+        features->fl_dur = (double)(session->stats.last_packet - session->stats.first_packet) / 1000000000.0; // 纳秒转秒
+        printf("DEBUG: fl_dur calculated = %.6f\n", features->fl_dur);
+    } else {
+        features->fl_dur = 0.0; // 如果只有一个包，持续时间为0
+        printf("DEBUG: fl_dur = 0.0 (no duration)\n");
     }
     
-    // 生成开始时间字符串
+    // 生成开始时间字符串（可读格式）
     time_t start_time_sec = session->stats.first_packet / 1000000000;
     struct tm *tm_info = localtime(&start_time_sec);
     strftime(features->start_time_str, sizeof(features->start_time_str), "%Y-%m-%d %H:%M:%S", tm_info);
@@ -2111,22 +2102,21 @@ int main(void) {
 
 // =================== 新的CSV导出函数 ===================
 
-// CSV头部定义（包含所有flow_features字段）
+// CSV头部定义（修改字段顺序）
 static const char* comprehensive_csv_header = 
-    "SessionID,SrcIP,SrcPort,DstIP,DstPort,Protocol,"
-    "FlowDuration,StartTime,"
-    "TotFwdPk,TotBwdPk,Tot1FwPk,Tot1BwPk,"
-    "FwdPkt1Max,FwdPkt1Min,FwdPkt1Avg,FwdPkt1Std,"
-    "BwdPkt1Max,BwdPkt1Min,BwdPkt1Avg,BwdPkt1Std,"
-    "FlBytS,FlPktS,"
-    "FlIatAvg,FlIatStd,FlIatMax,FlIatMin,"
-    "FwIatTot,FwIatAvg,FwIatStd,FwIatMax,FwIatMin,"
-    "BwIatTot,BwIatAvg,BwIatStd,BwIatMax,BwIatMin,"
-    "FwHdrLen,BwHdrLen,"
-    "PktLenMin,PktLenMax,PktLenAvg,PktLenStd,PktLenVa,"
-    "DownUpRatio,AvgPacketSize,FwSegAvg,BwSegAvg,"
-    "SubflFwPk,SubflFwByt,SubflBwPk,SubflBwByt,"
-    "FwWinByt,BwWinByt,FwActPkt,FwSegMin\n";
+    "SrcIP,SrcPort,DstIP,DstPort,Protocol,Timestamp,fl_dur,"
+    "tot_fw_pk,tot_bw_pk,tot_1_fw_pk,"
+    "fwd_pkt_1_min,fwd_pkt_1_max,fwd_pkt_1_avg,fwd_pkt_1_std,"
+    "bwd_pkt_1_min,bwd_pkt_1_max,bwd_pkt_1_avg,bwd_pkt_1_std,"
+    "fl_byt_s,fl_pkt_s,"
+    "fl_iat_avg,fl_iat_std,fl_iat_max,fl_iat_min,"
+    "fw_iat_tot,fw_iat_avg,fw_iat_std,fw_iat_max,fw_iat_min,"
+    "bw_iat_tot,bw_iat_avg,bw_iat_std,bw_iat_max,bw_iat_min,"
+    "fw_hdr_len,bw_hdr_len,fw_pkt_s,bw_pkt_s,"
+    "pkt_len_min,pkt_len_max,pkt_len_avg,pkt_len_std,pkt_len_va,"
+    "down_up_ratio,pkt_size_avg,fw_seg_avg,bw_seg_avg,"
+    "subfl_fw_pk,subfl_fw_byt,subfl_bw_pk,subfl_bw_byt,"
+    "fw_win_byt,bw_win_byt,fw_ack_pkt,fw_seg_min\n";
 
 int export_comprehensive_flow_features_to_csv(const char *filename) {
     if (!global_session_manager) {
@@ -2194,6 +2184,14 @@ int export_comprehensive_flow_features_to_csv(const char *filename) {
 int export_comprehensive_session_features(transport_session_t *session, FILE *fp) {
     if (!session || !fp) return -1;
     
+    // 添加调试信息
+    printf("DEBUG: Session %s:%u -> %s:%u, first_packet=%lu, last_packet=%lu\n",
+           inet_ntoa((struct in_addr){.s_addr = session->key.src_ip}),
+           ntohs(session->key.src_port),
+           inet_ntoa((struct in_addr){.s_addr = session->key.dst_ip}),
+           ntohs(session->key.dst_port),
+           session->stats.first_packet, session->stats.last_packet);
+    
     struct flow_features *features = &session->stats.features;
     
     // 转换IP地址为字符串
@@ -2206,34 +2204,32 @@ int export_comprehensive_session_features(transport_session_t *session, FILE *fp
     char dst_ip_str[INET_ADDRSTRLEN];
     inet_ntop(AF_INET, &addr, dst_ip_str, INET_ADDRSTRLEN);
     
-    // 写入CSV行 - 包含所有flow_features字段
-    fprintf(fp, "%u,%s,%u,%s,%u,%u,"
-                "%.6f,%s,"
-                "%lu,%lu,%lu,%lu,"
+    // 写入CSV行 - 修改字段顺序和格式
+    fprintf(fp, "%s,%u,%s,%u,%u,%s,%.6f,"
+                "%lu,%lu,%lu,"
                 "%u,%u,%.2f,%.2f,%u,%u,%.2f,%.2f,"
+                "%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,"
                 "%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,"
-                "%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,"
-                "%.2f,%.2f,"
-                "%u,%u,%.2f,%.2f,%.2f,"
                 "%.2f,%.2f,%.2f,%.2f,"
-                "%.2f,%.2f,%.2f,%.2f,"
-                "%u,%u,%u,%u\n",
+                "%.2f,%.2f,%.2f,%.2f,%.2f,"
+                "%.2f,%.2f,%.2f,%.2f\n",
                 
-                // 基本信息 (五元组)
-                session->session_id, src_ip_str, ntohs(session->key.src_port), 
-                dst_ip_str, ntohs(session->key.dst_port), session->key.protocol,
+                // 基本信息 - 修改顺序：src_ip, src_port, dst_ip, dst_port
+                src_ip_str, ntohs(session->key.src_port),
+                dst_ip_str, ntohs(session->key.dst_port), 
+                session->key.protocol,
                 
-                // 时间信息
-                features->fl_dur, features->start_time_str,
+                // 时间信息 - 修改timestamp和fl_dur格式
+                features->start_time_str, features->fl_dur,
                 
-                // 基本统计 (flow_features)
+                // 基本统计
                 features->tot_fw_pk, features->tot_bw_pk,
-                features->tot_1_fw_pk, features->tot_1_bw_pk,
+                features->tot_1_fw_pk,
                 
                 // 包大小特征
-                features->fwd_pkt_1_max, features->fwd_pkt_1_min,
+                features->fwd_pkt_1_min, features->fwd_pkt_1_max,
                 features->fwd_pkt_1_avg, features->fwd_pkt_1_std,
-                features->bwd_pkt_1_max, features->bwd_pkt_1_min,
+                features->bwd_pkt_1_min, features->bwd_pkt_1_max,
                 features->bwd_pkt_1_avg, features->bwd_pkt_1_std,
                 
                 // 流量率特征
@@ -2251,11 +2247,12 @@ int export_comprehensive_session_features(transport_session_t *session, FILE *fp
                 features->bw_iat_tot, features->bw_iat_avg, features->bw_iat_std,
                 features->bw_iat_max, features->bw_iat_min,
                 
-                // 头部长度
+                // 头部长度和包率
                 (double)features->fw_hdr_len, (double)features->bw_hdr_len,
+                features->fw_pkt_s, features->bw_pkt_s,
                 
                 // 包长度统计
-                features->pkt_len_min, features->pkt_len_max,
+                (double)features->pkt_len_min, (double)features->pkt_len_max,
                 features->pkt_len_avg, features->pkt_len_std, features->pkt_len_va,
                 
                 // 比率和平均值
@@ -2263,12 +2260,12 @@ int export_comprehensive_session_features(transport_session_t *session, FILE *fp
                 features->fw_seg_avg, features->bw_seg_avg,
                 
                 // 子流特征
-                features->subfl_fw_pk, features->subfl_fw_byt,
-                features->subfl_bw_pk, features->subfl_bw_byt,
+                (double)features->subfl_fw_pk, (double)features->subfl_fw_byt,
+                (double)features->subfl_bw_pk, (double)features->subfl_bw_byt,
                 
                 // 窗口和段大小特征
-                features->fw_win_byt, features->bw_win_byt,
-                features->fw_act_pkt, features->fw_seg_min);
+                (double)features->fw_win_byt, (double)features->bw_win_byt,
+                (double)features->fw_act_pkt, (double)features->fw_seg_min);
     
     return 0;
 }
