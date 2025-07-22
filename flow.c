@@ -802,7 +802,17 @@ void flow_table_destroy() {
             timestamp_array_free(&node->stats.bwd_timestamps);
             timestamp_array_free(&node->stats.udp.fwd_timestamps);
             timestamp_array_free(&node->stats.udp.bwd_timestamps);
-            
+            // 新增：释放active和idle数组
+            if (node->stats.active) {
+                free(node->stats.active);
+                node->stats.active = NULL;
+                node->stats.active_count = 0;
+            }
+            if (node->stats.idle) {
+                free(node->stats.idle);
+                node->stats.idle = NULL;
+                node->stats.idle_count = 0;
+            }
             mempool_free(&global_pool, node);
             node = next;
         }
