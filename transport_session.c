@@ -2205,67 +2205,61 @@ int export_comprehensive_session_features(transport_session_t *session, FILE *fp
     inet_ntop(AF_INET, &addr, dst_ip_str, INET_ADDRSTRLEN);
     
     // 写入CSV行 - 修改字段顺序和格式
-    fprintf(fp, "%s,%u,%s,%u,%u,%s,%.6f,"
-                "%lu,%lu,%lu,"
-                "%u,%u,%.2f,%.2f,%u,%u,%.2f,%.2f,"
-                "%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,"
-                "%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,"
-                "%.2f,%.2f,%.2f,%.2f,"
-                "%.2f,%.2f,%.2f,%.2f,%.2f,"
-                "%.2f,%.2f,%.2f,%.2f\n",
-                
-                // 基本信息 - 修改顺序：src_ip, src_port, dst_ip, dst_port
+    fprintf(fp, "%s,%u,%s,%u,%u,%s,%.6f,",
                 src_ip_str, ntohs(session->key.src_port),
                 dst_ip_str, ntohs(session->key.dst_port), 
                 session->key.protocol,
-                
-                // 时间信息 - 修改timestamp和fl_dur格式
-                features->start_time_str, features->fl_dur,
+        features->start_time_str,
+        features->fl_dur);
                 
                 // 基本统计
-                features->tot_fw_pk, features->tot_bw_pk,
-                features->tot_1_fw_pk,
+    fprintf(fp, "%lu,%lu,%lu,",
+            features->tot_fw_pk, features->tot_bw_pk, features->tot_1_fw_pk);
                 
                 // 包大小特征
-                features->fwd_pkt_1_min, features->fwd_pkt_1_max,
-                features->fwd_pkt_1_avg, features->fwd_pkt_1_std,
-                features->bwd_pkt_1_min, features->bwd_pkt_1_max,
-                features->bwd_pkt_1_avg, features->bwd_pkt_1_std,
+    fprintf(fp, "%u,%u,%.2f,%.2f,%u,%u,%.2f,%.2f,",
+            features->fwd_pkt_1_min, features->fwd_pkt_1_max, features->fwd_pkt_1_avg, features->fwd_pkt_1_std,
+            features->bwd_pkt_1_min, features->bwd_pkt_1_max, features->bwd_pkt_1_avg, features->bwd_pkt_1_std);
                 
                 // 流量率特征
-                features->fl_byt_s, features->fl_pkt_s,
+    fprintf(fp, "%.2f,%.2f,",
+            features->fl_byt_s, features->fl_pkt_s);
                 
                 // 流间隔时间特征
-                features->fl_iat_avg, features->fl_iat_std,
-                features->fl_iat_max, features->fl_iat_min,
+    fprintf(fp, "%.2f,%.2f,%.2f,%.2f,",
+            features->fl_iat_avg, features->fl_iat_std, features->fl_iat_max, features->fl_iat_min);
                 
                 // 前向IAT特征
-                features->fw_iat_tot, features->fw_iat_avg,
-                features->fw_iat_std, features->fw_iat_max, features->fw_iat_min,
+    fprintf(fp, "%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,",
+            features->fw_iat_tot, features->fw_iat_avg, features->fw_iat_std, features->fw_iat_max, features->fw_iat_min);
                 
                 // 反向IAT特征
-                features->bw_iat_tot, features->bw_iat_avg, features->bw_iat_std,
-                features->bw_iat_max, features->bw_iat_min,
+    fprintf(fp, "%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,",
+            features->bw_iat_tot, features->bw_iat_avg, features->bw_iat_std, features->bw_iat_max, features->bw_iat_min);
                 
                 // 头部长度和包率
-                (double)features->fw_hdr_len, (double)features->bw_hdr_len,
-                features->fw_pkt_s, features->bw_pkt_s,
+    fprintf(fp, "%.2f,%.2f,%.2f,%.2f,",
+            (double)features->fw_hdr_len, (double)features->bw_hdr_len, features->fw_pkt_s, features->bw_pkt_s);
                 
                 // 包长度统计
-                (double)features->pkt_len_min, (double)features->pkt_len_max,
-                features->pkt_len_avg, features->pkt_len_std, features->pkt_len_va,
+    fprintf(fp, "%.2f,%.2f,%.2f,%.2f,%.2f,",
+            (double)features->pkt_len_min, (double)features->pkt_len_max, features->pkt_len_avg, features->pkt_len_std, features->pkt_len_va);
                 
                 // 比率和平均值
-                features->down_up_ratio, features->avg_packet_size,
-                features->fw_seg_avg, features->bw_seg_avg,
+    fprintf(fp, "%.2f,%.2f,%.2f,%.2f,%.2f,",
+            features->down_up_ratio, features->avg_packet_size, features->fw_seg_avg, features->bw_seg_avg);
                 
                 // 子流特征
+    fprintf(fp, "%.2f,%.2f,%.2f,%.2f,",
                 (double)features->subfl_fw_pk, (double)features->subfl_fw_byt,
-                (double)features->subfl_bw_pk, (double)features->subfl_bw_byt,
+            (double)features->subfl_bw_pk, (double)features->subfl_bw_byt);
                 
                 // 窗口和段大小特征
+    fprintf(fp, "%.2f,%.2f,%.2f,%.2f,",
                 (double)features->fw_win_byt, (double)features->bw_win_byt,
                 (double)features->fw_act_pkt, (double)features->fw_seg_min);
+    
+    fprintf(fp, "\n");
     
     return 0;
 }

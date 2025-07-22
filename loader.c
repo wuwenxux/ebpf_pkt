@@ -77,6 +77,10 @@ static clock_t start_cpu_time;
 static clock_t start_wall_time;
 static struct timespec program_start_time;
 
+// 全局时间基准
+struct timespec boot_realtime;
+uint64_t boot_monotonic_ns = 0;
+
 // 全局变量以跟踪终端模式
 int in_place_updates = 1;  // 默认启用原位更新
 int first_stats_print = 1; // 第一次打印标志
@@ -1805,11 +1809,13 @@ void print_final_stats(void) {
         
         if (csv_fp) {
             // 基本流信息 - 只包含你需要的字段
+            char timebuf[32];
+            format_ebpf_packet_time(node->stats.first_seen, timebuf, sizeof(timebuf));
             fprintf(csv_fp, "%s,%d,%s,%d,%d,%s,",
                    flow->src_ip, node->original_src_port,
                    flow->dst_ip, node->original_dst_port,
                    flow->protocol,
-                   flow->start_time_str);
+                   timebuf);
             
             // 流持续时间
             fprintf(csv_fp, "%.6f,",
@@ -1860,6 +1866,13 @@ void print_final_stats(void) {
                    (double)flow->features.subfl_bw_pk, (double)flow->features.subfl_bw_byt,
                    flow->features.fw_win_byt, flow->features.bw_win_byt,
                                        flow->features.fw_act_pkt, flow->features.fw_seg_min);
+        }
+        if (i < 5) {
+            printf("DEBUG: boot_realtime.tv_sec = %ld, boot_monotonic_ns = %lu, node->stats.first_seen = %lu\n",
+                boot_realtime.tv_sec, boot_monotonic_ns, node->stats.first_seen);
+            char timebuf[32];
+            format_ebpf_packet_time(node->stats.first_seen, timebuf, sizeof(timebuf));
+            printf("DEBUG: wall time = %s\n", timebuf);
         }
     }
     
@@ -1933,7 +1946,29 @@ void print_usage(const char *prog_name) {
     printf("  %s -r capture.pcap        # Read from pcap file\n", prog_name);
 }
 
+// 启动时初始化时间基准
+void init_time_base() {
+    struct timespec realtime, monotonic;
+    clock_gettime(CLOCK_REALTIME, &realtime);
+    clock_gettime(CLOCK_MONOTONIC, &monotonic);
+    boot_realtime = realtime;
+    boot_monotonic_ns = (uint64_t)monotonic.tv_sec * 1000000000ULL + monotonic.tv_nsec;
+}
+
+// 将bpf_ktime_get_ns()时间戳转为wall time字符串
+void format_ebpf_packet_time(uint64_t ktime_ns, char *buf, size_t buflen) {
+    uint64_t base_ns = (uint64_t)boot_realtime.tv_sec * 1000000000ULL + boot_realtime.tv_nsec;
+    uint64_t abs_ns = base_ns + (ktime_ns - boot_monotonic_ns);
+    time_t sec = abs_ns / 1000000000ULL;
+    struct tm tm;
+    localtime_r(&sec, &tm);
+    strftime(buf, buflen, "%Y-%m-%d %H:%M:%S", &tm);
+}
+
+
+
 int main(int argc, char **argv) {
+    init_time_base();
     const char *ifname = "all";  // Default to monitor all interfaces
     const char *pcap_file = NULL;
     int c;
@@ -2068,6 +2103,15 @@ int main(int argc, char **argv) {
         // Live capture mode
         ret = run_live_capture(ifname);
     }
+    
+    // 启动主捕获/处理循环后，添加如下实时统计输出
+    while (running) {
+        update_system_stats();
+        printf("\r已收到数据包: %lu", system_stats.packets_processed);
+        fflush(stdout);
+        sleep(1);
+    }
+    printf("\n"); // 程序结束时换行
     
     return ret;
 }

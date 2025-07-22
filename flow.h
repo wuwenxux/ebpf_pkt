@@ -685,4 +685,8 @@ void verify_tshark_style_counting();
 // **新增**: 会话时间记录函数
 void print_session_timing_info();
 
+void format_packet_time(uint64_t pkt_timestamp, char *buf, size_t buflen);
+void format_ebpf_packet_time(uint64_t ktime_ns, char *buf, size_t buflen);
+
 #endif /* FLOW_H */
+
