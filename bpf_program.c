@@ -214,6 +214,8 @@ static __always_inline int check_src_range(__u32 src_ip) {
 static __always_inline int apply_packet_filter(__u32 src_ip, __u32 dst_ip,
                                               __u16 src_port, __u16 dst_port,
                                               __u8 protocol) {
+    // 关闭所有过滤，直接允许
+    //return FILTER_ACTION_ALLOW;
     __u32 config_key = 0;
     struct filter_config *config = bpf_map_lookup_elem(&filter_config_map, &config_key);
     
@@ -310,30 +312,28 @@ static __always_inline int is_loopback(__u32 saddr, __u32 daddr) {
 
 static __always_inline void submit_batch(struct xdp_md *ctx, struct batch_data *batch) {
     if (batch->count > 0) {
-        // 显式限制 count 不超过 BATCH_SIZE
         __u32 count = batch->count;
         if (count > BATCH_SIZE)
             count = BATCH_SIZE;
         
-        __u32 max_size = sizeof(struct batch_data);
-        __u32 data_size = offsetof(struct batch_data, pkts);
-        
-        // 使用安全的方式计算数据大小，避免整数溢出
-        data_size += count * sizeof(struct packet_info);
-        
-        // 显式边界检查，使验证器满意
-        if (data_size > max_size)
-            data_size = max_size;
-        
-        // 使用 & 操作符来限制范围，这是验证器最喜欢的方式
-        data_size &= (max_size - 1) | max_size;
-        
+        // 提交 packet_info 数组，而不是整个 batch_data 结构体
         bpf_perf_event_output(ctx, &events, BPF_F_CURRENT_CPU, 
-                             batch, data_size);
+                             batch->pkts, count * sizeof(struct packet_info));
         batch->count = 0;
         batch->last_flush = bpf_ktime_get_ns();
     }
 }
+
+// INFO模式宏定义（可根据实际集成方式调整）
+#define INFO_MODE 1
+
+// 全局包计数器（percpu，避免竞争）
+struct {
+    __uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
+    __uint(key_size, sizeof(__u32));
+    __uint(value_size, sizeof(__u64));
+    __uint(max_entries, 1);
+} packet_count_map SEC(".maps");
 
 SEC("xdp") 
 int xdp_packet_capture(struct xdp_md *ctx) {
@@ -386,6 +386,17 @@ int xdp_packet_capture(struct xdp_md *ctx) {
     if (bpf_ktime_get_ns() - batch->last_flush > FLUSH_TIMEOUT_NS) {
         submit_batch(ctx, batch);
     }
+    // 统计报文数量并在INFO模式下打印
+#if INFO_MODE
+    __u32 count_key = 0;
+    __u64 *pcount = bpf_map_lookup_elem(&packet_count_map, &count_key);
+    if (pcount) {
+        __sync_fetch_and_add(pcount, 1);
+        if (*pcount % 1000 == 0) {
+            bpf_printk("[INFO] Total packets received: %llu", *pcount);
+        }
+    }
+#endif
     return XDP_PASS;
 }
 

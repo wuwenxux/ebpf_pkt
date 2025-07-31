@@ -442,20 +442,23 @@ static void process_packet_direct(const struct iphdr *ip, uint16_t src_port, uin
 }
 
 static void cleanup(void) {
+    static pthread_mutex_t cleanup_mutex = PTHREAD_MUTEX_INITIALIZER;
+    pthread_mutex_lock(&cleanup_mutex);
     if (cleanup_done) {
+        pthread_mutex_unlock(&cleanup_mutex);
         return;
     }
     cleanup_done = 1;
-    
+
     // 销毁数据包队列
     packet_queue_destroy(&packet_queue);
-    
+
     // Cleanup flow table
     if (flow_table_initialized) {
         print_final_stats();
         flow_table_destroy();
     }
-    
+
     // Close lock file
     if (lock_fd != -1) {
         flock(lock_fd, LOCK_UN);
@@ -463,6 +466,7 @@ static void cleanup(void) {
         unlink(LOCK_FILE);
         lock_fd = -1;
     }
+    pthread_mutex_unlock(&cleanup_mutex);
 }
 
 // Initialize system monitoring
@@ -622,6 +626,14 @@ static int check_single_instance(void) {
 
 // 修改后的BPF数据处理函数，将数据包添加到队列
 static void handle_batch(void *ctx, int cpu, void *data, __u32 size) {
+    // 新增：断言 size 必须是 struct packet_info 的整数倍
+    /* 
+    if (size % sizeof(struct packet_info) != 0) {
+        fprintf(stderr, "[ASAN-DEBUG] handle_batch: perf event size %u is not a multiple of struct packet_info (%zu)!\n", size, sizeof(struct packet_info));
+        fflush(stderr);
+        abort();
+    }
+    */
     const struct packet_info *pkts = data;
     int count = size / sizeof(struct packet_info);
     
@@ -657,7 +669,7 @@ static void handle_batch(void *ctx, int cpu, void *data, __u32 size) {
         
         // 调试输出（前10个包）- 仅在debug模式下显示
         static int debug_count = 0;
-        if (debug_count < 10 && get_debug_level() > 0) {
+        if (debug_count < 10 && get_debug_level() >= 2) {
             struct in_addr src_addr = {.s_addr = pkt->src_ip};
             struct in_addr dst_addr = {.s_addr = pkt->dst_ip};
             printf("DEBUG: Packet %d - IP: %s -> %s, Protocol: %d, Ports: %u -> %u, TCP flags: 0x%02x\n", 
@@ -1392,7 +1404,7 @@ int run_single_interface_capture(const char *ifname) {
             last_process_time = current_time;
             
             // 调试输出（仅在debug模式下）
-            if (get_debug_level() > 0 && processed_count > 0) {
+            if (get_debug_level() >= 2 && processed_count > 0) {
                 printf("DEBUG: Processed %d packets from queue (queue size: %lu)\n", 
                        processed_count, packet_queue_size(&packet_queue));
             }
@@ -1599,8 +1611,7 @@ void print_final_stats(void) {
             flow->duration = time_diff(&node->stats.end_time, &node->stats.start_time);
             
             // 格式化开始时间（可读格式）
-            struct tm *start_tm = localtime(&node->stats.start_time.tv_sec);
-            strftime(flow->start_time_str, sizeof(flow->start_time_str), "%Y-%m-%d %H:%M:%S", start_tm);
+            format_ebpf_packet_time(node->stats.first_seen, flow->start_time_str, sizeof(flow->start_time_str));
             
             // 准备IP地址字符串
             snprintf(flow->src_ip, sizeof(flow->src_ip), "%u.%u.%u.%u", NIPQUAD(node->key.src_ip));
@@ -1867,7 +1878,7 @@ void print_final_stats(void) {
                    flow->features.fw_win_byt, flow->features.bw_win_byt,
                                        flow->features.fw_act_pkt, flow->features.fw_seg_min);
         }
-        if (i < 5) {
+        if (i < 5 && get_debug_level() >= 2) {
             printf("DEBUG: boot_realtime.tv_sec = %ld, boot_monotonic_ns = %lu, node->stats.first_seen = %lu\n",
                 boot_realtime.tv_sec, boot_monotonic_ns, node->stats.first_seen);
             char timebuf[32];

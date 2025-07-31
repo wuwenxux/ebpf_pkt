@@ -89,19 +89,19 @@ all: bpf_program.o $(TARGETS)
 debug: CFLAGS += -g -O0 -DDEBUG -DDEBUG_LEVEL=$(DEBUG_LEVEL) -Wall -Wextra -Wpedantic
 debug: CFLAGS += -fsanitize=address -fsanitize=undefined -fno-omit-frame-pointer
 debug: LDFLAGS += -fsanitize=address -fsanitize=undefined
-debug: $(DEBUG_TARGETS)
+debug: loader_debug
 
 # Release版本
 release: CFLAGS += -O3 -DNDEBUG -march=native -mtune=native
 release: CFLAGS += -flto -ffast-math -funroll-loops -fomit-frame-pointer
 release: LDFLAGS += -flto
-release: $(RELEASE_TARGETS)
+release: loader_release
 
 # Profile版本
 profile: CFLAGS += -O2 -g -pg -DDEBUG_LEVEL=1
 profile: CFLAGS += -fno-omit-frame-pointer -DTRACE_ENABLED
 profile: LDFLAGS += -pg
-profile: $(PROFILE_TARGETS)
+profile: loader_profile
 
 # 所有版本
 all-versions: debug release profile
@@ -120,21 +120,21 @@ loader: loader.c flow.c mempool.c transport_session.c
 
 loader_debug: loader.c flow.c mempool.c transport_session.c
 	@echo "编译loader (debug版本)..."
-	$(CC) $(CFLAGS) -g -O0 -DDEBUG -DDEBUG_LEVEL=$(DEBUG_LEVEL) -Wall -Wextra -Wpedantic \
-		-fsanitize=address -fsanitize=undefined -fno-omit-frame-pointer \
-		$(LDFLAGS) -fsanitize=address -fsanitize=undefined -o $@ $^ $(LDLIBS)
+	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ $^ $(LDLIBS)
 
 loader_release: loader.c flow.c mempool.c transport_session.c
 	@echo "编译loader (release版本)..."
-	$(CC) $(CFLAGS) -O3 -DNDEBUG -march=native -mtune=native \
-		-flto -ffast-math -funroll-loops -fomit-frame-pointer \
-		$(LDFLAGS) -flto -o $@ $^ $(LDLIBS)
+	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ $^ $(LDLIBS)
 
 loader_profile: loader.c flow.c mempool.c transport_session.c
 	@echo "编译loader (profile版本)..."
-	$(CC) $(CFLAGS) -O2 -g -pg -DDEBUG_LEVEL=1 \
-		-fno-omit-frame-pointer -DTRACE_ENABLED \
-		$(LDFLAGS) -pg -o $@ $^ $(LDLIBS)
+	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ $^ $(LDLIBS)
+
+loader_debug_noasan: loader.c flow.c mempool.c transport_session.c
+	@echo "编译loader (debug版本，无ASan，用于Valgrind)..."
+	$(CC) $(CFLAGS) -g -O0 -DDEBUG -DDEBUG_LEVEL=$(DEBUG_LEVEL) -Wall -Wextra -Wpedantic \
+		-fno-omit-frame-pointer -DTRACE_ENABLED -DASSERT_ENABLED \
+		$(LDFLAGS) -o $@ $^ $(LDLIBS)
 
 # 其他应用程序可以根据需要添加
 
@@ -250,17 +250,24 @@ profile-perf: release
 	@echo "perf分析报告已保存到 perf_report.txt"
 
 # 使用valgrind进行内存检查
-memcheck: debug
+memcheck: debug-noasan
 	@echo "运行valgrind内存检查..."
 	valgrind --tool=memcheck --leak-check=full --show-leak-kinds=all \
 		--track-origins=yes --verbose --log-file=valgrind_report.txt \
-		./loader_debug -i lo -c 100
+		./loader_debug_noasan -i lo -c 100
 	@echo "内存检查报告已保存到 valgrind_report.txt"
+
+# Debug版本（无ASan，用于Valgrind）
+debug-noasan: CFLAGS += -g -O0 -DDEBUG -DDEBUG_LEVEL=$(DEBUG_LEVEL) -Wall -Wextra -Wpedantic
+debug-noasan: CFLAGS += -fno-omit-frame-pointer
+debug-noasan: CFLAGS += -DTRACE_ENABLED -DASSERT_ENABLED
+debug-noasan: BPF_CFLAGS += -g -O0 -DDEBUG
+debug-noasan: loader_debug_noasan
 
 # ==================== 清理目标 ====================
 clean:
 	rm -f *.o loader filter_manager filter_json_manager test_* ebpf_pkt.sh
-	rm -f loader_debug loader_release loader_profile
+	rm -f loader_debug loader_release loader_profile loader_debug_noasan
 	rm -f gmon.out profile_report.txt perf_report.txt valgrind_report.txt
 	rm -f *.debug *.release *.profile
 
