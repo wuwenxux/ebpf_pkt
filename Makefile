@@ -114,23 +114,23 @@ bpf_program.o: bpf_program.c
 # ==================== 应用程序编译 ====================
 
 # Loader应用程序
-loader: loader.c flow.c mempool.c transport_session.c
+loader: loader.c flow.c mempool.c transport_session.c logger.c
 	@echo "编译loader ($(BUILD_TYPE)版本)..."
 	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ $^ $(LDLIBS)
 
-loader_debug: loader.c flow.c mempool.c transport_session.c
+loader_debug: loader.c flow.c mempool.c transport_session.c logger.c
 	@echo "编译loader (debug版本)..."
 	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ $^ $(LDLIBS)
 
-loader_release: loader.c flow.c mempool.c transport_session.c
+loader_release: loader.c flow.c mempool.c transport_session.c logger.c
 	@echo "编译loader (release版本)..."
 	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ $^ $(LDLIBS)
 
-loader_profile: loader.c flow.c mempool.c transport_session.c
+loader_profile: loader.c flow.c mempool.c transport_session.c logger.c
 	@echo "编译loader (profile版本)..."
 	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ $^ $(LDLIBS)
 
-loader_debug_noasan: loader.c flow.c mempool.c transport_session.c
+loader_debug_noasan: loader.c flow.c mempool.c transport_session.c logger.c
 	@echo "编译loader (debug版本，无ASan，用于Valgrind)..."
 	$(CC) $(CFLAGS) -g -O0 -DDEBUG -DDEBUG_LEVEL=$(DEBUG_LEVEL) -Wall -Wextra -Wpedantic \
 		-fno-omit-frame-pointer -DTRACE_ENABLED -DASSERT_ENABLED \

@@ -40,6 +40,8 @@ typedef unsigned char u_char;
 
 // Our headers
 #include "flow.h"
+#include "transport_session.h"
+#include "logger.h"
 
 // 增加预取相关宏定义
 #define PREFETCH(addr) __builtin_prefetch(addr)
@@ -91,7 +93,7 @@ volatile int running = 1;
 // 函数前向声明
 void print_final_stats(void);
 int run_single_interface_capture(const char *ifname);
-
+void cleanup_expired_sessions(void);
 // flow_table_initialized是flow.c中的变量，我们在这里声明为外部变量
 extern int flow_table_initialized;
 extern int count_active_flows(); // 从flow.c导入流计数函数
@@ -626,6 +628,8 @@ static int check_single_instance(void) {
 
 // 修改后的BPF数据处理函数，将数据包添加到队列
 static void handle_batch(void *ctx, int cpu, void *data, __u32 size) {
+    (void)ctx;  // 避免未使用参数警告
+    (void)cpu;  // 避免未使用参数警告
     // 新增：断言 size 必须是 struct packet_info 的整数倍
     /* 
     if (size % sizeof(struct packet_info) != 0) {
@@ -729,7 +733,7 @@ void process_pcap_packet(const u_char *packet, const struct pcap_pkthdr *header)
     }
     
     // 预取传输层头
-    void *transport_header = (void *)ip + (ip->ihl * 4);
+    void *transport_header = (void *)((char *)ip + (ip->ihl * 4));
     PREFETCH(transport_header);
     
     // 准备数据包结构
@@ -1352,8 +1356,10 @@ int run_single_interface_capture(const char *ifname) {
     // 添加定期处理变量
     uint64_t packet_count = 0;
     uint64_t last_process_time = 0;
+    uint64_t last_cleanup_time = 0;
     uint64_t current_time = 0;
     const uint64_t PROCESS_INTERVAL_MS = 300;  // 300ms处理间隔
+    const uint64_t CLEANUP_INTERVAL_MS = 5000; // 5秒清理间隔
     const uint64_t PROCESS_PACKET_COUNT = 1000;  // 每1000个包处理一次
     const int MAX_BATCH_SIZE = 500;  // 每次最多处理500个包，避免长时间占用CPU
     
@@ -1368,6 +1374,12 @@ int run_single_interface_capture(const char *ifname) {
         
         // 获取当前时间（毫秒）
         current_time = get_current_time() / 1000000;  // 转换为毫秒
+        
+        // 定期清理过期会话 - 每5秒执行一次
+        if ((current_time - last_cleanup_time) >= CLEANUP_INTERVAL_MS) {
+            cleanup_expired_sessions();
+            last_cleanup_time = current_time;
+        }
         
         // 处理队列中的数据包 - 每1000个包或每300ms处理一次
         if (packet_count >= PROCESS_PACKET_COUNT || 
@@ -1976,7 +1988,67 @@ void format_ebpf_packet_time(uint64_t ktime_ns, char *buf, size_t buflen) {
     strftime(buf, buflen, "%Y-%m-%d %H:%M:%S", &tm);
 }
 
+// 会话超时清理函数
+void cleanup_expired_sessions(void) {
+    if (!global_session_manager) {
+        return;
+    }
+    
+    uint64_t current_time = get_current_time();
+    uint32_t pool_usage = get_lockfree_pool_usage_percent(&global_session_manager->session_pool);
+    
+    // 根据内存使用率调整清理策略
+    uint64_t timeout_threshold = SESSION_TIMEOUT_NS;
+    
+    if (pool_usage > 90) {
+        // 内存使用率 > 90%，激进清理
+        timeout_threshold = SESSION_TIMEOUT_NS / 2;
+        log_info("[MEMORY] High usage (%u%%), aggressive cleanup", pool_usage);
+    } else if (pool_usage > 70) {
+        // 内存使用率 > 70%，中等清理
+        timeout_threshold = SESSION_TIMEOUT_NS * 3 / 4;
+        log_info("[MEMORY] Medium usage (%u%%), moderate cleanup", pool_usage);
+    } else if (pool_usage > 50) {
+        // 内存使用率 > 50%，正常清理
+        log_info("[MEMORY] Normal usage (%u%%), standard cleanup", pool_usage);
+    } else {
+        // 内存使用率 < 50%，宽松清理
+        timeout_threshold = SESSION_TIMEOUT_NS * 3 / 2;
+        log_info("[MEMORY] Low usage (%u%%), relaxed cleanup", pool_usage);
+    }
+    
+    int cleaned_count = 0;
+    int total_sessions = 0;
+    
+    for (int i = 0; i < SESSION_HASH_SIZE; i++) {
+        transport_session_t *session = atomic_load_session_ptr(&global_session_manager->sessions[i]);
+        while (session) {
+            transport_session_t *next = atomic_load_session_ptr(&session->next_atomic);
+            total_sessions++;
+            
+            // 将 timespec 转换为纳秒进行比较
+            uint64_t session_last_activity = (uint64_t)session->last_activity.tv_sec * 1000000000ULL + 
+                                           (uint64_t)session->last_activity.tv_nsec;
+            
+            if (current_time - session_last_activity > timeout_threshold) {
+                if (lockfree_remove_session(session) == 0) {
+                    lockfree_free_session_to_pool(session);
+                    cleaned_count++;
+                }
+            }
+            session = next;
+        }
+    }
+    
+    if (cleaned_count > 0) {
+        log_info("[MEMORY] Cleaned %d/%d expired sessions, pool usage: %u%%", 
+                cleaned_count, total_sessions, pool_usage);
+    }
+}
 
+// 添加 transport_session.h 头文件
+#include "transport_session.h"
+#include "logger.h"
 
 int main(int argc, char **argv) {
     init_time_base();

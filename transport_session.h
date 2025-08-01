@@ -2,10 +2,11 @@
 #define TRANSPORT_SESSION_H
 
 #include <stdint.h>
-#include <time.h>
 #include <stdbool.h>
+#include <time.h>
 #include <stdatomic.h>
 #include "flow.h"
+#include "logger.h"
 
 // 添加缺失的常量定义
 // 会话哈希表大小 - 根据实际会话数量调整
@@ -298,20 +299,8 @@ int export_session_based_sessions_to_csv(const char *filename);
 int export_comprehensive_flow_features_to_csv(const char *filename);
 int export_comprehensive_session_features(transport_session_t *session, FILE *fp);
 
-// =================== 日志系统 ===================
-
-// 日志级别枚举
-typedef enum {
-    LOG_LEVEL_ERROR = 0,
-    LOG_LEVEL_WARN,
-    LOG_LEVEL_INFO,
-    LOG_LEVEL_DEBUG
-} log_level_t;
-
-// 日志系统函数声明
-extern log_level_t global_log_level;
-void set_log_level(log_level_t level);
-void log_msg(log_level_t level, const char *fmt, ...);
+// 导出基于conversation的会话统计
+int export_conversation_based_sessions_to_csv(const char *filename);
 
 // 会话管理器初始化和清理
 int transport_session_manager_init(void);
@@ -333,5 +322,12 @@ uint32_t get_session_manager_hash_collision_rate(void);
 
 // 基于实际数据的配置建议
 void suggest_config_based_on_actual_sessions(uint32_t actual_tcp_sessions, uint32_t actual_udp_sessions);
+
+// 全局会话管理器声明
+extern session_manager_t *global_session_manager;
+
+// 原子操作辅助函数声明
+transport_session_t *atomic_load_session_ptr(atomic_uintptr_t *atomic_ptr);
+void lockfree_free_session_to_pool(transport_session_t *session);
 
 #endif /* TRANSPORT_SESSION_H */

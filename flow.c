@@ -116,6 +116,7 @@ void handle_icmp(const void *transport_hdr, struct flow_key *key, uint8_t *flags
 }
 
 void handle_igmp(const void *transport_hdr, struct flow_key *key, uint8_t *flags) {
+    (void)transport_hdr;  // 避免未使用参数警告
     // IGMP协议处理
     key->src_port = 0;
     key->dst_port = 0;
@@ -123,6 +124,7 @@ void handle_igmp(const void *transport_hdr, struct flow_key *key, uint8_t *flags
 }
 
 void handle_gre(const void *transport_hdr, struct flow_key *key, uint8_t *flags) {
+    (void)transport_hdr;  // 避免未使用参数警告
     // GRE协议处理
     key->src_port = 0;
     key->dst_port = 0;
@@ -130,6 +132,7 @@ void handle_gre(const void *transport_hdr, struct flow_key *key, uint8_t *flags)
 }
 
 void handle_esp(const void *transport_hdr, struct flow_key *key, uint8_t *flags) {
+    (void)transport_hdr;  // 避免未使用参数警告
     // ESP协议处理
     key->src_port = 0;
     key->dst_port = 0;
@@ -137,6 +140,7 @@ void handle_esp(const void *transport_hdr, struct flow_key *key, uint8_t *flags)
 }
 
 void handle_ah(const void *transport_hdr, struct flow_key *key, uint8_t *flags) {
+    (void)transport_hdr;  // 避免未使用参数警告
     // AH协议处理
     key->src_port = 0;
     key->dst_port = 0;
@@ -144,6 +148,7 @@ void handle_ah(const void *transport_hdr, struct flow_key *key, uint8_t *flags) 
 }
 
 void handle_sctp(const void *transport_hdr, struct flow_key *key, uint8_t *flags) {
+    (void)transport_hdr;  // 避免未使用参数警告
     // SCTP协议处理 - 简化版本，不解析端口
     key->src_port = 0;
     key->dst_port = 0;
@@ -151,6 +156,7 @@ void handle_sctp(const void *transport_hdr, struct flow_key *key, uint8_t *flags
 }
 
 void handle_unknown(const void *transport_hdr, struct flow_key *key, uint8_t *flags) {
+    (void)transport_hdr;  // 避免未使用参数警告
     key->src_port = 0;
     key->dst_port = 0;
     *flags = 0;

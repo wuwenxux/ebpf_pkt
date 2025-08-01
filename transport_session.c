@@ -1,46 +1,22 @@
+#include "transport_session.h"
+#include "logger.h"
+#include "flow.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <stdint.h>
-#include <stdbool.h>
 #include <time.h>
-#include <unistd.h>
-#include <float.h>
-#include <arpa/inet.h>
-#include <netinet/ip.h>
-#include <netinet/tcp.h>
-#include <netinet/udp.h>
 #include <sys/time.h>
+#include <arpa/inet.h>
+#include <netinet/in.h>
 #include <math.h>
-#include <stdatomic.h>
-#include <stdarg.h>
+#include <float.h>
+#include <stddef.h>
 
-#include "transport_session.h"
-#include "flow.h"
-#include "mempool.h"
+// =================== 全局变量 ===================
 
-// =================== 日志系统实现 ===================
-
-// 全局日志级别变量
-log_level_t global_log_level = LOG_LEVEL_DEBUG;
-
-// 设置日志级别
-void set_log_level(log_level_t level) {
-    global_log_level = level;
-}
-
-// 日志消息函数
-void log_msg(log_level_t level, const char *fmt, ...) {
-    if (level > global_log_level) return;
-    
-    const char *level_str[] = {"ERROR", "WARN", "INFO", "DEBUG"};
-    fprintf(stderr, "[%s] ", level_str[level]);
-    
-    va_list args;
-    va_start(args, fmt);
-    vfprintf(stderr, fmt, args);
-    va_end(args);
-}
+// 全局会话管理器实例
+session_manager_t *global_session_manager = NULL;
+static atomic_bool session_manager_initialized = ATOMIC_VAR_INIT(false);
 
 // TCP标志定义
 #define TCP_FLAG_FIN 0x01
@@ -50,12 +26,10 @@ void log_msg(log_level_t level, const char *fmt, ...) {
 #define TCP_FLAG_ACK 0x10
 #define TCP_FLAG_URG 0x20
 
+
+
 // CAS操作重试次数
 #define CAS_RETRY_LIMIT 100
-
-// 全局会话管理器
-static session_manager_t *global_session_manager = NULL;
-static atomic_bool session_manager_initialized = ATOMIC_VAR_INIT(false);
 
 // 原子会话统计计数器
 static atomic_ulong session_id_counter = ATOMIC_VAR_INIT(1);
@@ -76,7 +50,7 @@ static int calculate_session_features(transport_session_t *session);
 
 // 无锁内存池函数声明
 static transport_session_t *lockfree_allocate_session_from_pool(void);
-static void lockfree_free_session_to_pool(transport_session_t *session);
+void lockfree_free_session_to_pool(transport_session_t *session);
 static transport_session_t *lockfree_find_session_with_state(const struct flow_key *key, uint8_t state_id);
 
 // 原子操作辅助函数
@@ -84,7 +58,7 @@ static inline void atomic_store_session_ptr(atomic_uintptr_t *atomic_ptr, transp
     atomic_store(atomic_ptr, (uintptr_t)session);
 }
 
-static inline transport_session_t *atomic_load_session_ptr(atomic_uintptr_t *atomic_ptr) {
+transport_session_t *atomic_load_session_ptr(atomic_uintptr_t *atomic_ptr) {
     return (transport_session_t *)atomic_load(atomic_ptr);
 }
 
@@ -129,7 +103,7 @@ int init_lockfree_memory_pool(memory_pool_t *pool, uint32_t block_count, size_t 
     
     memset(pool->pool_memory, 0, block_count * block_size);
     
-    log_msg(LOG_LEVEL_INFO, "Lockfree memory pool initialized: %u blocks of %zu bytes each\n", block_count, block_size);
+    log_info("Lockfree memory pool initialized: %u blocks of %zu bytes each", block_count, block_size);
     return 0;
 }
 
@@ -150,8 +124,8 @@ void cleanup_lockfree_memory_pool(memory_pool_t *pool) {
     atomic_store(&pool->used_count, 0);
     atomic_store(&pool->next_free_hint, 0);
     
-    log_msg(LOG_LEVEL_INFO, "Lockfree memory pool cleaned up\n");
-    log_msg(LOG_LEVEL_INFO, "Final stats - Allocations: %lu, Deallocations: %lu, Max usage: %u\n",
+    log_info("Lockfree memory pool cleaned up");
+    log_info("Final stats - Allocations: %lu, Deallocations: %lu, Max usage: %u",
            atomic_load(&pool->allocation_count),
            atomic_load(&pool->deallocation_count),
            atomic_load(&pool->max_usage));
@@ -283,7 +257,7 @@ static transport_session_t *lockfree_allocate_session_from_pool(void) {
     return session;
 }
 
-static void lockfree_free_session_to_pool(transport_session_t *session) {
+void lockfree_free_session_to_pool(transport_session_t *session) {
     if (!session || !global_session_manager) return;
     
     atomic_store(&session->is_active, false);
@@ -528,7 +502,7 @@ transport_session_t *create_transport_session_with_state(const struct flow_key *
     uint32_t current_limit = global_session_manager->max_sessions_limit ? 
                             global_session_manager->max_sessions_limit : MAX_SESSIONS;
     if (atomic_load(&global_session_manager->total_sessions) >= current_limit) {
-        log_msg(LOG_LEVEL_WARN, "Warning: Maximum session limit reached (%u)\n", current_limit);
+        log_warn("Warning: Maximum session limit reached (%u)", current_limit);
         return NULL;
     }
     
@@ -586,6 +560,7 @@ transport_session_t *create_transport_session_with_state(const struct flow_key *
 
 int update_tcp_session_state(transport_session_t *session, uint8_t tcp_flags, 
                             uint32_t seq, uint32_t ack, uint16_t window, uint64_t timestamp) {
+    (void)ack;  // 避免未使用参数警告
     if (!session || session->type != SESSION_TYPE_TCP) {
         return -1;
     }
@@ -758,14 +733,14 @@ int export_sessions_flow_features_to_csv(const char *filename) {
     fclose(fp);
     
     // 打印详细统计信息
-    log_msg(LOG_LEVEL_INFO, "\n=== Session Export Statistics ===\n");
-    log_msg(LOG_LEVEL_INFO, "Exported %d active sessions with detailed flow features to %s\n", exported_count, filename);
-    log_msg(LOG_LEVEL_INFO, "Total active sessions: %u\n", total_active_sessions);
-    log_msg(LOG_LEVEL_INFO, "TCP sessions: %u (%.1f%%)\n", tcp_session_count, 
+    log_info("\n=== Session Export Statistics ===\n");
+    log_info("Exported %d active sessions with detailed flow features to %s\n", exported_count, filename);
+    log_info("Total active sessions: %u\n", total_active_sessions);
+    log_info("TCP sessions: %u (%.1f%%)\n", tcp_session_count, 
            total_active_sessions > 0 ? (tcp_session_count * 100.0 / total_active_sessions) : 0.0);
-    log_msg(LOG_LEVEL_INFO, "UDP sessions: %u (%.1f%%)\n", udp_session_count,
+    log_info("UDP sessions: %u (%.1f%%)\n", udp_session_count,
            total_active_sessions > 0 ? (udp_session_count * 100.0 / total_active_sessions) : 0.0);
-    log_msg(LOG_LEVEL_INFO, "================================\n");
+    log_info("================================\n");
     
     // 打印内存池统计
     print_lockfree_pool_stats(&global_session_manager->session_pool);
@@ -912,7 +887,7 @@ int export_all_sessions_to_csv(const char *filename) {
     }
     
     fclose(fp);
-    log_msg(LOG_LEVEL_INFO, "Exported %d active sessions (simple format) to %s\n", exported_count, filename);
+    log_info("Exported %d active sessions (simple format) to %s\n", exported_count, filename);
     return exported_count;
 }
 
@@ -1081,33 +1056,33 @@ static void calculate_session_features_export(const transport_session_t *session
 void print_lockfree_pool_stats(const memory_pool_t *pool) {
     if (!pool) return;
     
-    log_msg(LOG_LEVEL_INFO, "\n=== Lockfree Memory Pool Statistics ===\n");
-    log_msg(LOG_LEVEL_INFO, "Total blocks: %u\n", pool->total_blocks);
-    log_msg(LOG_LEVEL_INFO, "Used blocks: %u\n", atomic_load(&pool->used_count));
-    log_msg(LOG_LEVEL_INFO, "Usage percentage: %u%%\n", get_lockfree_pool_usage_percent(pool));
-    log_msg(LOG_LEVEL_INFO, "Max usage reached: %u blocks\n", atomic_load(&pool->max_usage));
-    log_msg(LOG_LEVEL_INFO, "Total allocations: %lu\n", atomic_load(&pool->allocation_count));
-    log_msg(LOG_LEVEL_INFO, "Total deallocations: %lu\n", atomic_load(&pool->deallocation_count));
-    log_msg(LOG_LEVEL_INFO, "Current free hint: %u\n", atomic_load(&pool->next_free_hint));
-    log_msg(LOG_LEVEL_INFO, "==========================================\n\n");
+    log_info("\n=== Lockfree Memory Pool Statistics ===\n");
+    log_info("Total blocks: %u\n", pool->total_blocks);
+    log_info("Used blocks: %u\n", atomic_load(&pool->used_count));
+    log_info("Usage percentage: %u%%\n", get_lockfree_pool_usage_percent(pool));
+    log_info("Max usage reached: %u blocks\n", atomic_load(&pool->max_usage));
+    log_info("Total allocations: %lu\n", atomic_load(&pool->allocation_count));
+    log_info("Total deallocations: %lu\n", atomic_load(&pool->deallocation_count));
+    log_info("Current free hint: %u\n", atomic_load(&pool->next_free_hint));
+    log_info("==========================================\n\n");
 }
 
 void print_session_manager_stats(const session_manager_t *manager) {
     if (!manager) return;
     
-    log_msg(LOG_LEVEL_INFO, "\n=== Lockfree Session Manager Statistics ===\n");
-    log_msg(LOG_LEVEL_INFO, "Total sessions: %u\n", atomic_load(&manager->total_sessions));
-    log_msg(LOG_LEVEL_INFO, "Active sessions: %u\n", atomic_load(&manager->active_sessions));
-    log_msg(LOG_LEVEL_INFO, "TCP sessions: %u\n", atomic_load(&manager->tcp_sessions));
-    log_msg(LOG_LEVEL_INFO, "UDP sessions: %u\n", atomic_load(&manager->udp_sessions));
-    log_msg(LOG_LEVEL_INFO, "Sessions created: %lu\n", atomic_load(&manager->sessions_created));
-    log_msg(LOG_LEVEL_INFO, "Sessions destroyed: %lu\n", atomic_load(&manager->sessions_destroyed));
-    log_msg(LOG_LEVEL_INFO, "Pool allocations: %lu\n", atomic_load(&manager->pool_allocations));
-    log_msg(LOG_LEVEL_INFO, "Malloc allocations: %lu\n", atomic_load(&manager->malloc_allocations));
-    log_msg(LOG_LEVEL_INFO, "Hash collisions: %lu\n", atomic_load(&manager->hash_collisions));
-    log_msg(LOG_LEVEL_INFO, "Lookup operations: %lu\n", atomic_load(&manager->lookup_operations));
-    log_msg(LOG_LEVEL_INFO, "Next session ID: %u\n", atomic_load(&manager->next_session_id));
-    log_msg(LOG_LEVEL_INFO, "=============================================\n\n");
+    log_info("\n=== Lockfree Session Manager Statistics ===\n");
+    log_info("Total sessions: %u\n", atomic_load(&manager->total_sessions));
+    log_info("Active sessions: %u\n", atomic_load(&manager->active_sessions));
+    log_info("TCP sessions: %u\n", atomic_load(&manager->tcp_sessions));
+    log_info("UDP sessions: %u\n", atomic_load(&manager->udp_sessions));
+    log_info("Sessions created: %lu\n", atomic_load(&manager->sessions_created));
+    log_info("Sessions destroyed: %lu\n", atomic_load(&manager->sessions_destroyed));
+    log_info("Pool allocations: %lu\n", atomic_load(&manager->pool_allocations));
+    log_info("Malloc allocations: %lu\n", atomic_load(&manager->malloc_allocations));
+    log_info("Hash collisions: %lu\n", atomic_load(&manager->hash_collisions));
+    log_info("Lookup operations: %lu\n", atomic_load(&manager->lookup_operations));
+    log_info("Next session ID: %u\n", atomic_load(&manager->next_session_id));
+    log_info("=============================================\n\n");
 }
 
 // =================== 特征统计功能实现 =================
@@ -1415,10 +1390,10 @@ int transport_session_manager_init(void) {
     global_session_manager->cleanup_interval_ns = (uint32_t)SESSION_CLEANUP_INTERVAL_NS;
     global_session_manager->load_factor_threshold = LOAD_FACTOR_THRESHOLD;
     
-    log_msg(LOG_LEVEL_INFO, "Lockfree transport session manager initialized successfully\n");
-    log_msg(LOG_LEVEL_INFO, "Memory pool: %d blocks, usage: %u%%\n", MEMORY_POOL_SIZE, 
+    log_info("Lockfree transport session manager initialized successfully\n");
+    log_info("Memory pool: %d blocks, usage: %u%%\n", MEMORY_POOL_SIZE, 
            get_lockfree_pool_usage_percent(&global_session_manager->session_pool));
-    log_msg(LOG_LEVEL_INFO, "Default config: max_sessions=%u, timeout=%u, cleanup=%u, load_threshold=%.2f\n",
+    log_info("Default config: max_sessions=%u, timeout=%u, cleanup=%u, load_threshold=%.2f\n",
            MAX_SESSIONS, SESSION_TIMEOUT_NS, SESSION_CLEANUP_INTERVAL_NS, LOAD_FACTOR_THRESHOLD);
     return 0;
 }
@@ -1453,7 +1428,7 @@ void transport_session_manager_cleanup(void) {
     free(global_session_manager);
     global_session_manager = NULL;
     
-    log_msg(LOG_LEVEL_INFO, "Lockfree transport session manager cleaned up\n");
+    log_info("Lockfree transport session manager cleaned up\n");
 }
 
 // =================== 基于Conversation的会话管理 ===================
@@ -1768,7 +1743,7 @@ int export_conversation_based_sessions_to_csv(const char *filename) {
     
     fclose(fp);
     
-    log_msg(LOG_LEVEL_INFO, "Exported %d conversation-based sessions to %s\n", exported_count, filename);
+    log_info("Exported %d conversation-based sessions to %s\n", exported_count, filename);
     return exported_count;
 }
 
@@ -1997,32 +1972,32 @@ static void generate_test_packets(test_packet_t *packets, int count) {
 }
 
 int main(void) {
-    log_msg(LOG_LEVEL_INFO, "=== Transport Session Management Test ===\n");
+    log_info("=== Transport Session Management Test ===\n");
     
     // 初始化流表（来自flow.c）
     flow_table_init();
-    log_msg(LOG_LEVEL_INFO, "Flow table initialized\n");
+    log_info("Flow table initialized\n");
     
     // 初始化会话管理器
     if (transport_session_manager_init() != 0) {
-        log_msg(LOG_LEVEL_ERROR, "Failed to initialize session manager\n");
+        log_error("Failed to initialize session manager\n");
         return -1;
     }
-    log_msg(LOG_LEVEL_INFO, "Session manager initialized successfully\n");
+    log_info("Session manager initialized successfully\n");
     
     // 生成测试包
     const int num_packets = 1000;
     test_packet_t *packets = malloc(num_packets * sizeof(test_packet_t));
     if (!packets) {
-        log_msg(LOG_LEVEL_ERROR, "Failed to allocate memory for test packets\n");
+        log_error("Failed to allocate memory for test packets\n");
         return -1;
     }
     
     generate_test_packets(packets, num_packets);
-    log_msg(LOG_LEVEL_INFO, "Generated %d test packets\n", num_packets);
+    log_info("Generated %d test packets\n", num_packets);
     
     // 处理包并创建基于conversation的会话
-    log_msg(LOG_LEVEL_INFO, "\n=== Processing Packets with Conversation-based Sessions ===\n");
+    log_info("\n=== Processing Packets with Conversation-based Sessions ===\n");
     int sessions_created = 0;
     int packets_processed = 0;
     
@@ -2043,7 +2018,7 @@ int main(void) {
                 sessions_created++;
                 
                 if (sessions_created <= 5) {
-                    log_msg(LOG_LEVEL_INFO, "Created session %u: %s:%u -> %s:%u (%s)\n",
+                    log_info("Created session %u: %s:%u -> %s:%u (%s)\n",
                            session->session_id,
                            inet_ntoa((struct in_addr){.s_addr = session->key.src_ip}),
                            ntohs(session->key.src_port),
@@ -2060,31 +2035,31 @@ int main(void) {
         }
     }
     
-    log_msg(LOG_LEVEL_INFO, "\n=== Processing Complete ===\n");
-    log_msg(LOG_LEVEL_INFO, "Total packets processed: %d\n", packets_processed);
-    log_msg(LOG_LEVEL_INFO, "Total sessions created: %d\n", sessions_created);
-    log_msg(LOG_LEVEL_INFO, "Active sessions: %u\n", get_active_session_count());
-    log_msg(LOG_LEVEL_INFO, "TCP sessions: %u\n", get_tcp_session_count());
-    log_msg(LOG_LEVEL_INFO, "UDP sessions: %u\n", get_udp_session_count());
+    log_info("\n=== Processing Complete ===\n");
+    log_info("Total packets processed: %d\n", packets_processed);
+    log_info("Total sessions created: %d\n", sessions_created);
+    log_info("Active sessions: %u\n", get_active_session_count());
+    log_info("TCP sessions: %u\n", get_tcp_session_count());
+    log_info("UDP sessions: %u\n", get_udp_session_count());
     
     // 导出会话统计
-    log_msg(LOG_LEVEL_INFO, "\n=== Exporting Session Statistics ===\n");
+    log_info("\n=== Exporting Session Statistics ===\n");
     int exported = export_conversation_based_sessions_to_csv("conversation_sessions.csv");
-    log_msg(LOG_LEVEL_INFO, "Exported %d sessions to conversation_sessions.csv\n", exported);
+    log_info("Exported %d sessions to conversation_sessions.csv\n", exported);
     
     // 同时导出传统格式进行对比
     int exported_traditional = export_all_sessions_to_csv("traditional_sessions.csv");
-    log_msg(LOG_LEVEL_INFO, "Exported %d sessions to traditional_sessions.csv (for comparison)\n", exported_traditional);
+    log_info("Exported %d sessions to traditional_sessions.csv (for comparison)\n", exported_traditional);
     
     // 打印内存池统计
-    log_msg(LOG_LEVEL_INFO, "\n=== Memory Pool Statistics ===\n");
+    log_info("\n=== Memory Pool Statistics ===\n");
     if (global_session_manager) {
         print_lockfree_pool_stats(&global_session_manager->session_pool);
         print_session_manager_stats(global_session_manager);
     }
     
     // 打印conversation统计（来自flow.c）
-    log_msg(LOG_LEVEL_INFO, "\n=== Conversation Statistics ===\n");
+    log_info("\n=== Conversation Statistics ===\n");
     print_wireshark_conversation_stats();
     
     // 清理
@@ -2092,7 +2067,7 @@ int main(void) {
     transport_session_manager_cleanup();
     flow_table_destroy();
     
-    log_msg(LOG_LEVEL_INFO, "\n=== Test Complete ===\n");
+    log_info("\n=== Test Complete ===\n");
     return 0;
 }
 
@@ -2120,13 +2095,13 @@ static const char* comprehensive_csv_header =
 
 int export_comprehensive_flow_features_to_csv(const char *filename) {
     if (!global_session_manager) {
-        log_msg(LOG_LEVEL_ERROR, "Session manager not initialized\n");
+        log_error("Session manager not initialized\n");
         return -1;
     }
     
     FILE *fp = fopen(filename, "w");
     if (!fp) {
-        log_msg(LOG_LEVEL_ERROR, "Failed to open file: %s\n", filename);
+        log_error("Failed to open file: %s\n", filename);
         return -1;
     }
     
@@ -2169,14 +2144,14 @@ int export_comprehensive_flow_features_to_csv(const char *filename) {
     fclose(fp);
     
     // 打印详细统计信息
-    log_msg(LOG_LEVEL_INFO, "\n=== Comprehensive Flow Features Export Statistics ===\n");
-    log_msg(LOG_LEVEL_INFO, "Exported %d active sessions with comprehensive flow features to %s\n", exported_count, filename);
-    log_msg(LOG_LEVEL_INFO, "Total active sessions: %u\n", total_active_sessions);
-    log_msg(LOG_LEVEL_INFO, "TCP sessions: %u (%.1f%%)\n", tcp_session_count, 
+    log_info("\n=== Comprehensive Flow Features Export Statistics ===\n");
+    log_info("Exported %d active sessions with comprehensive flow features to %s\n", exported_count, filename);
+    log_info("Total active sessions: %u\n", total_active_sessions);
+    log_info("TCP sessions: %u (%.1f%%)\n", tcp_session_count, 
             total_active_sessions > 0 ? (tcp_session_count * 100.0 / total_active_sessions) : 0.0);
-    log_msg(LOG_LEVEL_INFO, "UDP sessions: %u (%.1f%%)\n", udp_session_count,
+    log_info("UDP sessions: %u (%.1f%%)\n", udp_session_count,
             total_active_sessions > 0 ? (udp_session_count * 100.0 / total_active_sessions) : 0.0);
-    log_msg(LOG_LEVEL_INFO, "====================================================\n");
+    log_info("====================================================\n");
     
     return exported_count;
 }
@@ -2269,28 +2244,28 @@ int export_comprehensive_session_features(transport_session_t *session, FILE *fp
 int set_session_manager_config(uint32_t max_sessions, uint32_t timeout_ns, 
                               uint32_t cleanup_interval, double load_threshold) {
     if (!global_session_manager) {
-        log_msg(LOG_LEVEL_ERROR, "Session manager not initialized\n");
+        log_error("Session manager not initialized\n");
         return -1;
     }
     
     // 验证参数
     if (max_sessions == 0 || max_sessions > 10000000) {  // 最大1000万会话
-        log_msg(LOG_LEVEL_ERROR, "Invalid max_sessions: %u (must be 1-10000000)\n", max_sessions);
+        log_error("Invalid max_sessions: %u (must be 1-10000000)\n", max_sessions);
         return -1;
     }
     
     if (timeout_ns == 0 || timeout_ns > 3600000000000ULL) {  // 最大1小时
-        log_msg(LOG_LEVEL_ERROR, "Invalid timeout_ns: %u (must be 1-3600000000000)\n", timeout_ns);
+        log_error("Invalid timeout_ns: %u (must be 1-3600000000000)\n", timeout_ns);
         return -1;
     }
     
     if (cleanup_interval == 0 || cleanup_interval > 3600000000000ULL) {
-        log_msg(LOG_LEVEL_ERROR, "Invalid cleanup_interval: %u (must be 1-3600000000000)\n", cleanup_interval);
+        log_error("Invalid cleanup_interval: %u (must be 1-3600000000000)\n", cleanup_interval);
         return -1;
     }
     
     if (load_threshold <= 0.0 || load_threshold > 1.0) {
-        log_msg(LOG_LEVEL_ERROR, "Invalid load_threshold: %f (must be 0.0-1.0)\n", load_threshold);
+        log_error("Invalid load_threshold: %f (must be 0.0-1.0)\n", load_threshold);
         return -1;
     }
     
@@ -2300,7 +2275,7 @@ int set_session_manager_config(uint32_t max_sessions, uint32_t timeout_ns,
     global_session_manager->cleanup_interval_ns = cleanup_interval;
     global_session_manager->load_factor_threshold = load_threshold;
     
-    log_msg(LOG_LEVEL_INFO, "Session manager config updated: max_sessions=%u, timeout=%u, cleanup=%u, load_threshold=%.2f\n",
+    log_info("Session manager config updated: max_sessions=%u, timeout=%u, cleanup=%u, load_threshold=%.2f\n",
             max_sessions, timeout_ns, cleanup_interval, load_threshold);
     
     return 0;
@@ -2309,7 +2284,7 @@ int set_session_manager_config(uint32_t max_sessions, uint32_t timeout_ns,
 int get_session_manager_config(uint32_t *max_sessions, uint32_t *timeout_ns, 
                               uint32_t *cleanup_interval, double *load_threshold) {
     if (!global_session_manager) {
-        log_msg(LOG_LEVEL_ERROR, "Session manager not initialized\n");
+        log_error("Session manager not initialized\n");
         return -1;
     }
     
@@ -2341,35 +2316,35 @@ uint32_t get_session_manager_hash_collision_rate(void) {
 // =================== 智能配置建议函数 ===================
 
 void suggest_session_manager_config(uint64_t available_memory_mb, uint32_t expected_sessions) {
-    log_msg(LOG_LEVEL_INFO, "=== Session Manager Configuration Suggestions ===\n");
+    log_info("=== Session Manager Configuration Suggestions ===\n");
     
     // 基于可用内存的建议
     uint64_t memory_bytes = available_memory_mb * 1024 * 1024;
     uint32_t max_sessions_by_memory = memory_bytes / sizeof(transport_session_t);
     
-    log_msg(LOG_LEVEL_INFO, "Available memory: %lu MB\n", available_memory_mb);
-    log_msg(LOG_LEVEL_INFO, "Max sessions by memory: %u\n", max_sessions_by_memory);
+    log_info("Available memory: %lu MB\n", available_memory_mb);
+    log_info("Max sessions by memory: %u\n", max_sessions_by_memory);
     
     // 基于预期会话数的哈希表大小建议
     uint32_t suggested_hash_size = expected_sessions * 4;  // 4倍预期会话数
     if (suggested_hash_size < 65536) suggested_hash_size = 65536;  // 最小64K
     if (suggested_hash_size > 16777216) suggested_hash_size = 16777216;  // 最大16M
     
-    log_msg(LOG_LEVEL_INFO, "Expected sessions: %u\n", expected_sessions);
-    log_msg(LOG_LEVEL_INFO, "Suggested hash size: %u\n", suggested_hash_size);
+    log_info("Expected sessions: %u\n", expected_sessions);
+    log_info("Suggested hash size: %u\n", suggested_hash_size);
     
     // 建议的配置
     uint32_t max_sessions = (max_sessions_by_memory < expected_sessions * 2) ? 
                            max_sessions_by_memory : expected_sessions * 2;
     
-    log_msg(LOG_LEVEL_INFO, "Recommended configuration:\n");
-    log_msg(LOG_LEVEL_INFO, "  - Max sessions: %u\n", max_sessions);
-    log_msg(LOG_LEVEL_INFO, "  - Hash size: %u\n", suggested_hash_size);
-    log_msg(LOG_LEVEL_INFO, "  - Session timeout: 300 seconds\n");
-    log_msg(LOG_LEVEL_INFO, "  - Cleanup interval: 60 seconds\n");
-    log_msg(LOG_LEVEL_INFO, "  - Load factor threshold: 0.75\n");
+    log_info("Recommended configuration:\n");
+    log_info("  - Max sessions: %u\n", max_sessions);
+    log_info("  - Hash size: %u\n", suggested_hash_size);
+    log_info("  - Session timeout: 300 seconds\n");
+    log_info("  - Cleanup interval: 60 seconds\n");
+    log_info("  - Load factor threshold: 0.75\n");
     
-    log_msg(LOG_LEVEL_INFO, "==============================================\n");
+    log_info("==============================================\n");
 }
 
 // =================== 基于实际数据的配置建议函数 ===================
@@ -2377,10 +2352,10 @@ void suggest_session_manager_config(uint64_t available_memory_mb, uint32_t expec
 void suggest_config_based_on_actual_sessions(uint32_t actual_tcp_sessions, uint32_t actual_udp_sessions) {
     uint32_t total_sessions = actual_tcp_sessions + actual_udp_sessions;
     
-    log_msg(LOG_LEVEL_INFO, "=== 基于实际会话数的配置建议 ===\n");
-    log_msg(LOG_LEVEL_INFO, "实际TCP会话数: %u\n", actual_tcp_sessions);
-    log_msg(LOG_LEVEL_INFO, "实际UDP会话数: %u\n", actual_udp_sessions);
-    log_msg(LOG_LEVEL_INFO, "总会话数: %u\n", total_sessions);
+    log_info("=== 基于实际会话数的配置建议 ===\n");
+    log_info("实际TCP会话数: %u\n", actual_tcp_sessions);
+    log_info("实际UDP会话数: %u\n", actual_udp_sessions);
+    log_info("总会话数: %u\n", total_sessions);
     
     // 计算建议的哈希表大小 (4倍会话数)
     uint32_t suggested_hash_size = total_sessions * 4;
@@ -2397,33 +2372,33 @@ void suggest_config_based_on_actual_sessions(uint32_t actual_tcp_sessions, uint3
     if (suggested_pool_size < 10000) suggested_pool_size = 10000;  // 最小1万
     if (suggested_pool_size > 1000000) suggested_pool_size = 1000000;  // 最大100万
     
-    log_msg(LOG_LEVEL_INFO, "\n建议配置:\n");
-    log_msg(LOG_LEVEL_INFO, "  - 哈希表大小: %u (%.1f倍会话数)\n", 
+    log_info("\n建议配置:\n");
+    log_info("  - 哈希表大小: %u (%.1f倍会话数)\n", 
             suggested_hash_size, (double)suggested_hash_size / total_sessions);
-    log_msg(LOG_LEVEL_INFO, "  - 最大会话数: %u (%.1f倍当前会话数)\n", 
+    log_info("  - 最大会话数: %u (%.1f倍当前会话数)\n", 
             suggested_max_sessions, (double)suggested_max_sessions / total_sessions);
-    log_msg(LOG_LEVEL_INFO, "  - 内存池大小: %u (%.1f倍当前会话数)\n", 
+    log_info("  - 内存池大小: %u (%.1f倍当前会话数)\n", 
             suggested_pool_size, (double)suggested_pool_size / total_sessions);
     
     // 性能预测
     double current_load_factor = (double)total_sessions / SESSION_HASH_SIZE;
     double suggested_load_factor = (double)total_sessions / suggested_hash_size;
     
-    log_msg(LOG_LEVEL_INFO, "\n性能预测:\n");
-    log_msg(LOG_LEVEL_INFO, "  - 当前负载因子: %.4f\n", current_load_factor);
-    log_msg(LOG_LEVEL_INFO, "  - 建议负载因子: %.4f\n", suggested_load_factor);
-    log_msg(LOG_LEVEL_INFO, "  - 性能提升: %.1f倍\n", current_load_factor / suggested_load_factor);
+    log_info("\n性能预测:\n");
+    log_info("  - 当前负载因子: %.4f\n", current_load_factor);
+    log_info("  - 建议负载因子: %.4f\n", suggested_load_factor);
+    log_info("  - 性能提升: %.1f倍\n", current_load_factor / suggested_load_factor);
     
     // 内存使用预测
     uint64_t session_memory = total_sessions * sizeof(transport_session_t);
     uint64_t hash_table_memory = suggested_hash_size * sizeof(void*);
     uint64_t total_memory_mb = (session_memory + hash_table_memory) / (1024 * 1024);
     
-    log_msg(LOG_LEVEL_INFO, "\n内存使用预测:\n");
-    log_msg(LOG_LEVEL_INFO, "  - 会话内存: %lu MB\n", session_memory / (1024 * 1024));
-    log_msg(LOG_LEVEL_INFO, "  - 哈希表内存: %lu MB\n", hash_table_memory / (1024 * 1024));
-    log_msg(LOG_LEVEL_INFO, "  - 总内存: %lu MB\n", total_memory_mb);
+    log_info("\n内存使用预测:\n");
+    log_info("  - 会话内存: %lu MB\n", session_memory / (1024 * 1024));
+    log_info("  - 哈希表内存: %lu MB\n", hash_table_memory / (1024 * 1024));
+    log_info("  - 总内存: %lu MB\n", total_memory_mb);
     
-    log_msg(LOG_LEVEL_INFO, "==============================================\n");
+    log_info("==============================================\n");
 }
 
