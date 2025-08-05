@@ -1070,19 +1070,19 @@ void print_lockfree_pool_stats(const memory_pool_t *pool) {
 void print_session_manager_stats(const session_manager_t *manager) {
     if (!manager) return;
     
-    log_info("\n=== Lockfree Session Manager Statistics ===\n");
-    log_info("Total sessions: %u\n", atomic_load(&manager->total_sessions));
-    log_info("Active sessions: %u\n", atomic_load(&manager->active_sessions));
-    log_info("TCP sessions: %u\n", atomic_load(&manager->tcp_sessions));
-    log_info("UDP sessions: %u\n", atomic_load(&manager->udp_sessions));
-    log_info("Sessions created: %lu\n", atomic_load(&manager->sessions_created));
-    log_info("Sessions destroyed: %lu\n", atomic_load(&manager->sessions_destroyed));
-    log_info("Pool allocations: %lu\n", atomic_load(&manager->pool_allocations));
-    log_info("Malloc allocations: %lu\n", atomic_load(&manager->malloc_allocations));
-    log_info("Hash collisions: %lu\n", atomic_load(&manager->hash_collisions));
-    log_info("Lookup operations: %lu\n", atomic_load(&manager->lookup_operations));
-    log_info("Next session ID: %u\n", atomic_load(&manager->next_session_id));
-    log_info("=============================================\n\n");
+    log_info("=== Lockfree Session Manager Statistics ===");
+    log_info("Total sessions: %u", atomic_load(&manager->total_sessions));
+    log_info("Active sessions: %u", atomic_load(&manager->active_sessions));
+    log_info("TCP sessions: %u", atomic_load(&manager->tcp_sessions));
+    log_info("UDP sessions: %u", atomic_load(&manager->udp_sessions));
+    log_info("Sessions created: %lu", atomic_load(&manager->sessions_created));
+    log_info("Sessions destroyed: %lu", atomic_load(&manager->sessions_destroyed));
+    log_info("Pool allocations: %lu", atomic_load(&manager->pool_allocations));
+    log_info("Malloc allocations: %lu", atomic_load(&manager->malloc_allocations));
+    log_info("Hash collisions: %lu", atomic_load(&manager->hash_collisions));
+    log_info("Lookup operations: %lu", atomic_load(&manager->lookup_operations));
+    log_info("Next session ID: %u", atomic_load(&manager->next_session_id));
+    log_info("=============================================");
 }
 
 // =================== 特征统计功能实现 =================
@@ -1103,14 +1103,14 @@ int calculate_session_features(transport_session_t *session) {
     features->tot_1_bw_pk = session->stats.bytes_in;   // 反向字节数
     
     // 重新计算流持续时间（fl_dur）
-    printf("DEBUG: first_packet=%lu, last_packet=%lu\n", 
+    log_debug("first_packet=%lu, last_packet=%lu\n", 
            session->stats.first_packet, session->stats.last_packet);
     if (session->stats.last_packet > session->stats.first_packet) {
         features->fl_dur = (double)(session->stats.last_packet - session->stats.first_packet) / 1000000000.0; // 纳秒转秒
-        printf("DEBUG: fl_dur calculated = %.6f\n", features->fl_dur);
+        log_debug("fl_dur calculated = %.6f\n", features->fl_dur);
     } else {
         features->fl_dur = 0.0; // 如果只有一个包，持续时间为0
-        printf("DEBUG: fl_dur = 0.0 (no duration)\n");
+        log_debug("fl_dur = 0.0 (no duration)\n");
     }
     
     // 生成开始时间字符串（可读格式）
@@ -1390,10 +1390,10 @@ int transport_session_manager_init(void) {
     global_session_manager->cleanup_interval_ns = (uint32_t)SESSION_CLEANUP_INTERVAL_NS;
     global_session_manager->load_factor_threshold = LOAD_FACTOR_THRESHOLD;
     
-    log_info("Lockfree transport session manager initialized successfully\n");
-    log_info("Memory pool: %d blocks, usage: %u%%\n", MEMORY_POOL_SIZE, 
+    log_info("Lockfree transport session manager initialized successfully");
+    log_info("Memory pool: %d blocks, usage: %u%%", MEMORY_POOL_SIZE, 
            get_lockfree_pool_usage_percent(&global_session_manager->session_pool));
-    log_info("Default config: max_sessions=%u, timeout=%u, cleanup=%u, load_threshold=%.2f\n",
+    log_info("Default config: max_sessions=%u, timeout=%u, cleanup=%u, load_threshold=%.2f",
            MAX_SESSIONS, SESSION_TIMEOUT_NS, SESSION_CLEANUP_INTERVAL_NS, LOAD_FACTOR_THRESHOLD);
     return 0;
 }
@@ -1648,6 +1648,9 @@ transport_session_t *process_packet_with_conversation(const struct flow_key *key
             session->state.tcp_state = new_state;
         }
     }
+    
+    // 计算会话特征
+    calculate_session_features(session);
     
     return session;
 }
@@ -2160,7 +2163,7 @@ int export_comprehensive_session_features(transport_session_t *session, FILE *fp
     if (!session || !fp) return -1;
     
     // 添加调试信息
-    printf("DEBUG: Session %s:%u -> %s:%u, first_packet=%lu, last_packet=%lu\n",
+    log_debug("Session %s:%u -> %s:%u, first_packet=%lu, last_packet=%lu\n",
            inet_ntoa((struct in_addr){.s_addr = session->key.src_ip}),
            ntohs(session->key.src_port),
            inet_ntoa((struct in_addr){.s_addr = session->key.dst_ip}),
@@ -2196,44 +2199,43 @@ int export_comprehensive_session_features(transport_session_t *session, FILE *fp
             features->fwd_pkt_1_min, features->fwd_pkt_1_max, features->fwd_pkt_1_avg, features->fwd_pkt_1_std,
             features->bwd_pkt_1_min, features->bwd_pkt_1_max, features->bwd_pkt_1_avg, features->bwd_pkt_1_std);
                 
-                // 流量率特征
+                // 流量率特征 (KB/s, pkts/s) - 总计、源到目标、目标到源
     fprintf(fp, "%.2f,%.2f,",
             features->fl_byt_s, features->fl_pkt_s);
-                
-                // 流间隔时间特征
+    
+    // 流间隔时间特征
     fprintf(fp, "%.2f,%.2f,%.2f,%.2f,",
             features->fl_iat_avg, features->fl_iat_std, features->fl_iat_max, features->fl_iat_min);
-                
-                // 前向IAT特征
-    fprintf(fp, "%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,",
-            features->fw_iat_tot, features->fw_iat_avg, features->fw_iat_std, features->fw_iat_max, features->fw_iat_min);
-                
-                // 反向IAT特征
-    fprintf(fp, "%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,",
-            features->bw_iat_tot, features->bw_iat_avg, features->bw_iat_std, features->bw_iat_max, features->bw_iat_min);
-                
-                // 头部长度和包率
+    
+    // 前向IAT特征
+    fprintf(fp, "%.2f,%.2f,%.2f,%.2f,%.2f,",
+            (double)features->fw_iat_tot, features->fw_iat_avg, features->fw_iat_std, features->fw_iat_max, features->fw_iat_min);
+    
+    // 反向IAT特征
+    fprintf(fp, "%.2f,%.2f,%.2f,%.2f,%.2f,",
+            (double)features->bw_iat_tot, features->bw_iat_avg, features->bw_iat_std, features->bw_iat_max, features->bw_iat_min);
+    
+    // 头部长度和包率
     fprintf(fp, "%.2f,%.2f,%.2f,%.2f,",
             (double)features->fw_hdr_len, (double)features->bw_hdr_len, features->fw_pkt_s, features->bw_pkt_s);
-                
-                // 包长度统计
-    fprintf(fp, "%.2f,%.2f,%.2f,%.2f,%.2f,",
-            (double)features->pkt_len_min, (double)features->pkt_len_max, features->pkt_len_avg, features->pkt_len_std, features->pkt_len_va);
-                
-                // 比率和平均值
-    fprintf(fp, "%.2f,%.2f,%.2f,%.2f,%.2f,",
-            features->down_up_ratio, features->avg_packet_size, features->fw_seg_avg, features->bw_seg_avg);
-                
-                // 子流特征
-    fprintf(fp, "%.2f,%.2f,%.2f,%.2f,",
-                (double)features->subfl_fw_pk, (double)features->subfl_fw_byt,
-            (double)features->subfl_bw_pk, (double)features->subfl_bw_byt);
-                
-                // 窗口和段大小特征
-    fprintf(fp, "%.2f,%.2f,%.2f,%.2f,",
-                (double)features->fw_win_byt, (double)features->bw_win_byt,
-                (double)features->fw_act_pkt, (double)features->fw_seg_min);
     
+    // 包长度统计
+    fprintf(fp, "%.2f,%.2f,%.2f,%.2f,%.2f,",
+            (double)features->pkt_len_min, (double)features->pkt_len_max, features->pkt_len_avg, features->pkt_len_std, (double)features->pkt_len_va);
+    
+    // 比率和平均值
+    fprintf(fp, "%.2f,%.2f,%.2f,%.2f,",
+            features->down_up_ratio, features->avg_packet_size, features->fw_seg_avg, features->bw_seg_avg);
+    
+    // 子流特征
+    fprintf(fp, "%.2f,%.2f,%.2f,%.2f,",
+            (double)features->subfl_fw_pk, (double)features->subfl_fw_byt,
+            (double)features->subfl_bw_pk, (double)features->subfl_bw_byt);
+    
+    // 窗口和段大小特征
+    fprintf(fp, "%.2f,%.2f,%.2f,%.2f,",
+            (double)features->fw_win_byt, (double)features->bw_win_byt,
+            (double)features->fw_act_pkt, (double)features->fw_seg_min);
     fprintf(fp, "\n");
     
     return 0;
@@ -2254,14 +2256,12 @@ int set_session_manager_config(uint32_t max_sessions, uint32_t timeout_ns,
         return -1;
     }
     
-    if (timeout_ns == 0 || timeout_ns > 3600000000000ULL) {  // 最大1小时
-        log_error("Invalid timeout_ns: %u (must be 1-3600000000000)\n", timeout_ns);
-        return -1;
+    if (timeout_ns == 0 || timeout_ns > 3600000000000ULL) {  // 使用 ULL 后缀确保无符号长长整型
+        timeout_ns = SESSION_TIMEOUT_NS;  // 默认1小时
     }
     
     if (cleanup_interval == 0 || cleanup_interval > 3600000000000ULL) {
-        log_error("Invalid cleanup_interval: %u (must be 1-3600000000000)\n", cleanup_interval);
-        return -1;
+        cleanup_interval = SESSION_CLEANUP_INTERVAL_NS;  // 默认值
     }
     
     if (load_threshold <= 0.0 || load_threshold > 1.0) {

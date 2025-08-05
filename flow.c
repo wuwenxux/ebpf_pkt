@@ -18,12 +18,29 @@
 
 #include "flow.h"
 #include "mempool.h"
+#include "logger.h"
 
 // =================== 调试级别控制 ===================
 static int debug_level = 0;
 
 void set_debug_level(int level) {
     debug_level = level;
+    
+    // 同时设置日志级别
+    switch (level) {
+        case 0:
+            set_log_level(LOG_LEVEL_WARN);  // 只显示警告和错误
+            break;
+        case 1:
+            set_log_level(LOG_LEVEL_INFO);  // 显示信息、警告和错误
+            break;
+        case 2:
+            set_log_level(LOG_LEVEL_DEBUG); // 显示所有日志
+            break;
+        default:
+            set_log_level(LOG_LEVEL_WARN);
+            break;
+    }
 }
 
 int get_debug_level() {
@@ -71,7 +88,7 @@ uint32_t get_udp_conversation_count() {
 }
 
 uint32_t get_total_conversation_count() {
-    return atomic_load(&total_conversation_count);
+    return atomic_load(&tcp_conversation_count) + atomic_load(&udp_conversation_count);
 }
 
 uint32_t assign_tcp_conversation_id() {
@@ -235,7 +252,7 @@ void flow_table_init() {
         return;
     }
     // 强制重新初始化，确保每次都是干净的状态
-    mempool_init(&global_pool);
+    mempool_init_physical(&global_pool, 2);   // 减少到2个块，每个块65536个节点
     memset(flow_table, 0, sizeof(flow_table));
     init_protocol_handlers();
     
@@ -749,7 +766,7 @@ void print_wireshark_conversation_stats() {
     
     // UDP对话计数验证
     int udp_manual_count = verify_udp_conversation_count();
-    if (udp_manual_count != udp_conv) {
+    if ((uint32_t)udp_manual_count != udp_conv) {
         printf("⚠️  UDP对话计数不一致: 计数器=%u, 实际=%d\n", udp_conv, udp_manual_count);
     } else {
         printf("✅ UDP对话计数一致性验证通过\n");
@@ -1940,7 +1957,7 @@ void print_all_wireshark_sessions() {
         printf("UDP Stream验证:\n");
         printf("  计数器显示: %u streams\n", get_udp_conversation_count());
         printf("  实际统计: %d streams\n", udp_manual_count);
-        if (udp_manual_count == get_udp_conversation_count()) {
+        if ((uint32_t)udp_manual_count == get_udp_conversation_count()) {
             printf("  ✅ UDP stream计数一致性验证通过\n");
         } else {
             printf("  ⚠️  UDP stream计数不一致\n");

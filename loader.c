@@ -40,8 +40,9 @@ typedef unsigned char u_char;
 
 // Our headers
 #include "flow.h"
+#include "stats_window.h"
+#include "loader.h"
 #include "transport_session.h"
-#include "logger.h"
 
 // 增加预取相关宏定义
 #define PREFETCH(addr) __builtin_prefetch(addr)
@@ -64,39 +65,47 @@ const char *ANSI_RESTORE_CURSOR = "\033[u";         // 恢复光标位置
 const char *ANSI_HIDE_CURSOR = "\033[?25l";      // 隐藏光标
 const char *ANSI_SHOW_CURSOR = "\033[?25h";      // 显示光标
 
-// System statistics structure
+// 系统统计结构定义（与system_stats.c保持一致）
 typedef struct {
-    double cpu_usage;           // CPU使用率 (%)
-    double memory_usage;        // 内存使用率 (%)
-    uint64_t packets_processed; // 已处理的数据包数量
-    double processing_time;     // 处理时间 (秒)
-    uint64_t packets_per_second; // 每秒处理的数据包数
+    double cpu_usage;
+    double memory_usage;
+    uint64_t packets_processed;
+    double processing_time;
+    uint64_t packets_per_second;
 } system_stats_t;
 
-// Global system statistics
-static system_stats_t system_stats = {0};
-static clock_t start_cpu_time;
-static clock_t start_wall_time;
-static struct timespec program_start_time;
+// 使用system_stats.c中定义的system_stats_t
+extern system_stats_t system_stats;
+clock_t start_cpu_time;
+clock_t start_wall_time;
+struct timespec program_start_time;
 
 // 全局时间基准
 struct timespec boot_realtime;
 uint64_t boot_monotonic_ns = 0;
 
-// 全局变量以跟踪终端模式
-int in_place_updates = 1;  // 默认启用原位更新
-int first_stats_print = 1; // 第一次打印标志
+// 全局变量
 
 // 运行状态，设为extern以便其他文件可访问
 volatile int running = 1;
+static volatile int monitor_running = 1;  // 监控模式运行状态
 
 // 函数前向声明
 void print_final_stats(void);
 int run_single_interface_capture(const char *ifname);
-void cleanup_expired_sessions(void);
+// 删除未使用的函数声明
+static int run_monitor_mode(const char *ifname);
+static void *capture_thread_func(void *arg);
 // flow_table_initialized是flow.c中的变量，我们在这里声明为外部变量
 extern int flow_table_initialized;
 extern int count_active_flows(); // 从flow.c导入流计数函数
+extern int transport_session_manager_init(void);
+extern void transport_session_manager_cleanup(void);
+extern session_manager_t *global_session_manager;
+extern transport_session_t *process_packet_with_conversation(const struct flow_key *key, 
+                                                           uint32_t packet_size,
+                                                           uint8_t tcp_flags,
+                                                           uint64_t timestamp);
 
 // 多接口监听相关结构
 typedef struct {
@@ -197,6 +206,10 @@ static lockfree_queue_t packet_queue;
 // 全局包计数器
 static volatile uint64_t global_packet_count = 0;
 
+// 实时统计计数器
+static volatile uint64_t total_packets_captured = 0;
+static volatile uint64_t total_bytes_captured = 0;
+
 // 获取当前时间（纳秒）- 使用flow.h中已声明的函数
 
 // 确保队列容量是2的幂次，便于位运算优化
@@ -217,7 +230,7 @@ static void packet_queue_init(lockfree_queue_t *queue, int initial_capacity) {
     
     queue->packets = (packet_data_t *)aligned_alloc(64, capacity * sizeof(packet_data_t));
     if (!queue->packets) {
-        fprintf(stderr, "Failed to allocate packet queue\n");
+        log_error("Failed to allocate packet queue");
         exit(EXIT_FAILURE);
     }
     
@@ -247,6 +260,11 @@ static void packet_queue_destroy(lockfree_queue_t *queue) {
 
 // 扩容队列 - 当队列接近满时触发
 static int expand_queue(lockfree_queue_t *queue) {
+    // 检查队列是否已初始化
+    if (!queue || !queue->packets) {
+        return -1;
+    }
+    
     // 使用CAS操作确保只有一个线程进行扩容
     if (!__sync_bool_compare_and_swap(&queue->expanding, 0, 1)) {
         return 0; // 其他线程正在扩容
@@ -297,6 +315,11 @@ static int expand_queue(lockfree_queue_t *queue) {
 static int packet_queue_enqueue(lockfree_queue_t *queue, const packet_data_t *packet) {
     if (!running) return -1;
     
+    // 检查队列是否已初始化
+    if (!queue || !queue->packets) {
+        return -1;
+    }
+    
     uint64_t tail, head, next_tail;
     int retry_count = 0;
     const int max_retries = 1000;
@@ -340,7 +363,7 @@ static int packet_queue_enqueue(lockfree_queue_t *queue, const packet_data_t *pa
         // 队列可能已满，丢弃这个包以避免卡死
         static int drop_warning_count = 0;
         if (drop_warning_count < 10) {
-            fprintf(stderr, "Warning: Packet queue full, dropping packet (warning %d/10)\n", ++drop_warning_count);
+            log_warn("Packet queue full, dropping packet (warning %d/10)", ++drop_warning_count);
         }
         return -1;
     }
@@ -350,6 +373,11 @@ static int packet_queue_enqueue(lockfree_queue_t *queue, const packet_data_t *pa
 
 // 无锁出队操作
 static int packet_queue_dequeue(lockfree_queue_t *queue, packet_data_t *packet) {
+    // 检查队列是否已初始化
+    if (!queue || !queue->packets) {
+        return -1;
+    }
+    
     uint64_t head, tail, next_head;
     int retry_count = 0;
     const int max_retries = 100;
@@ -389,13 +417,18 @@ static int packet_queue_dequeue(lockfree_queue_t *queue, packet_data_t *packet) 
 
 // 获取队列当前大小（近似值，用于监控）
 static uint64_t packet_queue_size(lockfree_queue_t *queue) {
+    // 检查队列是否已初始化
+    if (!queue || !queue->packets) {
+        return 0;
+    }
+    
     uint64_t tail = queue->tail;
     uint64_t head = queue->head;
     return tail - head;
 }
 
 // 包处理计数器
-static volatile uint64_t total_packets_processed = 0;
+volatile uint64_t total_packets_processed = 0;
 static volatile uint64_t total_bytes_processed = 0;
 
 struct packet_info {
@@ -438,9 +471,34 @@ static void process_packet_direct(const struct iphdr *ip, uint16_t src_port, uin
         process_packet(ip, &udp_info, timestamp);
     }
     
+    // 同时处理会话管理器（如果已初始化）
+    if (global_session_manager) {
+        struct flow_key key = {0};
+        key.src_ip = ip->saddr;
+        key.dst_ip = ip->daddr;
+        key.protocol = ip->protocol;
+        
+        if (ip->protocol == IPPROTO_TCP) {
+            key.src_port = src_port;
+            key.dst_port = dst_port;
+        } else if (ip->protocol == IPPROTO_UDP) {
+            key.src_port = src_port;
+            key.dst_port = dst_port;
+        }
+        
+        // 使用会话管理器处理数据包
+        (void)process_packet_with_conversation(&key, 
+                                              ntohs(ip->tot_len),
+                                              tcp_flags,
+                                              timestamp);
+    }
+    
     // 更新统计信息
     __sync_fetch_and_add(&total_packets_processed, 1);
     __sync_fetch_and_add(&total_bytes_processed, ntohs(ip->tot_len));
+    
+    // 更新实时统计
+    atomic_fetch_add(&g_realtime_stats.packet_count, 1);
 }
 
 static void cleanup(void) {
@@ -457,7 +515,7 @@ static void cleanup(void) {
 
     // Cleanup flow table
     if (flow_table_initialized) {
-        print_final_stats();
+        // print_final_stats();  // 注释掉统计结果输出
         flow_table_destroy();
     }
 
@@ -483,92 +541,31 @@ static void init_system_monitoring(void) {
     system_stats.packets_per_second = 0;
 }
 
-// Get current CPU usage
-static double get_cpu_usage(void) {
-    struct rusage usage;
-    if (getrusage(RUSAGE_SELF, &usage) != 0) {
-        return 0.0;
-    }
-    
-    // 计算用户态和内核态CPU时间
-    double user_time = usage.ru_utime.tv_sec + usage.ru_utime.tv_usec / 1000000.0;
-    double sys_time = usage.ru_stime.tv_sec + usage.ru_stime.tv_usec / 1000000.0;
-    double total_cpu_time = user_time + sys_time;
-    
-    // 计算程序运行的总时间
-    struct timespec current_time;
-    clock_gettime(CLOCK_REALTIME, &current_time);
-    double elapsed_time = (current_time.tv_sec - program_start_time.tv_sec) + 
-                         (current_time.tv_nsec - program_start_time.tv_nsec) / 1000000000.0;
-    
-    if (elapsed_time > 0) {
-        return (total_cpu_time / elapsed_time) * 100.0;
-    }
-    return 0.0;
-}
+// CPU usage function is defined in system_stats.c
 
-// Get current memory usage
-static double get_memory_usage(void) {
-    struct rusage usage;
-    if (getrusage(RUSAGE_SELF, &usage) != 0) {
-        return 0.0;
-    }
-    
-    // ru_maxrss在Linux上以KB为单位
-    long memory_kb = usage.ru_maxrss;
-    
-    // 获取系统总内存
-    struct sysinfo si;
-    if (sysinfo(&si) != 0) {
-        return 0.0;
-    }
-    
-    // 转换为MB并计算百分比
-    double memory_mb = memory_kb / 1024.0;
-    double total_memory_mb = si.totalram / (1024.0 * 1024.0);
-    
-    if (total_memory_mb > 0) {
-        return (memory_mb / total_memory_mb) * 100.0;
-    }
-    return 0.0;
-}
-
-// Update system statistics
-static void update_system_stats(void) {
-    system_stats.cpu_usage = get_cpu_usage();
-    system_stats.memory_usage = get_memory_usage();
-    system_stats.packets_processed = total_packets_processed;
-    
-    // 计算处理时间
-    struct timespec current_time;
-    clock_gettime(CLOCK_REALTIME, &current_time);
-    system_stats.processing_time = (current_time.tv_sec - program_start_time.tv_sec) + 
-                                  (current_time.tv_nsec - program_start_time.tv_nsec) / 1000000000.0;
-    
-    // 计算每秒处理的数据包数
-    if (system_stats.processing_time > 0) {
-        system_stats.packets_per_second = (uint64_t)(system_stats.packets_processed / system_stats.processing_time);
-    }
-}
+// Update system statistics - 使用system_stats.c中的实现
+extern void update_system_stats(void);
 
 void sig_handler(int sig) {
     static int signal_count = 0;
     signal_count++;
     
     if (signal_count == 1) {
-        printf("\nReceived signal %d, initiating graceful shutdown...\n", sig);
-        running = 0;
+        log_info("Received signal %d, initiating graceful shutdown...", sig);
+        // 使用原子操作设置退出标志
+        __sync_fetch_and_and(&running, 0);
+        __sync_fetch_and_and(&monitor_running, 0);
         
-        // 移除这里的print_final_stats()调用，避免与cleanup()中的重复
-        // if (flow_table_initialized) {
-        //     print_final_stats();
-        // }
-        
-        // Give some time for cleanup to finish
-        sleep(1);
-        alarm(5); // Set a 5-second timeout
+        // 设置较短的超时时间
+        alarm(3); // 3秒超时
     } else {
-        printf("\nForcing immediate exit...\n");
+        log_info("Forcing immediate exit...");
+        
+        // 恢复终端到正常状态
+        printf("\033[?25h");  // 显示光标
+        printf("\033[0m");     // 重置所有属性
+        fflush(stdout);
+        
         exit(1);
     }
 }
@@ -580,16 +577,16 @@ static int check_single_instance(void) {
     if (lock_fd == -1) {
         // 检查是否有权限创建锁文件
         if (errno == EACCES || errno == EPERM) {
-            fprintf(stderr, "No permission to create lock file %s, trying to use /tmp directory\n", LOCK_FILE);
+            log_warn("No permission to create lock file %s, trying to use /tmp directory", LOCK_FILE);
             // 尝试在/tmp目录下创建
             const char *tmp_lock = "/tmp/ebpf_pkt.lock";
             lock_fd = open(tmp_lock, O_RDWR | O_CREAT, 0644);
             if (lock_fd == -1) {
-                fprintf(stderr, "Cannot create lock file: %s\n", strerror(errno));
+                log_error("Cannot create lock file: %s", strerror(errno));
                 return -1;
             }
         } else {
-            fprintf(stderr, "Cannot create lock file: %s\n", strerror(errno));
+            log_error("Cannot create lock file: %s", strerror(errno));
             return -1;
         }
     }
@@ -598,12 +595,12 @@ static int check_single_instance(void) {
     if (flock(lock_fd, LOCK_EX | LOCK_NB) == -1) {
         if (errno == EWOULDBLOCK) {
             // 已有另一个实例在运行
-            fprintf(stderr, "Another instance is already running\n");
+            log_error("Another instance is already running");
             close(lock_fd);
             lock_fd = -1;
             return 1;
         } else {
-            fprintf(stderr, "Unable to lock file: %s\n", strerror(errno));
+            log_error("Unable to lock file: %s", strerror(errno));
             close(lock_fd);
             lock_fd = -1;
             return -1;
@@ -616,7 +613,7 @@ static int check_single_instance(void) {
     if (ftruncate(lock_fd, 0) == -1 || 
         lseek(lock_fd, 0, SEEK_SET) == -1 ||
         write(lock_fd, pid_str, strlen(pid_str)) == -1) {
-        fprintf(stderr, "Unable to write PID to lock file: %s\n", strerror(errno));
+        log_warn("Unable to write PID to lock file: %s", strerror(errno));
         // 继续运行，这只是额外的信息
     }
     
@@ -652,7 +649,7 @@ static void handle_batch(void *ctx, int cpu, void *data, __u32 size) {
     running &= !should_exit;
     
     if (should_exit) {
-        printf("Reached specified duration of %d seconds. Exiting...\n", duration);
+        log_info("Reached specified duration of %d seconds. Exiting...", duration);
         return;
     }
     
@@ -671,16 +668,21 @@ static void handle_batch(void *ctx, int cpu, void *data, __u32 size) {
         // 更新全局包计数器
         __sync_fetch_and_add(&global_packet_count, 1);
         
-        // 调试输出（前10个包）- 仅在debug模式下显示
+        // 更新统计信息（在实时捕获模式下）
+        __sync_fetch_and_add(&total_packets_captured, 1);
+        __sync_fetch_and_add(&total_bytes_captured, pkt->pkt_len);
+        
+        // 调试输出（前10个包）- 仅在debug模式下显示/
+        /*
         static int debug_count = 0;
-        if (debug_count < 10 && get_debug_level() >= 2) {
+        if (debug_count < 10) {
             struct in_addr src_addr = {.s_addr = pkt->src_ip};
             struct in_addr dst_addr = {.s_addr = pkt->dst_ip};
-            printf("DEBUG: Packet %d - IP: %s -> %s, Protocol: %d, Ports: %u -> %u, TCP flags: 0x%02x\n", 
+            log_debug("Packet %d - IP: %s -> %s, Protocol: %d, Ports: %u -> %u, TCP flags: 0x%02x", 
                    debug_count + 1, inet_ntoa(src_addr), inet_ntoa(dst_addr), 
                    pkt->protocol, pkt->src_port, pkt->dst_port, pkt->tcp_flags);
             debug_count++;
-        }
+        }*/
         
         // 准备数据包结构
         packet_data_t packet_data;
@@ -712,108 +714,84 @@ static void handle_batch(void *ctx, int cpu, void *data, __u32 size) {
     }
 }
 
-// 修改后的pcap包处理函数，将数据包添加到队列
+// 重新实现的pcap包处理函数 - 安全对齐处理
 void process_pcap_packet(const u_char *packet, const struct pcap_pkthdr *header) {
-    // 预取以太网头和IP头
-    PREFETCH((void *)packet);
-    PREFETCH((void *)(packet + sizeof(struct ethhdr)));
+    // 跳过以太网头（14字节）
+    const u_char *ip_data = packet + 14;
     
-    struct ethhdr *eth = (struct ethhdr *)packet;
+    // 安全拷贝IP头到对齐的内存
+    struct iphdr ip_header;
+    memcpy(&ip_header, ip_data, sizeof(ip_header));
     
-    // 使用位操作替代条件判断
-    if ((ntohs(eth->h_proto) ^ ETH_P_IP) != 0) {
-        return;  // Skip non-IP packets
-    }
-    
-    struct iphdr *ip = (struct iphdr *)(packet + sizeof(struct ethhdr));
-    
-    // 使用位操作替代条件判断
-    if ((ip->version ^ 4) != 0) {
+    // 检查IP版本
+    if (ip_header.version != 4) {
         return;  // Skip non-IPv4 packets
     }
     
-    // 预取传输层头
-    void *transport_header = (void *)((char *)ip + (ip->ihl * 4));
-    PREFETCH(transport_header);
+    // 计算时间戳
+    uint64_t timestamp = (uint64_t)header->ts.tv_sec * 1000000000ULL + (uint64_t)header->ts.tv_usec * 1000ULL;
     
-    // 准备数据包结构
-    packet_data_t packet_data;
-    
-    // 复制IP头
-    memcpy(&packet_data.ip_header, ip, sizeof(struct iphdr));
-    
-    // 调试信息已关闭
-    // static int debug_count = 0;
-    // if (debug_count < 10) {
-    //     struct in_addr src_addr = {.s_addr = ip->saddr};
-    //     struct in_addr dst_addr = {.s_addr = ip->daddr};
-    //     printf("PCAP DEBUG: Packet %d - IP: %s -> %s, Protocol: %d\n", 
-    //            debug_count + 1, inet_ntoa(src_addr), inet_ntoa(dst_addr), ip->protocol);
-    //     debug_count++;
-    // }
-    
-    // 提取并转换时间戳为纳秒
-    packet_data.timestamp = (uint64_t)header->ts.tv_sec * 1000000000ULL + (uint64_t)header->ts.tv_usec * 1000ULL;
-    
-    // 根据协议类型处理传输层
-    if (ip->protocol == IPPROTO_TCP) {
-        struct tcphdr *tcp = (struct tcphdr *)transport_header;
-        packet_data.transport_header.tcp.source = tcp->source;
-        packet_data.transport_header.tcp.dest = tcp->dest;
-        packet_data.transport_header.tcp.seq = ntohl(tcp->seq);
-        memcpy(packet_data.transport_header.tcp.flags_byte, tcp, sizeof(struct tcphdr));
-    } else if (ip->protocol == IPPROTO_UDP) {
-        struct udphdr *udp = (struct udphdr *)transport_header;
-        packet_data.transport_header.udp.source = udp->source;
-        packet_data.transport_header.udp.dest = udp->dest;
-    }
-    
-    // 将数据包添加到队列
-    if (packet_queue_enqueue(&packet_queue, &packet_data) != 0) {
-        // 入队失败，检查是否应该退出
-        if (!running) return;
-    }
-    
-    // 使用位操作进行条件判断
-    time_t current_time = time(NULL);
-    int should_exit = (duration > 0) & (current_time - start_time >= duration);
-    running &= !should_exit;
-    
-    if (should_exit) {
-        printf("Reached specified duration of %d seconds. Exiting...\n", duration);
-        return;
+    // 根据协议类型处理
+    if (ip_header.protocol == IPPROTO_TCP) {
+        // 计算TCP头位置
+        const u_char *tcp_data = ip_data + (ip_header.ihl * 4);
+        
+        // 安全拷贝TCP头到对齐的内存
+        struct tcphdr tcp_header;
+        memcpy(&tcp_header, tcp_data, sizeof(tcp_header));
+        
+        // 直接处理TCP包
+        process_packet_direct(&ip_header, 
+                            ntohs(tcp_header.source),
+                            ntohs(tcp_header.dest),
+                            ntohl(tcp_header.seq),
+                            *((uint8_t*)&tcp_header + 13), // TCP标志位
+                            timestamp);
+    } else if (ip_header.protocol == IPPROTO_UDP) {
+        // 计算UDP头位置
+        const u_char *udp_data = ip_data + (ip_header.ihl * 4);
+        
+        // 安全拷贝UDP头到对齐的内存
+        struct udphdr udp_header;
+        memcpy(&udp_header, udp_data, sizeof(udp_header));
+        
+        // 直接处理UDP包
+        process_packet_direct(&ip_header,
+                            ntohs(udp_header.source),
+                            ntohs(udp_header.dest),
+                            0, 0, // UDP没有序列号和标志位
+                            timestamp);
     }
 }
 
-// Process a pcap file
+
+
+// 重新实现的pcap文件处理函数 - 高效直接处理
 int process_pcap_file(const char *pcap_file) {
     char errbuf[PCAP_ERRBUF_SIZE];
     pcap_t *handle = NULL;
     int ret = 0;
     
-    // Record start time
+    // 记录开始时间
     start_time = time(NULL);
     
-    // 初始化数据包队列
-    packet_queue_init(&packet_queue, PACKET_QUEUE_SIZE);
-    
-    // Initialize flow tracking
+    // 初始化流跟踪
     flow_table_init();
     
-    printf("Processing pcap file: %s\n", pcap_file);
+    log_info("Processing pcap file: %s", pcap_file);
     
     if (loop_count == 0) {
-        printf("Loop mode: infinite loops\n");
+        log_info("Loop mode: infinite loops");
     } else if (loop_count > 1) {
-        printf("Loop mode: %d loops\n", loop_count);
+        log_info("Loop mode: %d loops", loop_count);
     }
     
     if (loop_delay > 0 && loop_count != 1) {
-        printf("Loop delay: %d seconds between loops\n", loop_delay);
+        log_info("Loop delay: %d seconds between loops", loop_delay);
     }
     
     if (duration > 0) {
-        printf("Will analyze traffic for %d seconds\n", duration);
+        log_info("Will analyze traffic for %d seconds", duration);
     }
     
     int total_packet_count = 0;
@@ -823,51 +801,48 @@ int process_pcap_file(const char *pcap_file) {
     while (running && (loop_count == 0 || current_loop < loop_count)) {
         current_loop++;
         
-        // Open the pcap file
+        // 打开pcap文件
         handle = pcap_open_offline(pcap_file, errbuf);
         if (handle == NULL) {
-            fprintf(stderr, "Couldn't open pcap file %s: %s\n", pcap_file, errbuf);
+            log_error("Couldn't open pcap file %s: %s", pcap_file, errbuf);
             ret = -1;
             break;
         }
         
         if (current_loop > 1 && !quiet_mode) {
-            printf("Starting loop %d/%s...\n", current_loop, 
+            log_info("Starting loop %d/%s...", current_loop, 
                    loop_count == 0 ? "∞" : (char[]){loop_count + '0', '\0'});
         }
         
-        // Process packets from the pcap file
+        // 处理pcap文件中的数据包
         struct pcap_pkthdr header;
         const u_char *packet;
         int loop_packet_count = 0;
         
         while (running && (packet = pcap_next(handle, &header)) != NULL) {
-            // 预取数据包内容以提高性能
-            PREFETCH(packet);
-            PREFETCH(packet + 64); // 预取第二个缓存行
-            
+            // 直接处理数据包
             process_pcap_packet(packet, &header);
             loop_packet_count++;
             total_packet_count++;
             
-            // 每10000个包检查一次时间限制
-            if (loop_packet_count % 10000 == 0) {
+            // 每500个包检查一次时间限制（更频繁的检查）
+            if (loop_packet_count % 500 == 0) {
                 if (duration > 0 && time(NULL) - start_time >= duration) {
-                    printf("Reached specified duration of %d seconds. Exiting...\n", duration);
+                    log_info("Reached specified duration of %d seconds. Exiting...", duration);
                     running = 0;
                     break;
                 }
             }
         }
         
-        // Close current handle
+        // 关闭当前句柄
         if (handle) {
             pcap_close(handle);
             handle = NULL;
         }
         
         if (!quiet_mode) {
-            printf("Loop %d completed: processed %d packets\n", current_loop, loop_packet_count);
+            log_info("Loop %d completed: processed %d packets", current_loop, loop_packet_count);
         }
         
         // 检查是否需要继续循环
@@ -878,7 +853,7 @@ int process_pcap_file(const char *pcap_file) {
         // 如果不是最后一次循环且设置了延迟，则等待
         if ((loop_count == 0 || current_loop < loop_count) && loop_delay > 0) {
             if (!quiet_mode) {
-                printf("Waiting %d seconds before next loop...\n", loop_delay);
+                log_info("Waiting %d seconds before next loop...", loop_delay);
             }
             
             // 分段睡眠以便能响应中断信号
@@ -889,41 +864,16 @@ int process_pcap_file(const char *pcap_file) {
         
         // 检查时间限制
         if (duration > 0 && time(NULL) - start_time >= duration) {
-            printf("Reached specified duration of %d seconds. Exiting...\n", duration);
+            log_info("Reached specified duration of %d seconds. Exiting...", duration);
             break;
         }
     }
     
-    printf("Total packets processed: %d (across %d loop%s)\n", 
+    log_info("Total packets processed: %d (across %d loop%s)", 
            total_packet_count, current_loop, current_loop > 1 ? "s" : "");
     
-    // 等待队列处理完所有数据包
-    if (!quiet_mode) {
-        printf("Waiting for packet processing to complete...\n");
-    }
-    
-    while (packet_queue_size(&packet_queue) > 0 && running) {
-        packet_data_t packet;
-        if (packet_queue_dequeue(&packet_queue, &packet) == 0) {
-            // 直接处理数据包
-            if (packet.ip_header.protocol == IPPROTO_TCP) {
-                // 从存储的TCP头部数据中提取标志位
-                struct tcphdr *tcp_header = (struct tcphdr *)packet.transport_header.tcp.flags_byte;
-                uint8_t tcp_flags = *((uint8_t*)tcp_header + 13);  // TCP标志位在第13字节
-                uint32_t tcp_seq = packet.transport_header.tcp.seq;
-                
-                process_packet_direct(&packet.ip_header, 
-                                    packet.transport_header.tcp.source,
-                                    packet.transport_header.tcp.dest,
-                                    tcp_seq, tcp_flags, packet.timestamp);
-            } else if (packet.ip_header.protocol == IPPROTO_UDP) {
-                process_packet_direct(&packet.ip_header,
-                                    packet.transport_header.udp.source,
-                                    packet.transport_header.udp.dest,
-                                    0, 0, packet.timestamp);  // UDP没有序列号和标志位
-            }
-        }
-    }
+    // 打印最终统计信息（包括CSV文件生成）
+    print_final_stats();
     
     // 调用统一清理函数
     cleanup();
@@ -960,7 +910,7 @@ static int get_available_interfaces(char interfaces[][IF_NAMESIZE], int max_coun
 // 初始化单个接口的监听线程
 static int init_interface_thread(const char *ifname, int thread_id) {
     if (interface_count >= MAX_INTERFACES) {
-        fprintf(stderr, "Maximum number of interfaces reached\n");
+        log_error("Maximum number of interfaces reached");
         return -1;
     }
     
@@ -976,12 +926,12 @@ static int init_interface_thread(const char *ifname, int thread_id) {
     // 获取接口索引
     it->ifindex = if_nametoindex(ifname);
     if (!it->ifindex) {
-        fprintf(stderr, "Failed to get interface index for %s: %s\n", 
+        log_error("Failed to get interface index for %s: %s", 
                 ifname, strerror(errno));
         return -1;
     }
     
-    printf("Initializing interface %s (index: %d) for thread %d\n", 
+    log_info("Initializing interface %s (index: %d) for thread %d", 
            ifname, it->ifindex, thread_id);
     
     interface_count++;
@@ -1001,12 +951,12 @@ static void *interface_listener_thread(void *arg) {
     int map_fd, err;
     int ret = 0;
     
-    printf("Thread %d: Starting listener for interface %s\n", thread_id, ifname);
+    log_info("Thread %d: Starting listener for interface %s", thread_id, ifname);
     
     // 加载BPF程序
     obj = bpf_object__open_file("bpf_program.o", NULL);
     if (libbpf_get_error(obj)) {
-        fprintf(stderr, "Thread %d: Failed to open BPF object file for %s\n", 
+        log_error("Thread %d: Failed to open BPF object file for %s", 
                 thread_id, ifname);
         ret = 1;
         goto cleanup;
@@ -1015,7 +965,7 @@ static void *interface_listener_thread(void *arg) {
     // 加载到内核
     err = bpf_object__load(obj);
     if (err) {
-        fprintf(stderr, "Thread %d: BPF loading failed for %s: %s\n", 
+        log_error("Thread %d: BPF loading failed for %s: %s", 
                 thread_id, ifname, strerror(-err));
         ret = 1;
         goto cleanup;
@@ -1024,7 +974,7 @@ static void *interface_listener_thread(void *arg) {
     // 附加到接口
     prog = bpf_object__find_program_by_name(obj, "xdp_packet_capture");
     if (!prog) {
-        fprintf(stderr, "Thread %d: BPF program not found for %s\n", 
+        log_error("Thread %d: BPF program not found for %s", 
                 thread_id, ifname);
         ret = 1;
         goto cleanup;
@@ -1032,7 +982,7 @@ static void *interface_listener_thread(void *arg) {
     
     int ifindex = if_nametoindex(ifname);
     if (!ifindex) {
-        fprintf(stderr, "Thread %d: Failed to get interface index for %s: %s\n", 
+        log_error("Thread %d: Failed to get interface index for %s: %s", 
                 thread_id, ifname, strerror(errno));
         ret = 1;
         goto cleanup;
@@ -1040,7 +990,7 @@ static void *interface_listener_thread(void *arg) {
     
     link = bpf_program__attach_xdp(prog, ifindex);
     if (libbpf_get_error(link)) {
-        fprintf(stderr, "Thread %d: XDP attachment failed for %s: %s\n", 
+        log_error("Thread %d: XDP attachment failed for %s: %s", 
                 thread_id, ifname, strerror(-errno));
         ret = 1;
         goto cleanup;
@@ -1049,7 +999,7 @@ static void *interface_listener_thread(void *arg) {
     // 设置性能缓冲区
     map_fd = bpf_object__find_map_fd_by_name(obj, "events");
     if (map_fd < 0) {
-        fprintf(stderr, "Thread %d: Perf event map not found for %s\n", 
+        log_error("Thread %d: Perf event map not found for %s", 
                 thread_id, ifname);
         ret = 1;
         goto cleanup;
@@ -1066,7 +1016,7 @@ static void *interface_listener_thread(void *arg) {
                           &pb_opts);
     
     if (libbpf_get_error(pb)) {
-        fprintf(stderr, "Thread %d: Failed to create perf buffer for %s\n", 
+        log_error("Thread %d: Failed to create perf buffer for %s", 
                 thread_id, ifname);
         ret = 1;
         goto cleanup;
@@ -1085,18 +1035,18 @@ static void *interface_listener_thread(void *arg) {
     }
     pthread_mutex_unlock(&interface_mutex);
     
-    printf("Thread %d: Successfully started capturing on %s\n", thread_id, ifname);
+    log_info("Thread %d: Successfully started capturing on %s", thread_id, ifname);
     
     // 事件循环
     while (running) {
         err = perf_buffer__poll(pb, 100);
         if (err < 0 && err != -EINTR) {
-            fprintf(stderr, "Thread %d: Error polling %s: %d\n", thread_id, ifname, err);
+            log_error("Thread %d: Error polling %s: %d", thread_id, ifname, err);
             break;
         }
     }
     
-    printf("Thread %d: Exiting listener for %s\n", thread_id, ifname);
+    log_info("Thread %d: Exiting listener for %s", thread_id, ifname);
     
 cleanup:
     // 清理资源
@@ -1131,17 +1081,17 @@ cleanup:
 static int start_multi_interface_capture(char *interfaces[], int interface_count) {
     pthread_t *threads = malloc(interface_count * sizeof(pthread_t));
     if (!threads) {
-        fprintf(stderr, "Failed to allocate thread array\n");
+        log_error("Failed to allocate thread array");
         return -1;
     }
     
-    printf("Starting %d interface listener threads...\n", interface_count);
+    log_info("Starting %d interface listener threads...", interface_count);
     
     // 为每个接口创建监听线程
     for (int i = 0; i < interface_count; i++) {
         thread_arg_t *arg = malloc(sizeof(thread_arg_t));
         if (!arg) {
-            fprintf(stderr, "Failed to allocate thread argument for %s\n", interfaces[i]);
+            log_error("Failed to allocate thread argument for %s", interfaces[i]);
             continue;
         }
         
@@ -1151,23 +1101,23 @@ static int start_multi_interface_capture(char *interfaces[], int interface_count
         
         // 初始化接口线程
         if (init_interface_thread(interfaces[i], i) != 0) {
-            fprintf(stderr, "Failed to initialize interface %s\n", interfaces[i]);
+            log_error("Failed to initialize interface %s", interfaces[i]);
             free(arg);
             continue;
         }
         
         // 创建线程
         if (pthread_create(&threads[i], NULL, interface_listener_thread, arg) != 0) {
-            fprintf(stderr, "Failed to create thread for interface %s\n", interfaces[i]);
+            log_error("Failed to create thread for interface %s", interfaces[i]);
             free(arg);
             continue;
         }
         
-        printf("Created listener thread %d for interface %s\n", i, interfaces[i]);
+        log_info("Created listener thread %d for interface %s", i, interfaces[i]);
     }
     
     // 等待所有线程完成
-    printf("Waiting for interface threads to complete...\n");
+    log_info("Waiting for interface threads to complete...");
     for (int i = 0; i < interface_count; i++) {
         pthread_join(threads[i], NULL);
     }
@@ -1188,23 +1138,23 @@ int run_live_capture(const char *ifname) {
     int available_count = get_available_interfaces(interfaces, MAX_INTERFACES);
     
     if (available_count == 0) {
-        fprintf(stderr, "No available network interfaces found\n");
+        log_error( "No available network interfaces found\n");
         return 1;
     }
     
-    printf("Found %d available interfaces:\n", available_count);
+    log_info("Found %d available interfaces:\n", available_count);
     for (int i = 0; i < available_count; i++) {
-        printf("  %d: %s\n", i + 1, interfaces[i]);
+        log_info("  %d: %s\n", i + 1, interfaces[i]);
     }
     
     // 初始化全局资源
     start_time = time(NULL);
     packet_queue_init(&packet_queue, PACKET_QUEUE_SIZE);
     flow_table_init();
-    printf("Flow tracking initialized\n");
+    log_info("Flow tracking initialized");
     
     if (duration > 0) {
-        printf("Will capture traffic for %d seconds\n", duration);
+        log_info("Will capture traffic for %d seconds\n", duration);
     }
     
     // 转换为指针数组
@@ -1263,72 +1213,72 @@ int run_single_interface_capture(const char *ifname) {
 
     // Initialize flow tracking
     flow_table_init();
-    printf("Flow tracking initialized\n");
+    log_info("Flow tracking initialized");
     if (duration > 0) {
-        printf("Will capture traffic for %d seconds\n", duration);
+        log_info("Will capture traffic for %d seconds", duration);
     }
     
-    printf("Processing interface: %s\n", ifname);
+    log_info("Processing interface: %s", ifname);
 
     /* 1. Load BPF program */
-    printf("Loading BPF program from bpf_program.o...\n");
+    log_info("Loading BPF program from bpf_program.o...");
     obj = bpf_object__open_file("bpf_program.o", NULL);
     if (libbpf_get_error(obj)) {
-        fprintf(stderr, "Failed to open BPF object file: %s\n", strerror(-libbpf_get_error(obj)));
+        log_error("Failed to open BPF object file: %s", strerror(-libbpf_get_error(obj)));
         ret = 1;
         goto cleanup;
     }
-    printf("BPF object loaded successfully\n");
+    log_info("BPF object loaded successfully");
 
     /* 2. Load into kernel */
-    printf("Loading BPF program into kernel...\n");
+    log_info("Loading BPF program into kernel...");
     err = bpf_object__load(obj);
     if (err) {
-        fprintf(stderr, "BPF loading failed: %s\n", strerror(-err));
+        log_error("BPF loading failed: %s", strerror(-err));
         ret = 1;
         goto cleanup;
     }
-    printf("BPF program loaded into kernel successfully\n");
+    log_info("BPF program loaded into kernel successfully");
 
     /* 3. Attach to interface */
-    printf("Finding XDP program...\n");
+    log_info("Finding XDP program...");
     prog = bpf_object__find_program_by_name(obj, "xdp_packet_capture");
     if (!prog) {
-        fprintf(stderr, "BPF program 'xdp_packet_capture' not found\n");
+        log_error("BPF program 'xdp_packet_capture' not found");
         ret = 1;
         goto cleanup;
     }
-    printf("XDP program found\n");
+    log_info("XDP program found");
 
-    printf("Getting interface index for %s...\n", ifname);
+    log_info("Getting interface index for %s...", ifname);
     int ifindex = if_nametoindex(ifname);
     if (!ifindex) {
-        fprintf(stderr, "Failed to get interface index for %s: %s\n", ifname, strerror(errno));
+        log_error("Failed to get interface index for %s: %s", ifname, strerror(errno));
         ret = 1;
         goto cleanup;
     }
-    printf("Interface index: %d\n", ifindex);
+    log_info("Interface index: %d", ifindex);
 
     // 预取相关内存以提高性能
     PREFETCH(prog);
-    printf("Attaching XDP program to interface...\n");
+    log_info("Attaching XDP program to interface...");
     link = bpf_program__attach_xdp(prog, ifindex);
     if (libbpf_get_error(link)) {
-        fprintf(stderr, "XDP attachment failed: %s\n", strerror(-libbpf_get_error(link)));
+        log_error("XDP attachment failed: %s", strerror(-libbpf_get_error(link)));
         ret = 1;
         goto cleanup;
     }
-    printf("XDP program attached successfully\n");
+    log_info("XDP program attached successfully");
 
     /* 4. Setup perf buffer */
-    printf("Setting up perf buffer...\n");
+    log_info("Setting up perf buffer...");
     map_fd = bpf_object__find_map_fd_by_name(obj, "events");
     if (map_fd < 0) {
-        fprintf(stderr, "Perf event map 'events' not found\n");
+        log_error("Perf event map 'events' not found");
         ret = 1;
         goto cleanup;
     }
-    printf("Perf event map found, fd: %d\n", map_fd);
+    log_info("Perf event map found, fd: %d", map_fd);
     
     struct perf_buffer_opts pb_opts = {
         .sz = sizeof(pb_opts),
@@ -1342,44 +1292,42 @@ int run_single_interface_capture(const char *ifname) {
                         &pb_opts);
 
     if (libbpf_get_error(pb)) {
-        fprintf(stderr, "Failed to create perf buffer: %s\n", strerror(-libbpf_get_error(pb)));
+        log_error("Failed to create perf buffer: %s", strerror(-libbpf_get_error(pb)));
         ret = 1;
         goto cleanup;
     }
-    printf("Perf buffer created successfully\n");
+    log_info("Perf buffer created successfully");
 
-    printf("Successfully started capturing on %s, press Ctrl+C to stop...\n", ifname);
+    log_info("Successfully started capturing on %s", ifname);
 
     /* 5. Event loop */
-    printf("Entering event loop...\n");
+    if (!quiet_mode) {
+        log_info("Entering event loop...");
+    }
     
     // 添加定期处理变量
     uint64_t packet_count = 0;
     uint64_t last_process_time = 0;
-    uint64_t last_cleanup_time = 0;
     uint64_t current_time = 0;
     const uint64_t PROCESS_INTERVAL_MS = 300;  // 300ms处理间隔
-    const uint64_t CLEANUP_INTERVAL_MS = 5000; // 5秒清理间隔
     const uint64_t PROCESS_PACKET_COUNT = 1000;  // 每1000个包处理一次
     const int MAX_BATCH_SIZE = 500;  // 每次最多处理500个包，避免长时间占用CPU
+    
+    // 添加统计输出变量
+    uint64_t last_stats_time = 0;
+    const uint64_t STATS_INTERVAL_MS = 1000;  // 每1秒输出一次统计，提高更新频率
     
     while (running) {
         err = perf_buffer__poll(pb, 100);
         // 使用位操作代替条件判断 - 仅当err < 0且err != -EINTR时退出
         int should_break = (err < 0) & (err != -EINTR);
         if (should_break) {
-            fprintf(stderr, "Error polling: %d\n", err);
+            log_error("Error polling: %d", err);
             break;
         }
         
         // 获取当前时间（毫秒）
         current_time = get_current_time() / 1000000;  // 转换为毫秒
-        
-        // 定期清理过期会话 - 每5秒执行一次
-        if ((current_time - last_cleanup_time) >= CLEANUP_INTERVAL_MS) {
-            cleanup_expired_sessions();
-            last_cleanup_time = current_time;
-        }
         
         // 处理队列中的数据包 - 每1000个包或每300ms处理一次
         if (packet_count >= PROCESS_PACKET_COUNT || 
@@ -1417,7 +1365,7 @@ int run_single_interface_capture(const char *ifname) {
             
             // 调试输出（仅在debug模式下）
             if (get_debug_level() >= 2 && processed_count > 0) {
-                printf("DEBUG: Processed %d packets from queue (queue size: %lu)\n", 
+                log_debug("Processed %d packets from queue (queue size: %lu)\n", 
                        processed_count, packet_queue_size(&packet_queue));
             }
             
@@ -1429,9 +1377,64 @@ int run_single_interface_capture(const char *ifname) {
         
         // 更新包计数器 - 使用全局计数器
         packet_count = global_packet_count;
+        
+        // 定期输出统计信息（固定位置更新）
+        if (current_time - last_stats_time >= STATS_INTERVAL_MS) {
+            // 清除当前行并回到行首，确保固定位置更新
+            printf("\r\033[2K");
+            
+            // 计算处理速率
+            static uint64_t last_packets = 0;
+            static uint64_t last_bytes = 0;
+            static uint64_t last_time = 0;
+            
+            uint64_t packets_diff = total_packets_captured - last_packets;
+            uint64_t bytes_diff = total_bytes_captured - last_bytes;
+            uint64_t time_diff = current_time - last_time;
+            
+            double pps = 0.0, bps = 0.0;
+            if (time_diff > 0) {
+                pps = (double)packets_diff * 1000.0 / time_diff;  // 包/秒
+                bps = (double)bytes_diff * 1000.0 / time_diff;    // 字节/秒
+            }
+            
+            // 动态进度指示器
+            static int progress_phase = 0;
+            const char *progress_chars[] = {"⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"};
+            const char *progress = progress_chars[progress_phase % 10];
+            progress_phase++;
+            
+            // 获取当前时间戳
+            time_t now = time(NULL);
+            struct tm *tm_info = localtime(&now);
+            char time_str[9];
+            strftime(time_str, sizeof(time_str), "%H:%M:%S", tm_info);
+            
+            // 输出增强的统计信息（固定位置，不换行）
+            printf("⏰ %s | 🔄 %s | 📦 %lu (%.1f pkt/s) | 💾 %.2f MB (%.1f KB/s) | 🔗 TCP:%u UDP:%u Total:%u | 🗄️ %d/%d",
+                   time_str, progress,
+                   total_packets_captured, pps,
+                   total_bytes_captured / (1024.0 * 1024.0), bps / 1024.0,
+                   get_tcp_conversation_count(),
+                   get_udp_conversation_count(),
+                   get_total_conversation_count(),
+                   count_active_flows(),
+                   count_all_flows());
+            
+            // 更新上次统计值
+            last_packets = total_packets_captured;
+            last_bytes = total_bytes_captured;
+            last_time = current_time;
+            
+            fflush(stdout);
+            last_stats_time = current_time;
+        }
     }
 
-    printf("Exiting program...\n");
+    log_info("Exiting program...");
+    
+    // 在退出时添加换行，确保统计信息行完整显示
+    printf("\n");
     
     // 等待队列处理完所有数据包
     while (packet_queue_size(&packet_queue) > 0 && running) {
@@ -1460,17 +1463,17 @@ int run_single_interface_capture(const char *ifname) {
 cleanup:
     // Cleanup resources in reverse order of creation
     if (pb) {
-        printf("Cleaning up perf buffer...\n");
+        log_info("Cleaning up perf buffer...");
         perf_buffer__free(pb);
     }
     
     if (link) {
-        printf("Cleaning up XDP link...\n");
+        log_info("Cleaning up XDP link...");
         bpf_link__destroy(link);
     }
     
     if (obj) {
-        printf("Cleaning up BPF object...\n");
+        log_info("Cleaning up BPF object...");
         bpf_object__close(obj);
     }
     
@@ -1516,141 +1519,45 @@ static int compare_flows_by_time(const void *a, const void *b) {
 
 // 实现print_final_stats函数 - 在程序结束时打印最终统计（按时间顺序）
 void print_final_stats(void) {
-    time_t current_time = time(NULL);
-    
-    // Update and print system statistics first
-    update_system_stats();
-    
-    printf("\n=== System Performance Statistics ===\n");
-    printf("CPU Usage:              %.2f%%\n", system_stats.cpu_usage);
-    printf("Memory Usage:           %.2f%%\n", system_stats.memory_usage);
-    printf("Packets Processed:      %lu\n", system_stats.packets_processed);
-    printf("Processing Time:        %.2f seconds\n", system_stats.processing_time);
-    printf("Packets per Second:     %lu\n", system_stats.packets_per_second);
-    printf("======================================\n");
-    
-    // 使用get_total_conversation_count统计对话总数
-    uint32_t total_conversations = get_total_conversation_count();
-    uint32_t tcp_conversations = get_tcp_conversation_count();
-    uint32_t udp_conversations = get_udp_conversation_count();
-    
-    // 获取活跃流和所有流的数量
-    int active_flow_count = count_active_flows();
     int all_flow_count = count_all_flows();
-    
-    // 在非安静模式下打印对话统计
-    if (!quiet_mode) {
-        printf("\n============= Conversation Statistics =============\n");
-        printf("Total Conversations:    %u\n", total_conversations);
-        printf("  TCP Conversations:    %u\n", tcp_conversations);
-        printf("  UDP Conversations:    %u\n", udp_conversations);
-        printf("Active Flows:           %d\n", active_flow_count);
-        printf("Total Flows:            %d\n", all_flow_count);
-        printf("Inactive Flows:         %d\n", all_flow_count - active_flow_count);
-        printf("==================================================\n");
-    }
-    
-    // 统计流方向
-    int forward_all_flows = 0, reverse_all_flows = 0;
-    count_all_flow_directions(&forward_all_flows, &reverse_all_flows);
-    
-    if (!quiet_mode) {
-        printf("\n============= Flow Direction Statistics =============\n");
-        printf("Total Flow Directions: Forward: %d, Reverse: %d\n", 
-               forward_all_flows, reverse_all_flows);
-        
-        // 打印活跃流方向统计
-        int forward_active_flows = 0, reverse_active_flows = 0;
-        count_flow_directions(&forward_active_flows, &reverse_active_flows);
-        printf("Active Flow Directions: Forward: %d, Reverse: %d\n", 
-               forward_active_flows, reverse_active_flows);
-        printf("====================================================\n");
-    }
-    
-    // 添加Wireshark风格的对话统计
-    print_wireshark_conversation_stats();
-    
-    // 添加会话时间记录验证
-    //print_session_timing_info();
-    
-    // 收集总数据包和字节统计
-    uint64_t total_packets = 0;
-    uint64_t total_bytes = 0;
-    uint64_t total_tcp_flows = 0;
-    uint64_t total_udp_flows = 0;
-    uint64_t total_tcp_packets = 0;
-    uint64_t total_udp_packets = 0;
-    uint64_t total_tcp_bytes = 0;
-    uint64_t total_udp_bytes = 0;
-    
-    if (!quiet_mode) {
-        printf("\n============= Final Flow Statistics (Time Ordered) at %s =============\n", ctime(&current_time));
-    }
-    
-    // 分配内存来存储所有流信息
-    struct flow_info *flows = malloc(all_flow_count * sizeof(struct flow_info));
-    if (!flows) {
-        fprintf(stderr, "Error: Cannot allocate memory for flow sorting\n");
+    if (all_flow_count == 0) {
+        log_info("No flows found");
         return;
     }
     
-    uint64_t now = get_current_time();
+    // 分配内存
+    struct flow_info *flows = malloc(all_flow_count * sizeof(struct flow_info));
+    if (!flows) {
+        log_error("Memory allocation failed");
+        return;
+    }
+    
     int flow_count = 0;
     
-    // 收集所有流信息
+    // 收集流信息
     for (int i = 0; i < HASH_TABLE_SIZE; i++) {
         struct flow_node *node = flow_table[i];
-        while (node) {
-            if (flow_count >= all_flow_count) {
-                fprintf(stderr, "Warning: Flow count exceeded expected count\n");
-                break;
-            }
-            
+        while (node && flow_count < all_flow_count) {
             struct flow_info *flow = &flows[flow_count];
             flow->node = node;
-            flow->flow_id = flow_count + 1;
             
-            // 检查流是否超时
-            uint64_t timeout = FLOW_TIMEOUT_NS;
-            if (node->key.protocol == IPPROTO_TCP) {
-                timeout = TCP_FLOW_TIMEOUT_NS;
-            }
-            
-            // 判断流是否活跃
-            flow->is_active = (now - node->stats.last_seen <= timeout) ? 1 : 0;
-            
-            // 计算流持续时间
-            flow->duration = time_diff(&node->stats.end_time, &node->stats.start_time);
-            
-            // 格式化开始时间（可读格式）
-            format_ebpf_packet_time(node->stats.first_seen, flow->start_time_str, sizeof(flow->start_time_str));
-            
-            // 准备IP地址字符串
+            // 基本信息
             snprintf(flow->src_ip, sizeof(flow->src_ip), "%u.%u.%u.%u", NIPQUAD(node->key.src_ip));
             snprintf(flow->dst_ip, sizeof(flow->dst_ip), "%u.%u.%u.%u", NIPQUAD(node->key.dst_ip));
-            
-            // 设置协议
             flow->protocol = node->key.protocol;
-            
-            // 计算总包数和字节数
             flow->flow_packets = node->stats.fwd_packets + node->stats.bwd_packets;
             flow->flow_bytes = node->stats.fwd_bytes + node->stats.bwd_bytes;
             
-            // 计算流特征 - 使用简化版本避免段错误
+            // 计算特征
             memset(&flow->features, 0, sizeof(struct flow_features));
-            
-                        // 设置fl_dur - 使用与calculate_flow_features相同的逻辑（毫秒）
             if (node->stats.last_seen > node->stats.first_seen) {
-                flow->features.fl_dur = (double)(node->stats.last_seen - node->stats.first_seen) / 1000000.0; // 纳秒转毫秒
-            } else {
-                flow->features.fl_dur = 0.0; // 如果只有一个包或时间无效，持续时间为0
+                flow->features.fl_dur = (double)(node->stats.last_seen - node->stats.first_seen) / 1000000.0;
             }
             
-            // 只设置基本字段
+            // 基本统计
             flow->features.tot_fw_pk = node->stats.fwd_packets;
             flow->features.tot_bw_pk = node->stats.bwd_packets;
             flow->features.tot_1_fw_pk = node->stats.fwd_bytes;
-            flow->features.tot_1_bw_pk = node->stats.bwd_bytes;
             flow->features.fwd_pkt_1_min = node->stats.fwd_min_size;
             flow->features.fwd_pkt_1_max = node->stats.fwd_max_size;
             flow->features.bwd_pkt_1_min = node->stats.bwd_min_size;
@@ -1662,7 +1569,7 @@ void print_final_stats(void) {
             flow->features.fw_act_pkt = node->stats.fwd_tcp_payload_bytes;
             flow->features.fw_seg_min = node->stats.fwd_min_segment;
             
-            // 计算平均值
+            // 平均值
             if (node->stats.fwd_packets > 0) {
                 flow->features.fwd_pkt_1_avg = (double)node->stats.fwd_bytes / node->stats.fwd_packets;
             }
@@ -1670,278 +1577,72 @@ void print_final_stats(void) {
                 flow->features.bwd_pkt_1_avg = (double)node->stats.bwd_bytes / node->stats.bwd_packets;
             }
             
-            // 计算流量率
-            if (flow->duration > 0) {
-                flow->features.fl_byt_s = (double)flow->flow_bytes / flow->duration;
-                flow->features.fl_pkt_s = (double)flow->flow_packets / flow->duration;
-                flow->features.fw_pkt_s = (double)node->stats.fwd_packets / flow->duration;
-                flow->features.bw_pkt_s = (double)node->stats.bwd_packets / flow->duration;
+            // 流量率
+            if (flow->features.fl_dur > 0) {
+                flow->features.fl_byt_s = (double)flow->flow_bytes / flow->features.fl_dur;
+                flow->features.fl_pkt_s = (double)flow->flow_packets / flow->features.fl_dur;
             }
             
-            // 计算上传下载比例
+            // 比例
             if (node->stats.bwd_bytes > 0) {
                 flow->features.down_up_ratio = (double)node->stats.fwd_bytes / node->stats.bwd_bytes;
             }
-            
-            // 计算数据包平均长度
             if (flow->flow_packets > 0) {
                 flow->features.pkt_size_avg = (double)flow->flow_bytes / flow->flow_packets;
             }
-            
-            // 计算前向和反向平均长度
-            if (node->stats.fwd_packets > 0) {
-                flow->features.fw_seg_avg = (double)node->stats.fwd_bytes / node->stats.fwd_packets;
-            }
-            if (node->stats.bwd_packets > 0) {
-                flow->features.bw_seg_avg = (double)node->stats.bwd_bytes / node->stats.bwd_packets;
-            }
-            
-            // 设置子流特征
-            flow->features.subfl_fw_pk = (double)node->stats.fwd_packets;
-            flow->features.subfl_fw_byt = (double)node->stats.fwd_bytes;
-            flow->features.subfl_bw_pk = (double)node->stats.bwd_packets;
-            flow->features.subfl_bw_byt = (double)node->stats.bwd_bytes;
-            
-            // 设置流长度特征
-            flow->features.pkt_len_min = (flow->features.fwd_pkt_1_min < flow->features.bwd_pkt_1_min) ? 
-                                        flow->features.fwd_pkt_1_min : flow->features.bwd_pkt_1_min;
-            flow->features.pkt_len_max = (flow->features.fwd_pkt_1_max > flow->features.bwd_pkt_1_max) ? 
-                                        flow->features.fwd_pkt_1_max : flow->features.bwd_pkt_1_max;
-            flow->features.pkt_len_avg = (flow->features.fwd_pkt_1_avg + flow->features.bwd_pkt_1_avg) / 2.0;
-            flow->features.pkt_len_std = (flow->features.fwd_pkt_1_std + flow->features.bwd_pkt_1_std) / 2.0;
             
             flow_count++;
             node = node->next;
         }
     }
     
-    // 按开始时间排序
+    // 排序
     qsort(flows, flow_count, sizeof(struct flow_info), compare_flows_by_time);
     
-    // 如果指定了CSV文件，打开它
+    // 生成CSV
     FILE *csv_fp = NULL;
     if (csv_file) {
         csv_fp = fopen(csv_file, "w");
-        if (!csv_fp) {
-            fprintf(stderr, "Error: Could not open CSV file %s for writing: %s\n", 
-                    csv_file, strerror(errno));
-        }
-        
-        // 写入CSV标题 - 使用flow_features结构体中的字段名称
         if (csv_fp) {
-            fprintf(csv_fp, "SrcIP,SrcPort,DstIP,DstPort,Protocol,Timestamp,");
-            fprintf(csv_fp, "fl_dur,tot_fw_pk,tot_bw_pk,tot_1_fw_pk,");
-            fprintf(csv_fp, "fwd_pkt_1_min,fwd_pkt_1_max,fwd_pkt_1_avg,fwd_pkt_1_std,");
-            fprintf(csv_fp, "bwd_pkt_1_min,bwd_pkt_1_max,bwd_pkt_1_avg,bwd_pkt_1_std,");
-            fprintf(csv_fp, "fl_byt_s,fl_pkt_s,");
-            fprintf(csv_fp, "fl_iat_avg,fl_iat_std,fl_iat_max,fl_iat_min,");
-            fprintf(csv_fp, "fw_iat_tot,fw_iat_avg,fw_iat_std,fw_iat_max,fw_iat_min,");
-            fprintf(csv_fp, "bw_iat_tot,bw_iat_avg,bw_iat_std,bw_iat_max,bw_iat_min,");
-            fprintf(csv_fp, "fw_hdr_len,bw_hdr_len,fw_pkt_s,bw_pkt_s,pkt_len_min,pkt_len_max,pkt_len_avg,pkt_len_std,pkt_len_va,down_up_ratio,pkt_size_avg,fw_seg_avg,bw_seg_avg,subfl_fw_pk,subfl_fw_byt,subfl_bw_pk,subfl_bw_byt,fw_win_byt,bw_win_byt,fw_ack_pkt,fw_seg_min\n");
-        }
-    }
-    
-    // 按时间顺序打印流信息
-    if (!quiet_mode) {
-        printf("\n%-5s %-25s %-25s %-10s %-15s %-15s %-10s %-10s %-10s\n", 
-               "ID", "Source", "Destination", "Protocol", "Duration(s)", "Start Time", "Status", "Packets", "Bytes");
-        printf("%-5s %-25s %-25s %-10s %-15s %-15s %-10s %-10s %-10s\n", 
-               "----", "-----------------", "-----------------", "--------", "-----------", "-----------", "------", "-------", "-----");
-    }
-    
-    // 输出排序后的流信息
-    for (int i = 0; i < flow_count; i++) {
-        struct flow_info *flow = &flows[i];
-        struct flow_node *node = flow->node;
-        
-        // 计算总计数
-        total_packets += flow->flow_packets;
-        total_bytes += flow->flow_bytes;
-        
-        // 统计按协议
-        if (node->key.protocol == IPPROTO_TCP) {
-            total_tcp_flows++;
-            total_tcp_packets += flow->flow_packets;
-            total_tcp_bytes += flow->flow_bytes;
-        } else if (node->key.protocol == IPPROTO_UDP) {
-            total_udp_flows++;
-            total_udp_packets += flow->flow_packets;
-            total_udp_bytes += flow->flow_bytes;
-        }
-        
-        // 非安静模式下打印流信息
-        if (!quiet_mode) {
-            char src[30], dst[30];
-            snprintf(src, sizeof(src), "%s:%d", flow->src_ip, node->original_src_port);
-            snprintf(dst, sizeof(dst), "%s:%d", flow->dst_ip, node->original_dst_port);
+            // 标题
+            fprintf(csv_fp, "SrcIP,SrcPort,DstIP,DstPort,Protocol,Timestamp,fl_dur,tot_fw_pk,tot_bw_pk,tot_1_fw_pk,fwd_pkt_1_min,fwd_pkt_1_max,fwd_pkt_1_avg,fwd_pkt_1_std,bwd_pkt_1_min,bwd_pkt_1_max,bwd_pkt_1_avg,bwd_pkt_1_std,fl_byt_s,fl_pkt_s,fl_iat_avg,fl_iat_std,fl_iat_max,fl_iat_min,fw_iat_tot,fw_iat_avg,fw_iat_std,fw_iat_max,fw_iat_min,bw_iat_tot,bw_iat_avg,bw_iat_std,bw_iat_max,bw_iat_min,fw_hdr_len,bw_hdr_len,fw_pkt_s,bw_pkt_s,pkt_len_min,pkt_len_max,pkt_len_avg,pkt_len_std,pkt_len_va,down_up_ratio,pkt_size_avg,fw_seg_avg,bw_seg_avg,subfl_fw_pk,subfl_fw_byt,subfl_bw_pk,subfl_bw_byt,fw_win_byt,bw_win_byt,fw_ack_pkt,fw_seg_min\n");
             
-            printf("%-5d %-25s %-25s %-10s %-15.2f %-15s %-10s %-10lu %-10lu\n", 
-                   flow->flow_id, src, dst, 
-                   node->key.protocol == IPPROTO_TCP ? "TCP" : 
-                   (node->key.protocol == IPPROTO_UDP ? "UDP" : "Other"),
-                   flow->duration, 
-                   flow->start_time_str,
-                   flow->is_active ? "ACTIVE" : "INACTIVE",
-                   (unsigned long)flow->flow_packets,
-                   (unsigned long)flow->flow_bytes);
-            
-            // 打印方向统计信息
-            printf("     Forward: %-10lu pkts, %-10lu bytes | Reverse: %-10lu pkts, %-10lu bytes\n",
-                   (unsigned long)node->stats.fwd_packets,
-                   (unsigned long)node->stats.fwd_bytes,
-                   (unsigned long)node->stats.bwd_packets,
-                   (unsigned long)node->stats.bwd_bytes);
-            
-            // 打印包特征信息 - 简化版本
-            printf("     Packet Size (bytes) - Fwd: min=%-5u max=%-5u | Bwd: min=%-5u max=%-5u\n",
-                   node->stats.fwd_min_size,
-                   node->stats.fwd_max_size,
-                   node->stats.bwd_min_size,
-                   node->stats.bwd_max_size);
-                   
-            // 打印流量率特征 - 简化版本
-            printf("     Flow Rates - Bytes: %-7.2f KB/s | Packets: %-7.2f pkts/s\n",
-                   (double)flow->flow_bytes / (flow->duration * 1024.0),
-                   (double)flow->flow_packets / flow->duration);
-            
-            // 打印时间间隔特征 - 简化版本
-            printf("     Packet IAT (s) - Duration: %.6f seconds\n",
-                   flow->duration);
-            
-            // 打印TCP标志信息 (如果是TCP流)
-            if (node->key.protocol == IPPROTO_TCP) {
-                printf("     TCP Flags - FIN: %-4u SYN: %-4u RST: %-4u PSH: %-4u ACK: %-4u URG: %-4u CWR: %-4u ECE: %-4u\n",
-                       node->stats.tcp_flags.fwd_fin_count + node->stats.tcp_flags.bwd_fin_count,
-                       node->stats.tcp_flags.fwd_syn_count + node->stats.tcp_flags.bwd_syn_count,
-                       node->stats.tcp_flags.fwd_rst_count + node->stats.tcp_flags.bwd_rst_count,
-                       node->stats.tcp_flags.fwd_psh_count + node->stats.tcp_flags.bwd_psh_count,
-                       node->stats.tcp_flags.fwd_ack_count + node->stats.tcp_flags.bwd_ack_count,
-                       node->stats.tcp_flags.fwd_urg_count + node->stats.tcp_flags.bwd_urg_count,
-                       node->stats.tcp_flags.fwd_cwr_count + node->stats.tcp_flags.bwd_cwr_count,
-                       node->stats.tcp_flags.fwd_ece_count + node->stats.tcp_flags.bwd_ece_count);
+            // 数据
+            for (int i = 0; i < flow_count; i++) {
+                struct flow_info *flow = &flows[i];
+                struct flow_node *node = flow->node;
                 
-                // 打印TCP初始窗口大小
-                printf("     TCP Init Windows - Fwd: %-6u bytes | Bwd: %-6u bytes\n",
-                       node->stats.fwd_init_win_bytes,
-                       node->stats.bwd_init_win_bytes);
+                char timebuf[32];
+                format_ebpf_packet_time(node->stats.first_seen, timebuf, sizeof(timebuf));
+                
+                fprintf(csv_fp, "%s,%d,%s,%d,%d,%s,%.6f,%lu,%lu,%lu,%u,%u,%.6f,%.6f,%u,%u,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%lu,%lu,%.6f,%.6f,%u,%u,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%u,%u,%u,%u\n",
+                       flow->src_ip, node->original_src_port, flow->dst_ip, node->original_dst_port,
+                       flow->protocol, timebuf, flow->features.fl_dur,
+                       (unsigned long)flow->features.tot_fw_pk, (unsigned long)flow->features.tot_bw_pk,
+                       (unsigned long)flow->features.tot_1_fw_pk, flow->features.fwd_pkt_1_min,
+                       flow->features.fwd_pkt_1_max, flow->features.fwd_pkt_1_avg, flow->features.fwd_pkt_1_std,
+                       flow->features.bwd_pkt_1_min, flow->features.bwd_pkt_1_max, flow->features.bwd_pkt_1_avg,
+                       flow->features.bwd_pkt_1_std, flow->features.fl_byt_s, flow->features.fl_pkt_s,
+                       flow->features.fl_iat_avg, flow->features.fl_iat_std, flow->features.fl_iat_max,
+                       flow->features.fl_iat_min, flow->features.fw_iat_tot, flow->features.fw_iat_avg,
+                       flow->features.fw_iat_std, flow->features.fw_iat_max, flow->features.fw_iat_min,
+                       flow->features.bw_iat_tot, flow->features.bw_iat_avg, flow->features.bw_iat_std,
+                       flow->features.bw_iat_max, flow->features.bw_iat_min, flow->features.fw_hdr_len,
+                       flow->features.bw_hdr_len, flow->features.fw_pkt_s, flow->features.bw_pkt_s,
+                       flow->features.pkt_len_min, flow->features.pkt_len_max, flow->features.pkt_len_avg,
+                       flow->features.pkt_len_std, flow->features.pkt_len_va, flow->features.down_up_ratio,
+                       flow->features.pkt_size_avg, flow->features.fw_seg_avg, flow->features.bw_seg_avg,
+                       (double)flow->features.subfl_fw_pk, (double)flow->features.subfl_fw_byt,
+                       (double)flow->features.subfl_bw_pk, (double)flow->features.subfl_bw_byt,
+                       (unsigned int)flow->features.fw_win_byt, (unsigned int)flow->features.bw_win_byt, 
+                       (unsigned int)flow->features.fw_act_pkt, (unsigned int)flow->features.fw_seg_min);
             }
-            
-            // 打印空行分隔不同流的信息
-            printf("\n");
-        }
-        
-        if (csv_fp) {
-            // 基本流信息 - 只包含你需要的字段
-            char timebuf[32];
-            format_ebpf_packet_time(node->stats.first_seen, timebuf, sizeof(timebuf));
-            fprintf(csv_fp, "%s,%d,%s,%d,%d,%s,",
-                   flow->src_ip, node->original_src_port,
-                   flow->dst_ip, node->original_dst_port,
-                   flow->protocol,
-                   timebuf);
-            
-            // 流持续时间
-            fprintf(csv_fp, "%.6f,",
-                   flow->features.fl_dur);
-            
-            // 方向统计
-            fprintf(csv_fp, "%lu,%lu,%lu,",
-                   (unsigned long)flow->features.tot_fw_pk,
-                   (unsigned long)flow->features.tot_bw_pk,
-                   (unsigned long)flow->features.tot_1_fw_pk);
-            
-            // 包大小特征
-            fprintf(csv_fp, "%u,%u,%.6f,%.6f,",
-                   flow->features.fwd_pkt_1_min, flow->features.fwd_pkt_1_max,
-                   flow->features.fwd_pkt_1_avg, flow->features.fwd_pkt_1_std);
-            fprintf(csv_fp, "%u,%u,%.6f,%.6f,",
-                   flow->features.bwd_pkt_1_min, flow->features.bwd_pkt_1_max,
-                   flow->features.bwd_pkt_1_avg, flow->features.bwd_pkt_1_std);
-            
-            // 流量率特征
-            fprintf(csv_fp, "%.6f,%.6f,",
-                   flow->features.fl_byt_s, flow->features.fl_pkt_s);
-            
-            // 流间隔时间特征
-            fprintf(csv_fp, "%.6f,%.6f,%.6f,%.6f,",
-                   flow->features.fl_iat_avg, flow->features.fl_iat_std,
-                   flow->features.fl_iat_max, flow->features.fl_iat_min);
-            
-            // 时间间隔特征 - 正向
-            fprintf(csv_fp, "%.6f,%.6f,%.6f,%.6f,%.6f,",
-                   flow->features.fw_iat_tot, flow->features.fw_iat_avg, flow->features.fw_iat_std,
-                   flow->features.fw_iat_max, flow->features.fw_iat_min);
-            
-            // 时间间隔特征 - 反向
-            fprintf(csv_fp, "%.6f,%.6f,%.6f,%.6f,%.6f,",
-                   flow->features.bw_iat_tot, flow->features.bw_iat_avg, flow->features.bw_iat_std,
-                   flow->features.bw_iat_max, flow->features.bw_iat_min);
-            
-            // 头部长度和窗口信息
-            fprintf(csv_fp, "%lu,%lu,%.6f,%.6f,%u,%u,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%u,%u,%u,%u\n",
-                   flow->features.fw_hdr_len, flow->features.bw_hdr_len,
-                   flow->features.fw_pkt_s, flow->features.bw_pkt_s,
-                   flow->features.pkt_len_min, flow->features.pkt_len_max,
-                   flow->features.pkt_len_avg, flow->features.pkt_len_std, flow->features.pkt_len_va,
-                   flow->features.down_up_ratio, flow->features.pkt_size_avg,
-                   flow->features.fw_seg_avg, flow->features.bw_seg_avg,
-                   (double)flow->features.subfl_fw_pk, (double)flow->features.subfl_fw_byt,
-                   (double)flow->features.subfl_bw_pk, (double)flow->features.subfl_bw_byt,
-                   flow->features.fw_win_byt, flow->features.bw_win_byt,
-                                       flow->features.fw_act_pkt, flow->features.fw_seg_min);
-        }
-        if (i < 5 && get_debug_level() >= 2) {
-            printf("DEBUG: boot_realtime.tv_sec = %ld, boot_monotonic_ns = %lu, node->stats.first_seen = %lu\n",
-                boot_realtime.tv_sec, boot_monotonic_ns, node->stats.first_seen);
-            char timebuf[32];
-            format_ebpf_packet_time(node->stats.first_seen, timebuf, sizeof(timebuf));
-            printf("DEBUG: wall time = %s\n", timebuf);
+            fclose(csv_fp);
+            log_info("CSV exported: %s (%d flows)", csv_file, flow_count);
         }
     }
     
-    // 释放分配的内存
     free(flows);
-    
-    if (!quiet_mode) {
-        printf("\n============= Final Summary Statistics =============\n");
-        printf("Conversation Summary:\n");
-        printf("  Total Conversations:  %u\n", total_conversations);
-        printf("    TCP Conversations:  %u\n", tcp_conversations);
-        printf("    UDP Conversations:  %u\n", udp_conversations);
-        printf("\nFlow Summary:\n");
-        printf("  Total Flows:          %lu\n", (unsigned long)flow_count);
-        printf("    TCP Flows:          %lu\n", (unsigned long)total_tcp_flows);
-        printf("    UDP Flows:          %lu\n", (unsigned long)total_udp_flows);
-        printf("    Active Flows:       %d\n", active_flow_count);
-        printf("    Inactive Flows:     %d\n", all_flow_count - active_flow_count);
-        printf("\nPacket Summary:\n");
-        printf("  Total Packets:        %lu\n", (unsigned long)total_packets);
-        printf("    TCP Packets:        %lu\n", (unsigned long)total_tcp_packets);
-        printf("    UDP Packets:        %lu\n", (unsigned long)total_udp_packets);
-        printf("\nByte Summary:\n");
-        printf("  Total Bytes:          %lu (%.2f MB)\n", 
-               (unsigned long)total_bytes, total_bytes / (1024.0 * 1024.0));
-        printf("    TCP Bytes:          %lu (%.2f MB)\n", 
-               (unsigned long)total_tcp_bytes, total_tcp_bytes / (1024.0 * 1024.0));
-        printf("    UDP Bytes:          %lu (%.2f MB)\n", 
-               (unsigned long)total_udp_bytes, total_udp_bytes / (1024.0 * 1024.0));
-        printf("===================================================\n");
-    }
-    
-    if (csv_fp) {
-        fclose(csv_fp);
-        if (!quiet_mode) {
-            printf("\nFeatures exported to CSV file: %s\n", csv_file);
-        } else {
-            printf("Features exported to CSV file: %s\n", csv_file);
-        }
-    }
-    
-    if (!quiet_mode) {
-        printf("\n=============================================================\n\n");
-    }
-    
-
 }
 
 // 打印使用帮助
@@ -1962,11 +1663,13 @@ void print_usage(const char *prog_name) {
     printf("  -w, --wait <seconds>        Wait N seconds between loops (default: 0)\n");
     printf("  -v, --verbose <level>       Debug level: 0=none, 1=basic, 2=detailed (default: 0)\n");
     printf("  -q, --quiet                 Quiet mode, don't print statistics to screen\n");
+    printf("  -m, --monitor               Realtime monitor mode with ncurses interface\n");
     printf("  -h, --help                  Show this help message\n");
     printf("\nExamples:\n");
     printf("  %s -i enp1s0              # Monitor single interface\n", prog_name);
     printf("  %s -i all                 # Monitor all available interfaces\n", prog_name);
     printf("  %s -r capture.pcap        # Read from pcap file\n", prog_name);
+    printf("  %s --monitor              # Start realtime monitor mode\n", prog_name);
 }
 
 // 启动时初始化时间基准
@@ -1987,68 +1690,9 @@ void format_ebpf_packet_time(uint64_t ktime_ns, char *buf, size_t buflen) {
     localtime_r(&sec, &tm);
     strftime(buf, buflen, "%Y-%m-%d %H:%M:%S", &tm);
 }
+// 删除未使用的cleanup_expired_sessions函数
 
-// 会话超时清理函数
-void cleanup_expired_sessions(void) {
-    if (!global_session_manager) {
-        return;
-    }
-    
-    uint64_t current_time = get_current_time();
-    uint32_t pool_usage = get_lockfree_pool_usage_percent(&global_session_manager->session_pool);
-    
-    // 根据内存使用率调整清理策略
-    uint64_t timeout_threshold = SESSION_TIMEOUT_NS;
-    
-    if (pool_usage > 90) {
-        // 内存使用率 > 90%，激进清理
-        timeout_threshold = SESSION_TIMEOUT_NS / 2;
-        log_info("[MEMORY] High usage (%u%%), aggressive cleanup", pool_usage);
-    } else if (pool_usage > 70) {
-        // 内存使用率 > 70%，中等清理
-        timeout_threshold = SESSION_TIMEOUT_NS * 3 / 4;
-        log_info("[MEMORY] Medium usage (%u%%), moderate cleanup", pool_usage);
-    } else if (pool_usage > 50) {
-        // 内存使用率 > 50%，正常清理
-        log_info("[MEMORY] Normal usage (%u%%), standard cleanup", pool_usage);
-    } else {
-        // 内存使用率 < 50%，宽松清理
-        timeout_threshold = SESSION_TIMEOUT_NS * 3 / 2;
-        log_info("[MEMORY] Low usage (%u%%), relaxed cleanup", pool_usage);
-    }
-    
-    int cleaned_count = 0;
-    int total_sessions = 0;
-    
-    for (int i = 0; i < SESSION_HASH_SIZE; i++) {
-        transport_session_t *session = atomic_load_session_ptr(&global_session_manager->sessions[i]);
-        while (session) {
-            transport_session_t *next = atomic_load_session_ptr(&session->next_atomic);
-            total_sessions++;
-            
-            // 将 timespec 转换为纳秒进行比较
-            uint64_t session_last_activity = (uint64_t)session->last_activity.tv_sec * 1000000000ULL + 
-                                           (uint64_t)session->last_activity.tv_nsec;
-            
-            if (current_time - session_last_activity > timeout_threshold) {
-                if (lockfree_remove_session(session) == 0) {
-                    lockfree_free_session_to_pool(session);
-                    cleaned_count++;
-                }
-            }
-            session = next;
-        }
-    }
-    
-    if (cleaned_count > 0) {
-        log_info("[MEMORY] Cleaned %d/%d expired sessions, pool usage: %u%%", 
-                cleaned_count, total_sessions, pool_usage);
-    }
-}
-
-// 添加 transport_session.h 头文件
-#include "transport_session.h"
-#include "logger.h"
+// 删除未使用的print_realtime_stats函数
 
 int main(int argc, char **argv) {
     init_time_base();
@@ -2056,6 +1700,15 @@ int main(int argc, char **argv) {
     const char *pcap_file = NULL;
     int c;
     int ret = 0;
+    int monitor_mode = 0;  // 监控模式标志
+    
+    // 输出编译模式和日志级别信息
+    log_info("Build Mode: %s", get_build_mode_log_level());
+    log_info("Default Log Level: %s", 
+           (get_log_level() == 0) ? "ERROR" :
+           (get_log_level() == 1) ? "WARN" :
+           (get_log_level() == 2) ? "INFO" : "DEBUG");
+    log_info("==========================================");
 
     // Setup signal handlers
     signal(SIGINT, sig_handler);
@@ -2091,11 +1744,12 @@ int main(int argc, char **argv) {
         {"wait",          required_argument, 0, 'w'},
         {"verbose",       required_argument, 0, 'v'},
         {"quiet",         no_argument,       0, 'q'},
+        {"monitor",       no_argument,       0, 'm'},
         {"help",          no_argument,       0, 'h'},
         {0, 0, 0, 0}
     };
 
-    while ((c = getopt_long(argc, argv, "i:r:d:s:p:c:o:l:w:v:qh", long_options, NULL)) != -1) {
+    while ((c = getopt_long(argc, argv, "i:r:d:s:p:c:o:l:w:v:qmh", long_options, NULL)) != -1) {
         switch (c) {
             case 'i':
                 ifname = optarg;
@@ -2170,6 +1824,10 @@ int main(int argc, char **argv) {
                 quiet_mode = 1;
                 printf("Quiet mode enabled, statistics will not be printed to screen\n");
                 break;
+            case 'm':
+                monitor_mode = 1;
+                printf("Monitor mode enabled, will start realtime monitor interface\n");
+                break;
             case 'h':
                 print_usage(argv[0]);
                 return 0;
@@ -2179,6 +1837,38 @@ int main(int argc, char **argv) {
         }
     }
 
+    // 检查是否有实时监控模式参数（通过命令行参数）
+    for (int i = 1; i < argc; i++) {
+        if (strcmp(argv[i], "--monitor") == 0 || strcmp(argv[i], "-m") == 0) {
+            monitor_mode = 1;
+            break;
+        }
+    }
+
+    if (monitor_mode) {
+        // 实时监控模式
+        printf("Starting realtime monitor mode...\n");
+        
+        // 在monitor模式下显示信息、警告和错误日志，但不显示调试信息
+        set_log_level(LOG_LEVEL_INFO);
+        
+        // 初始化会话管理器
+        if (transport_session_manager_init() != 0) {
+            fprintf(stderr, "Failed to initialize session manager\n");
+            return 1;
+        }
+        
+        // 运行单线程监控模式
+        int ret = run_monitor_mode(ifname);
+        
+        // 清理
+        transport_session_manager_cleanup();
+        
+        printf("\nMonitor mode finished\n");
+        
+        return ret;
+    }
+
     if (pcap_file) {
         // Process pcap file
         ret = process_pcap_file(pcap_file);
@@ -2186,15 +1876,227 @@ int main(int argc, char **argv) {
         // Live capture mode
         ret = run_live_capture(ifname);
     }
+
+    // 打印最终消息
+    printf("\n程序结束\n");
+
+    return ret;
+}
+
+
+
+// 捕获线程函数
+static void *capture_thread_func(void *arg) {
+    struct perf_buffer *pb = (struct perf_buffer *)arg;
+    int err;
     
-    // 启动主捕获/处理循环后，添加如下实时统计输出
-    while (running) {
-        update_system_stats();
-        printf("\r已收到数据包: %lu", system_stats.packets_processed);
-        fflush(stdout);
-        sleep(1);
+    log_info("Capture thread started");
+    
+    while (monitor_running) {
+        // 处理perf buffer事件（非阻塞）
+        err = perf_buffer__poll(pb, 100); // 100ms超时
+        if (err < 0 && err != -EINTR) {
+            log_error("Error polling perf buffer: %s", strerror(-err));
+            break;
+        }
+        
+        // 处理队列中的数据包
+        while (packet_queue_size(&packet_queue) > 0 && monitor_running) {
+            packet_data_t packet;
+            if (packet_queue_dequeue(&packet_queue, &packet) == 0) {
+                // 直接处理数据包
+                if (packet.ip_header.protocol == IPPROTO_TCP) {
+                    // 从存储的TCP头部数据中提取标志位
+                    struct tcphdr *tcp_header = (struct tcphdr *)packet.transport_header.tcp.flags_byte;
+                    uint8_t tcp_flags = *((uint8_t*)tcp_header + 13);  // TCP标志位在第13字节
+                    uint32_t tcp_seq = packet.transport_header.tcp.seq;
+                    
+                    process_packet_direct(&packet.ip_header, 
+                                        packet.transport_header.tcp.source,
+                                        packet.transport_header.tcp.dest,
+                                        tcp_seq, tcp_flags, packet.timestamp);
+                } else if (packet.ip_header.protocol == IPPROTO_UDP) {
+                    process_packet_direct(&packet.ip_header,
+                                        packet.transport_header.udp.source,
+                                        packet.transport_header.udp.dest,
+                                        0, 0, packet.timestamp);  // UDP没有序列号和标志位
+                }
+            }
+        }
+        
+        // 短暂休眠以避免过度占用CPU
+        usleep(10000); // 10ms
     }
-    printf("\n"); // 程序结束时换行
+    
+    log_info("Capture thread finished");
+    return NULL;
+}
+
+// 新增：运行监控模式的函数（捕获线程 + 主线程UI）
+static int run_monitor_mode(const char *ifname) {
+    struct bpf_object *obj = NULL;
+    struct bpf_program *prog = NULL;
+    struct bpf_link *link = NULL;
+    struct perf_buffer *pb = NULL;
+    int map_fd, err;
+    int ret = 0;
+    WINDOW *win = NULL;
+    pthread_t capture_thread;
+
+    // 初始化时间基准
+    init_time_base();
+    
+    // 初始化系统监控
+    init_system_monitoring();
+
+    // 初始化数据包队列
+    packet_queue_init(&packet_queue, PACKET_QUEUE_SIZE);
+
+    // 初始化流表
+    flow_table_init();
+    log_info("Flow tracking initialized");
+    log_info("Processing interface: %s", ifname);
+
+    /* 1. Load BPF program */
+    log_info("Loading BPF program from bpf_program.o...");
+    obj = bpf_object__open_file("bpf_program.o", NULL);
+    if (libbpf_get_error(obj)) {
+        log_error("Failed to open BPF object file: %s", strerror(-libbpf_get_error(obj)));
+        ret = 1;
+        goto cleanup;
+    }
+    log_info("BPF object loaded successfully");
+
+    /* 2. Load into kernel */
+    log_info("Loading BPF program into kernel...");
+    err = bpf_object__load(obj);
+    if (err) {
+        log_error("BPF loading failed: %s", strerror(-err));
+        ret = 1;
+        goto cleanup;
+    }
+    log_info("BPF program loaded into kernel successfully");
+
+    /* 3. Attach to interface */
+    log_info("Finding XDP program...");
+    prog = bpf_object__find_program_by_name(obj, "xdp_packet_capture");
+    if (!prog) {
+        log_error("BPF program 'xdp_packet_capture' not found");
+        ret = 1;
+        goto cleanup;
+    }
+    log_info("XDP program found");
+
+    log_info("Getting interface index for %s...", ifname);
+    int ifindex = if_nametoindex(ifname);
+    if (!ifindex) {
+        log_error("Failed to get interface index for %s: %s", ifname, strerror(errno));
+        ret = 1;
+        goto cleanup;
+    }
+    log_info("Interface index: %d", ifindex);
+
+    // 预取相关内存以提高性能
+    PREFETCH(prog);
+    log_info("Attaching XDP program to interface...");
+    link = bpf_program__attach_xdp(prog, ifindex);
+    if (libbpf_get_error(link)) {
+        log_error("XDP attachment failed: %s", strerror(-libbpf_get_error(link)));
+        ret = 1;
+        goto cleanup;
+    }
+    log_info("XDP program attached successfully");
+
+    /* 4. Setup perf buffer */
+    log_info("Setting up perf buffer...");
+    map_fd = bpf_object__find_map_fd_by_name(obj, "events");
+    if (map_fd < 0) {
+        log_error("Perf event map 'events' not found");
+        ret = 1;
+        goto cleanup;
+    }
+    log_info("Perf event map found, fd: %d", map_fd);
+    
+    struct perf_buffer_opts pb_opts = {
+        .sz = sizeof(pb_opts),
+    };
+
+    /* 新版libbpf API */
+    pb = perf_buffer__new(map_fd, PERF_BUFFER_PAGES, 
+                        handle_batch, 
+                        NULL, 
+                        NULL, 
+                        &pb_opts);
+
+    if (libbpf_get_error(pb)) {
+        log_error("Failed to create perf buffer: %s", strerror(-libbpf_get_error(pb)));
+        ret = 1;
+        goto cleanup;
+    }
+    log_info("Perf buffer created successfully");
+    log_info("Successfully started capturing on %s", ifname);
+
+    /* 5. Start capture thread */
+    log_info("Starting capture thread...");
+    if (pthread_create(&capture_thread, NULL, capture_thread_func, pb) != 0) {
+        log_error("Failed to create capture thread");
+        ret = 1;
+        goto cleanup;
+    }
+
+    /* 6. Initialize ncurses */
+    win = init_stats_window();
+    if (!win) {
+        log_error("Failed to initialize stats window");
+        ret = 1;
+        goto cleanup;
+    }
+
+    /* 7. Main UI loop */
+    log_info("Entering main UI loop...");
+    
+    while (monitor_running) {
+        // 更新系统统计
+        update_system_stats();
+        
+        // 更新UI
+        update_stats_window(win);
+        
+        // 检查按键
+        int ch = wgetch(win);
+        if (ch == 'q' || ch == 'Q') {
+            log_info("User requested exit from monitor");
+            monitor_running = 0;
+            break;
+        }
+        
+        // 短暂休眠
+        usleep(500000); // 0.5秒
+    }
+
+    /* 8. Wait for capture thread to complete */
+    log_info("Waiting for capture thread to complete...");
+    pthread_join(capture_thread, NULL);
+
+cleanup:
+    if (win) {
+        cleanup_stats_window(win);
+    }
+    if (pb) {
+        perf_buffer__free(pb);
+    }
+    if (link) {
+        bpf_link__destroy(link);
+    }
+    if (obj) {
+        bpf_object__close(obj);
+    }
+    
+    // 清理数据包队列
+    packet_queue_destroy(&packet_queue);
+    
+    // 清理流表
+    flow_table_destroy();
     
     return ret;
 }

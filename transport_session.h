@@ -18,7 +18,7 @@
 #define MAX_SESSIONS 500000        // 50万会话
 
 // 内存池配置 - 基于实际并发会话数调整
-#define MEMORY_POOL_SIZE 200000    // 20万个会话的内存池
+#define MEMORY_POOL_SIZE 50000     // 减少到5万个会话的内存池
 
 // 会话超时配置 (纳秒)
 #define SESSION_TIMEOUT_NS 300000000000ULL  // 5分钟超时
