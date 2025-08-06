@@ -73,9 +73,28 @@ void mempool_init_physical(struct mempool *pool, size_t initial_blocks) {
 struct flow_node *mempool_alloc(struct mempool *pool) {
     if (!pool) return NULL;
     
+    // 检查程序是否正在退出
+    extern volatile int running;
+    if (!running) {
+        log_debug("Skipping mempool allocation during shutdown");
+        return NULL;
+    }
+    
     // 如果没有空闲节点，返回NULL（物理内存池不支持动态扩展）
     if (!pool->free_list) {
-        log_warn("No free nodes available in mempool");
+        // 计算当前使用情况
+        size_t total_nodes, free_nodes, used_nodes;
+        mempool_get_stats(pool, &total_nodes, &free_nodes, &used_nodes);
+        
+        log_warn("No free nodes available in mempool - Used: %zu/%zu (%.1f%%)", 
+                 used_nodes, total_nodes, (double)used_nodes * 100.0 / total_nodes);
+        
+        // 建议增加内存池大小
+        if (used_nodes > total_nodes * 0.8) {
+            log_info("Suggestion: Increase mempool size to %zu blocks for better performance", 
+                     (size_t)(pool->block_count * 1.5));
+        }
+        
         return NULL;
     }
     
@@ -107,10 +126,30 @@ void mempool_destroy(struct mempool *pool) {
         pool->physical_memory = NULL;
     }
     
-    // 清除池
     memset(pool, 0, sizeof(struct mempool));
+}
+
+// 清空内存池
+void mempool_clear(struct mempool *pool) {
+    if (!pool || !pool->physical_memory) return;
     
-    log_info("Physical mempool destroyed");
+    log_info("Clearing mempool: %zu nodes", pool->total_nodes);
+    
+    // 重置所有节点状态
+    struct flow_node* nodes = (struct flow_node*)pool->physical_memory;
+    for (size_t i = 0; i < pool->total_nodes; i++) {
+        memset(&nodes[i], 0, sizeof(struct flow_node));
+        nodes[i].in_use = 0;
+    }
+    
+    // 重建空闲链表
+    pool->free_list = NULL;
+    for (size_t i = 0; i < pool->total_nodes; i++) {
+        nodes[i].next = pool->free_list;
+        pool->free_list = &nodes[i];
+    }
+    
+    log_info("Mempool cleared: all %zu nodes reset to free state", pool->total_nodes);
 }
 
 void mempool_get_stats(struct mempool *pool, size_t *total_nodes, size_t *free_nodes, size_t *used_nodes) {

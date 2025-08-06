@@ -531,12 +531,22 @@ void reset_flow_stats_for_new_session(struct flow_stats *stats, uint64_t packet_
 void update_tcp_flags(struct flow_stats *stats, uint8_t tcp_flags, int is_reverse);
 void update_udp_stats(struct flow_stats *stats, uint32_t pkt_size, int is_reverse, uint64_t packet_timestamp);
 void calculate_flow_features(const struct flow_stats *stats, struct flow_features *features);
-void print_flow_stats();
+
 void process_packet(const struct iphdr *ip, const void *transport_hdr, uint64_t packet_timestamp);
 int count_active_flows();
-void count_flow_directions(int *forward_flows, int *reverse_flows);
 int count_all_flows();
-void count_all_flow_directions(int *forward_flows, int *reverse_flows);
+
+// UDP流管理 - Wireshark风格
+void reset_udp_stream_counter(void);
+uint32_t get_next_udp_stream_id(void);
+int verify_udp_conversation_count(void);
+
+
+// 活跃/空闲时间管理
+void update_active_idle(struct flow_stats *stats, uint64_t current_time);
+
+
+
 uint32_t get_total_conversation_count();
 
 uint32_t hash_flow_key(const struct flow_key *key);
@@ -547,10 +557,7 @@ void timestamp_array_init(timestamp_array_t *arr);
 void timestamp_array_add(timestamp_array_t *arr, uint64_t timestamp);
 void timestamp_array_free(timestamp_array_t *arr);
 
-// 添加新函数声明用于处理Bulk特征
-void update_flow_bulk(struct flow_stats *stats, uint32_t payload_size, int is_reverse, uint64_t timestamp);
-void update_subflow(struct flow_stats *stats, uint64_t current_time);
-void update_active_idle(struct flow_stats *stats, uint64_t current_time);
+
 
 // cicflowmeter Integration - Bulk Transfer Threshold
 #define CIC_BULK_BYTE_THRESHOLD   512      // 批量传输阈值 (字节)
@@ -558,10 +565,7 @@ void update_active_idle(struct flow_stats *stats, uint64_t current_time);
 // cicflowmeter Integration - Subflow Timeout
 #define CIC_SUBFLOW_TIMEOUT_NS    1000000000ULL   // 子流超时时间 (1秒)
 
-// =================== cicflowmeter 风格的流处理函数 ===================
-void update_subflow_cic(struct flow_stats *stats, uint64_t packet_timestamp);
-void update_active_idle_cic(struct flow_stats *stats, uint64_t current_time_diff);
-void update_flow_bulk_cic(struct flow_stats *stats, uint32_t payload_size, int is_reverse, uint64_t packet_timestamp);
+
 
 // =================== Wireshark 风格的对话统计函数 ===================
 
@@ -584,18 +588,12 @@ void update_conversation_completeness(struct flow_node *node, uint8_t tcp_flags)
 
 // Wireshark风格的统计打印函数
 void print_wireshark_conversation_stats();
-int count_wireshark_tcp_conversations();
 int count_wireshark_udp_conversations();
-int count_wireshark_all_conversations();
-void count_tcp_conversations_by_completeness(int *complete, int *incomplete, int *partial);
 
 // =================== Tshark风格兼容函数声明 ===================
 
-// 统计函数 - 与tshark完全兼容
-int count_tshark_tcp_conversations();       // 统计TCP对话数（与tshark -z conv,tcp一致）
-int count_tshark_udp_conversations();       // 统计UDP对话数（与tshark -z conv,udp一致）
-int count_tshark_ip_conversations();        // 统计IP对话数（与tshark -z conv,ip一致）
-void print_tshark_style_stats();            // 打印tshark风格的统计信息
+
+
 
 extern int quiet_mode;       // 安静模式变量
 extern int tshark_stats_mode; // tshark兼容统计模式变量
@@ -612,11 +610,7 @@ struct flow_node *flow_table_insert_with_timestamp(const struct flow_key *key, u
 struct flow_stats* get_or_create_conversation(const struct flow_key *key, int *is_reverse_ptr, uint64_t packet_timestamp, uint8_t tcp_flags);
 struct flow_stats* get_or_create_udp_conversation(const struct flow_key *key, int *is_reverse_ptr, uint64_t packet_timestamp);
 
-// UDP流管理 - Wireshark风格
-void reset_udp_stream_counter(void);
-uint32_t get_next_udp_stream_id(void);
-int verify_udp_conversation_count(void);
-void print_udp_conversation_details(void);
+
 
 // 包处理
 void process_packet(const struct iphdr *ip, const void *transport_hdr, uint64_t packet_timestamp);
@@ -642,16 +636,12 @@ void print_wireshark_conversation_stats(void);
 
 
 
-// TCP会话统计
-int count_tcp_sessions_by_lifecycle(void);
-void count_tcp_sessions_by_state(int *init_sessions, int *established_sessions, 
-                                 int *closing_sessions, int *reset_sessions, int *unknown_sessions);
+
 
 // 流特征计算
 void calculate_flow_features(const struct flow_stats *stats, struct flow_features *features);
 
-// 打印函数
-void print_simple_stats(void);
+
 void print_flow_stats(void);
 
 // 清理函数
@@ -675,17 +665,15 @@ void timestamp_array_free(timestamp_array_t *arr);
 // 五元组会话统计函数
 void count_sessions_by_five_tuple();
 
-// Wireshark风格会话打印函数
-void print_all_wireshark_sessions();
+
 
 // **新增**: tshark风格会话计数和验证函数
 int count_tshark_style_tcp_sessions();
 void verify_tshark_style_counting();
 
-// **新增**: 会话时间记录函数
-void print_session_timing_info();
 
-void format_packet_time(uint64_t pkt_timestamp, char *buf, size_t buflen);
+
+
 void format_ebpf_packet_time(uint64_t ktime_ns, char *buf, size_t buflen);
 
 #endif /* FLOW_H */

@@ -16,6 +16,6 @@ uint64_t get_ebpf_processed_bytes(void);
 void get_ebpf_stats(uint64_t *captured_packets, uint64_t *captured_bytes, 
                    uint64_t *processed_packets, uint64_t *processed_bytes);
 void print_ebpf_stats(void);
-void print_realtime_ebpf_stats(void);
+
 
 #endif // LOADER_H 

@@ -13,7 +13,7 @@ ifeq ($(BUILD_TYPE),debug)
     CFLAGS += -g -O0 -DDEBUG -DDEBUG_LEVEL=$(DEBUG_LEVEL) -Wall -Wextra -Wpedantic
     CFLAGS += -fsanitize=address -fsanitize=undefined -fno-omit-frame-pointer
     CFLAGS += -DTRACE_ENABLED -DASSERT_ENABLED
-    LDFLAGS += -fsanitize=address -fsanitize=undefined
+    LDFLAGS += -fsanitize=address -fsanitize=undefined -lncurses
     BPF_CFLAGS += -g -O0 -DDEBUG
     BUILD_SUFFIX = _debug
     DEBUG_INFO = 1
@@ -22,7 +22,7 @@ else ifeq ($(BUILD_TYPE),release)
     CFLAGS += -O3 -DNDEBUG -march=native -mtune=native
     CFLAGS += -flto -ffast-math -funroll-loops
     CFLAGS += -fomit-frame-pointer -DRELEASE_BUILD
-    LDFLAGS += -flto
+    LDFLAGS += -flto -lncurses
     BPF_CFLAGS += -O2 -DNDEBUG
     BUILD_SUFFIX = _release
     DEBUG_INFO = 0
@@ -30,7 +30,7 @@ else ifeq ($(BUILD_TYPE),profile)
     # Profile版本配置（用于性能分析）
     CFLAGS += -O2 -g -pg -DDEBUG_LEVEL=1
     CFLAGS += -fno-omit-frame-pointer -DTRACE_ENABLED
-    LDFLAGS += -pg
+    LDFLAGS += -pg -lncurses
     BPF_CFLAGS += -O2 -g
     BUILD_SUFFIX = _profile
     DEBUG_INFO = 1
@@ -61,7 +61,7 @@ BPF_CFLAGS += -target bpf -D__TARGET_ARCH_$(ARCH) \
              -g -O2 -mcpu=v3
 
 # 库链接标志
-LDLIBS := -lelf -lz -lbpf -lm -lpcap
+LDLIBS := -lelf -lz -lbpf -lm -lpcap -lncurses
 JSON_LDLIBS := $(LDLIBS) -lcjson
 
 # 确定正确的库路径
@@ -86,20 +86,27 @@ PROFILE_TARGETS := $(addsuffix _profile,$(TARGETS))
 all: bpf_program.o $(TARGETS)
 
 # Debug版本
-debug: CFLAGS += -g -O0 -DDEBUG -DDEBUG_LEVEL=$(DEBUG_LEVEL) -Wall -Wextra -Wpedantic
+debug: CFLAGS := -std=c11 -Wall -I$(LIBBPF_SRC) -D_GNU_SOURCE -D_POSIX_C_SOURCE=200809L
+debug: CFLAGS += -g -O0 -DDEBUG -DDEBUG_LEVEL=$(DEBUG_LEVEL) -Wall -Wextra -Wpedantic -fPIC
 debug: CFLAGS += -fsanitize=address -fsanitize=undefined -fno-omit-frame-pointer
-debug: LDFLAGS += -fsanitize=address -fsanitize=undefined
+debug: CFLAGS += -DBUILD_TYPE="debug" -DGIT_HASH="$(GIT_HASH)" -DVERSION="$(VERSION)"
+debug: LDFLAGS += -fsanitize=address -fsanitize=undefined -no-pie
 debug: loader_debug
 
 # Release版本
+release: CFLAGS := -std=c11 -Wall -I$(LIBBPF_SRC) -D_GNU_SOURCE -D_POSIX_C_SOURCE=200809L
 release: CFLAGS += -O3 -DNDEBUG -march=native -mtune=native
 release: CFLAGS += -flto -ffast-math -funroll-loops -fomit-frame-pointer
+release: CFLAGS += -fno-sanitize=address -fno-sanitize=undefined
+release: CFLAGS += -DBUILD_TYPE=\"release\" -DGIT_HASH=\"$(GIT_HASH)\" -DVERSION=\"$(VERSION)\"
 release: LDFLAGS += -flto
 release: loader_release
 
 # Profile版本
+profile: CFLAGS := -std=c11 -Wall -I$(LIBBPF_SRC) -D_GNU_SOURCE -D_POSIX_C_SOURCE=200809L
 profile: CFLAGS += -O2 -g -pg -DDEBUG_LEVEL=1
 profile: CFLAGS += -fno-omit-frame-pointer -DTRACE_ENABLED
+profile: CFLAGS += -DBUILD_TYPE=\"profile\" -DGIT_HASH=\"$(GIT_HASH)\" -DVERSION=\"$(VERSION)\"
 profile: LDFLAGS += -pg
 profile: loader_profile
 
@@ -111,26 +118,40 @@ bpf_program.o: bpf_program.c
 	@echo "编译BPF程序 ($(BUILD_TYPE)版本)..."
 	$(CLANG) $(BPF_CFLAGS) -c $< -o $@
 
+# ==================== 对象文件编译 ====================
+stats_window.o: stats_window.c stats_window.h
+	@echo "编译stats_window.o..."
+	$(CC) $(CFLAGS) -c $< -o $@
+
+system_stats.o: system_stats.c
+	@echo "编译system_stats.o..."
+	$(CC) $(CFLAGS) -c $< -o $@
+
 # ==================== 应用程序编译 ====================
 
 # Loader应用程序
-loader: loader.c flow.c mempool.c transport_session.c logger.c
+loader: loader.c flow.c mempool.c transport_session.c logger.c stats_window.o system_stats.o
 	@echo "编译loader ($(BUILD_TYPE)版本)..."
 	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ $^ $(LDLIBS)
 
-loader_debug: loader.c flow.c mempool.c transport_session.c logger.c
+# 测试监控程序
+test_monitor: test_monitor.c flow.c mempool.c transport_session.c logger.c stats_window.o system_stats.o
+	@echo "编译test_monitor ($(BUILD_TYPE)版本)..."
+	$(CC) $(CFLAGS) -fno-sanitize=address -fno-sanitize=undefined $(LDFLAGS) -o $@ $^ $(LDLIBS)
+
+loader_debug: loader.c flow.c mempool.c transport_session.c logger.c stats_window.o system_stats.o
 	@echo "编译loader (debug版本)..."
 	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ $^ $(LDLIBS)
 
-loader_release: loader.c flow.c mempool.c transport_session.c logger.c
+loader_release: loader.c flow.c mempool.c transport_session.c logger.c stats_window.o system_stats.o
 	@echo "编译loader (release版本)..."
 	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ $^ $(LDLIBS)
 
-loader_profile: loader.c flow.c mempool.c transport_session.c logger.c
+loader_profile: loader.c flow.c mempool.c transport_session.c logger.c stats_window.o system_stats.o
 	@echo "编译loader (profile版本)..."
 	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ $^ $(LDLIBS)
 
-loader_debug_noasan: loader.c flow.c mempool.c transport_session.c logger.c
+loader_debug_noasan: loader.c flow.c mempool.c transport_session.c logger.c stats_window.o system_stats.o
 	@echo "编译loader (debug版本，无ASan，用于Valgrind)..."
 	$(CC) $(CFLAGS) -g -O0 -DDEBUG -DDEBUG_LEVEL=$(DEBUG_LEVEL) -Wall -Wextra -Wpedantic \
 		-fno-omit-frame-pointer -DTRACE_ENABLED -DASSERT_ENABLED \

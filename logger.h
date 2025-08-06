@@ -30,9 +30,6 @@ void log_debug(const char *fmt, ...);
 void log_timestamp(char *buffer, size_t size);
 void log_format_level(log_level_t level, char *buffer, size_t size);
 
-// 日志文件管理
-int log_init_file(const char *filename);
-void log_close_file(void);
-void log_set_output(FILE *output);
+
 
 #endif /* LOGGER_H */ 

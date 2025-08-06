@@ -37,6 +37,9 @@ void mempool_destroy(struct mempool *pool);
 // 获取内存池统计信息
 void mempool_get_stats(struct mempool *pool, size_t *total_nodes, size_t *free_nodes, size_t *used_nodes);
 
+// 清空内存池
+void mempool_clear(struct mempool *pool);
+
 // 分配连续物理内存的辅助函数
 void* allocate_physical_memory(size_t size);
 

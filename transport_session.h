@@ -261,13 +261,14 @@ transport_session_t *create_transport_session_with_state(const struct flow_key *
                                                         uint8_t state_id, 
                                                         uint64_t timestamp);
 
-// CSV导出功能增强
-int export_sessions_flow_features_to_csv(const char *filename);
-int export_session_detailed_features(transport_session_t *session, FILE *fp);
+
 
 // 性能监控函数
 void print_lockfree_pool_stats(const memory_pool_t *pool);
 void print_session_manager_stats(const session_manager_t *manager);
+
+// CSV导出功能
+int export_session_detailed_features(transport_session_t *session, FILE *fp);
 
 // =================== 基于Session的会话管理函数 ===================
 
@@ -293,7 +294,7 @@ int update_session_from_flow(transport_session_t *session, uint32_t packet_size,
                             bool is_reverse, uint64_t timestamp);
 
 // 导出基于session的会话统计
-int export_session_based_sessions_to_csv(const char *filename);
+
 
 // 新的CSV导出函数
 int export_comprehensive_flow_features_to_csv(const char *filename);
@@ -306,22 +307,11 @@ int export_conversation_based_sessions_to_csv(const char *filename);
 int transport_session_manager_init(void);
 void transport_session_manager_cleanup(void);
 
-// 动态配置函数
-int set_session_manager_config(uint32_t max_sessions, uint32_t timeout_ns, 
-                              uint32_t cleanup_interval, double load_threshold);
-int get_session_manager_config(uint32_t *max_sessions, uint32_t *timeout_ns, 
-                              uint32_t *cleanup_interval, double *load_threshold);
 
-// 会话管理器状态查询
-uint32_t get_total_session_count(void);
-uint32_t get_active_session_count(void);
-uint32_t get_tcp_session_count(void);
-uint32_t get_udp_session_count(void);
-double get_session_manager_load_factor(void);
-uint32_t get_session_manager_hash_collision_rate(void);
 
-// 基于实际数据的配置建议
-void suggest_config_based_on_actual_sessions(uint32_t actual_tcp_sessions, uint32_t actual_udp_sessions);
+
+
+
 
 // 全局会话管理器声明
 extern session_manager_t *global_session_manager;

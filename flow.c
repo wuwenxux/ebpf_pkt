@@ -11,17 +11,32 @@
 #include <netinet/tcp.h>
 #include <netinet/udp.h>
 #include <netinet/ip_icmp.h>
+#include <netinet/igmp.h>
+#include <netinet/if_ether.h>
 #include <sys/time.h>
 #include <math.h>
 #include <linux/igmp.h>
 #include <stdatomic.h>
+#include <pthread.h>
+#include <sys/mman.h>
+#include <sys/sysinfo.h>
 
 #include "flow.h"
 #include "mempool.h"
 #include "logger.h"
+#include "transport_session.h"
+
+// 前向声明
+extern int calculate_session_features(transport_session_t *session);
 
 // =================== 调试级别控制 ===================
 static int debug_level = 0;
+
+// 统一的shutdown检查函数
+static inline bool is_shutdown_requested() {
+    extern volatile int running;
+    return !running;
+}
 
 void set_debug_level(int level) {
     debug_level = level;
@@ -47,13 +62,6 @@ int get_debug_level() {
     return debug_level;
 }
 
-#define DEBUG_PRINT(level, ...) \
-    do { \
-        if (debug_level >= level) { \
-            printf(__VA_ARGS__); \
-        } \
-    } while(0)
-
 // =================== Wireshark风格的对话统计系统 ===================
 // 基于conversation.h中的conv_item_t结构和packet-tcp.c的实现
 
@@ -61,6 +69,12 @@ int get_debug_level() {
 struct mempool global_pool;
 struct flow_node* flow_table[HASH_TABLE_SIZE] = {0};
 int flow_table_initialized = 0;
+
+// 会话创建统计变量
+static uint64_t total_sessions_created = 0;
+static uint64_t tcp_sessions_created = 0;
+static uint64_t udp_sessions_created = 0;
+static uint64_t sessions_reused = 0;
 
 // 全局对话计数器 (类似Wireshark的conversation tracking)
 static volatile uint32_t tcp_conversation_count = 0;
@@ -248,11 +262,55 @@ void set_flow_start_time_from_timestamp(struct flow_stats *stats, uint64_t times
 
 void flow_table_init() {
     if (flow_table_initialized) {
-        DEBUG_PRINT(1, "流表已初始化，跳过重新初始化\n");
+        log_info("Flow table already initialized, skipping re-initialization");
         return;
     }
-    // 强制重新初始化，确保每次都是干净的状态
-    mempool_init_physical(&global_pool, 2);   // 减少到2个块，每个块65536个节点
+    
+    // 获取系统可用内存
+    long pages = sysconf(_SC_AVPHYS_PAGES);
+    long page_size = sysconf(_SC_PAGE_SIZE);
+    long available_memory = pages * page_size;
+    long available_gb = available_memory / (1024 * 1024 * 1024);
+    
+    // 根据可用内存动态调整内存池大小，更加保守
+    size_t pool_blocks;
+    if (available_gb >= 32) {
+        pool_blocks = 50;   // 32GB+ 系统：50个块
+    } else if (available_gb >= 16) {
+        pool_blocks = 25;   // 16GB+ 系统：25个块
+    } else if (available_gb >= 8) {
+        pool_blocks = 15;   // 8GB+ 系统：15个块
+    } else if (available_gb >= 4) {
+        pool_blocks = 8;    // 4GB+ 系统：8个块
+    } else if (available_gb >= 2) {
+        pool_blocks = 4;    // 2GB+ 系统：4个块
+    } else {
+        pool_blocks = 2;    // 小内存系统：2个块
+    }
+    
+    log_info("System available memory: %ld GB, using %zu pool blocks", available_gb, pool_blocks);
+    
+    // 尝试初始化内存池，如果失败则使用更小的配置
+    int retry_count = 0;
+    while (retry_count < 3) {
+        mempool_init_physical(&global_pool, pool_blocks);
+        if (global_pool.physical_memory) {
+            break; // 成功分配
+        }
+        
+        // 减少内存池大小重试
+        pool_blocks = pool_blocks / 2;
+        if (pool_blocks < 1) pool_blocks = 1;
+        
+        log_warn("Memory allocation failed, retrying with %zu blocks", pool_blocks);
+        retry_count++;
+    }
+    
+    if (!global_pool.physical_memory) {
+        log_error("Failed to allocate memory pool after %d retries", retry_count);
+        return;
+    }
+    
     memset(flow_table, 0, sizeof(flow_table));
     init_protocol_handlers();
     
@@ -262,7 +320,7 @@ void flow_table_init() {
     
     flow_table_initialized = 1;
     
-    DEBUG_PRINT(1, "流表初始化完成，所有计数器已重置\n");
+    log_info("Flow table initialization completed, all counters reset");
 }
 
 uint32_t hash_flow_key(const struct flow_key *key) {
@@ -412,11 +470,17 @@ void update_conversation_completeness(struct flow_node *node, uint8_t tcp_flags)
 }
 
 struct flow_stats* get_or_create_conversation(const struct flow_key *key, int *is_reverse_ptr, uint64_t packet_timestamp, uint8_t tcp_flags) {
+    // 检查程序是否正在关闭
+    if (is_shutdown_requested()) {
+        log_debug("Skipping conversation creation during shutdown");
+        return NULL;
+    }
+    
     // **重要**: 根据协议类型使用不同的处理逻辑
     if (key->protocol == IPPROTO_UDP) {
         // UDP使用Wireshark风格的稳定对话管理
         struct flow_stats* udp_stats = get_or_create_udp_conversation(key, is_reverse_ptr, packet_timestamp);
-        DEBUG_PRINT(3, "DEBUG: get_or_create_conversation(UDP) 返回: %p\n", (void*)udp_stats);
+        log_debug("get_or_create_conversation(UDP) returns: %p", (void*)udp_stats);
         return udp_stats;
     }
     
@@ -458,32 +522,39 @@ struct flow_stats* get_or_create_conversation(const struct flow_key *key, int *i
     struct flow_node *node = flow_table[idx];
     
     while (node) {
+        // 移除 is_shutdown_requested() 检查，允许遍历所有节点
+        // if (is_shutdown_requested()) {
+        //     log_debug("Skipping flow lookup during shutdown");
+        //     return NULL;
+        // }
+        // 验证节点指针的有效性
+        if (!node || (uintptr_t)node < 0x1000) {
+            log_debug("Invalid node pointer detected, skipping");
+            node = node->next;
+            continue;
+        }
+        
         if (memcmp(&node->key, &normalized_key, sizeof(struct flow_key)) == 0) {
             // 找到现有会话 - **修改**: 使用更宽松的tshark风格逻辑
             bool should_create_new_session = false;
             
             if (key->protocol == IPPROTO_TCP) {
-                // **tshark风格**: 更宽松的新会话创建条件
+                // **更保守的会话创建策略**: 只在真正需要时才创建新会话
                 if ((tcp_flags & TCP_FLAG_SYN) && !(tcp_flags & TCP_FLAG_ACK)) {
-                    // 新的SYN包 - 使用多种条件判断是否创建新会话
+                    // 新的SYN包 - 使用更严格的条件判断是否创建新会话
                     if (node->stats.session_completed ||  // 会话已明确结束
                         node->tcp_state == TCP_CONV_RESET ||  // 会话被重置
-                        node->tcp_state == TCP_CONV_CLOSING ||  // 会话正在关闭
-                        (packet_timestamp - node->last_packet_time > 60000000000ULL)) {  // 超过60秒无活动
+                        (packet_timestamp - node->last_packet_time > 600000000000ULL)) {  // 超过10分钟无活动
                         should_create_new_session = true;
-                        DEBUG_PRINT(2, "tshark风格: 检测到新SYN，创建新TCP会话 (状态: %d)\n", node->tcp_state);
+                        log_debug("Creating new TCP session: session completed or long timeout");
                     } else {
-                        // **新增**: 即使会话未结束，如果是明显的新连接尝试也创建新会话
-                        // 这更符合tshark的行为
-                        if (node->stats.fwd_packets > 0 && node->stats.bwd_packets > 0) {
-                            // 如果已有双向通信，新的SYN可能是新连接
-                            should_create_new_session = true;
-                            DEBUG_PRINT(2, "tshark风格: 双向通信后的新SYN，创建新会话\n");
-                        }
+                        // **更严格**: 只有在会话明确结束或长时间无活动时才创建新会话
+                        // 移除双向通信检查，避免过度创建会话
+                        log_debug("Continuing with existing session, not creating new one");
                     }
                 }
                 
-                // **新增**: 处理连接重置后的新连接
+                // **处理连接重置**
                 if ((tcp_flags & TCP_FLAG_RST) && node->tcp_state != TCP_CONV_RESET) {
                     node->tcp_state = TCP_CONV_RESET;
                     node->stats.session_completed = 1;
@@ -491,40 +562,48 @@ struct flow_stats* get_or_create_conversation(const struct flow_key *key, int *i
             }
             
             if (should_create_new_session) {
-                // **修改**: 创建全新的节点而不是重置现有节点
-                // 这样可以保持历史会话记录，更符合tshark行为
-                struct flow_node *new_session_node = flow_table_insert_with_timestamp(&normalized_key, packet_timestamp);
-                if (new_session_node) {
-                                    // 设置原始端口号和IP地址 - 根据标准化结果调整
-                if (is_reverse) {
-                    // 如果标准化时交换了IP地址，原始端口号也要相应交换
-                    new_session_node->original_src_port = original_dst_port;
-                    new_session_node->original_dst_port = original_src_port;
-                    new_session_node->original_src_ip = original_dst_ip;
-                    new_session_node->original_dst_ip = original_src_ip;
-                } else {
-                    // 没有交换，使用原始值
-                    new_session_node->original_src_port = original_src_port;
-                    new_session_node->original_dst_port = original_dst_port;
-                    new_session_node->original_src_ip = original_src_ip;
-                    new_session_node->original_dst_ip = original_dst_ip;
-                }
+                // **更保守的新会话创建策略**: 只在真正需要时才创建新会话
+                if (node->stats.session_completed || 
+                    (packet_timestamp - node->last_packet_time > 600000000000ULL)) { // 10分钟无活动
                     
-                    // 初始化TCP相关字段
-                    if ((tcp_flags & TCP_FLAG_SYN)) {
-                        new_session_node->stats.tcp_base_seq_set = true;
+                    struct flow_node *new_session_node = flow_table_insert_with_timestamp(&normalized_key, packet_timestamp);
+                    if (new_session_node) {
+                        // 设置原始端口号和IP地址 - 根据标准化结果调整
+                        if (is_reverse) {
+                            // 如果标准化时交换了IP地址，原始端口号也要相应交换
+                            new_session_node->original_src_port = original_dst_port;
+                            new_session_node->original_dst_port = original_src_port;
+                            new_session_node->original_src_ip = original_dst_ip;
+                            new_session_node->original_dst_ip = original_src_ip;
+                        } else {
+                            // 没有交换，使用原始值
+                            new_session_node->original_src_port = original_src_port;
+                            new_session_node->original_dst_port = original_dst_port;
+                            new_session_node->original_src_ip = original_src_ip;
+                            new_session_node->original_dst_ip = original_dst_ip;
+                        }
+                        
+                        // 初始化TCP相关字段
+                        if ((tcp_flags & TCP_FLAG_SYN)) {
+                            new_session_node->stats.tcp_base_seq_set = true;
+                        }
+                        
+                        // 更新对话完整性
+                        update_conversation_completeness(new_session_node, tcp_flags);
+                        
+                        return &new_session_node->stats;
                     }
-                    
-                    // 更新对话完整性
-                    update_conversation_completeness(new_session_node, tcp_flags);
-                    
-                    return &new_session_node->stats;
+                } else {
+                    // 即使有SYN包，也继续使用现有会话
+                    log_debug("Continue using existing session, not creating new session");
                 }
             }
             
             // 更新现有会话的时间戳和完整性
             node->stats.last_seen = packet_timestamp;
             node->last_packet_time = packet_timestamp;
+            
+            sessions_reused++; // 统计会话重用次数
             
             if (key->protocol == IPPROTO_TCP) {
                 if (!node->stats.tcp_base_seq_set && (tcp_flags & TCP_FLAG_SYN)) {
@@ -536,7 +615,7 @@ struct flow_stats* get_or_create_conversation(const struct flow_key *key, int *i
             // 更新对话完整性
             update_conversation_completeness(node, tcp_flags);
             
-            DEBUG_PRINT(3, "DEBUG: 命中现有 node: %p, 返回 stats: %p\n", (void*)node, (void*)&node->stats);
+            log_debug("hit existing node: %p, returns stats: %p", (void*)node, (void*)&node->stats);
             return &node->stats;
         }
         node = node->next;
@@ -544,10 +623,11 @@ struct flow_stats* get_or_create_conversation(const struct flow_key *key, int *i
     
     // 创建新会话
     struct flow_node *new_node = flow_table_insert_with_timestamp(&normalized_key, packet_timestamp);
-    DEBUG_PRINT(3, "DEBUG: 新建 new_node: %p, 返回 stats: %p\n", (void*)new_node, (void*)&new_node->stats);
     if (!new_node) {
+        log_debug("Failed to create new flow node");
         return NULL;
     }
+    log_debug("new new_node: %p, returns stats: %p", (void*)new_node, (void*)&new_node->stats);
     
     // 设置原始端口号和IP地址 - 根据标准化结果调整
     if (is_reverse) {
@@ -572,6 +652,14 @@ struct flow_stats* get_or_create_conversation(const struct flow_key *key, int *i
     // 更新对话完整性
     update_conversation_completeness(new_node, tcp_flags);
     
+    // 更新会话创建统计
+    total_sessions_created++;
+    if (key->protocol == IPPROTO_TCP) {
+        tcp_sessions_created++;
+    } else if (key->protocol == IPPROTO_UDP) {
+        udp_sessions_created++;
+    }
+    
     return &new_node->stats;
 }
 
@@ -579,6 +667,12 @@ struct flow_stats* get_or_create_conversation(const struct flow_key *key, int *i
 
 void update_flow_stats(struct flow_stats *stats, uint32_t pkt_size, int is_reverse, uint64_t packet_timestamp) {
     if (!stats) return;
+    
+    // 检查程序是否正在关闭
+    if (is_shutdown_requested()) {
+        log_debug("Skipping flow stats update during shutdown");
+        return;
+    }
     
     // 如果是第一次更新，设置first_seen
     if (stats->first_seen == 0) {
@@ -621,6 +715,12 @@ void update_flow_stats(struct flow_stats *stats, uint32_t pkt_size, int is_rever
 void update_udp_stats(struct flow_stats *stats, uint32_t pkt_size, int is_reverse, uint64_t packet_timestamp) {
     if (!stats) return;
     
+    // 检查程序是否正在关闭
+    if (is_shutdown_requested()) {
+        log_debug("Skipping UDP stats update during shutdown");
+        return;
+    }
+    
     if (is_reverse) {
         stats->udp.bwd_packets++;
         stats->udp.bwd_bytes += pkt_size;
@@ -651,32 +751,23 @@ void update_udp_stats(struct flow_stats *stats, uint32_t pkt_size, int is_revers
 void process_packet(const struct iphdr *ip, const void *transport_hdr, uint64_t packet_timestamp) {
     if (!ip || !transport_hdr) return;
     
+    // 检查程序是否正在关闭
+    if (is_shutdown_requested()) {
+        log_debug("Skipping packet processing during shutdown");
+        return;
+    }
+    
     struct flow_key key = {0};
     key.src_ip = ip->saddr;
     key.dst_ip = ip->daddr;
     key.protocol = ip->protocol;
-    
-    // 添加详细调试信息，检查IP地址原始字节和主机序
-    // static int debug_count = 0;
-    // if (debug_count < 10) {
-    //     char src_ip_str[INET_ADDRSTRLEN];
-    //     char dst_ip_str[INET_ADDRSTRLEN];
-    //     inet_ntop(AF_INET, &ip->saddr, src_ip_str, sizeof(src_ip_str));
-    //     inet_ntop(AF_INET, &ip->daddr, dst_ip_str, sizeof(dst_ip_str));
-    //     printf("DEBUG: Packet %d - src raw: %08x, dst raw: %08x | src host: %08x, dst host: %08x | %s -> %s\n",
-    //         debug_count + 1,
-    //         ip->saddr, ip->daddr,
-    //         ntohl(ip->saddr), ntohl(ip->daddr),
-    //         src_ip_str, dst_ip_str);
-    //     debug_count++;
-    // }
     
     uint8_t flags = 0;
     
     // 使用协议处理函数
     if (protocol_handlers[ip->protocol]) {
         protocol_handlers[ip->protocol](transport_hdr, &key, &flags);
-        } else {
+    } else {
         handle_unknown(transport_hdr, &key, &flags);
     }
     
@@ -701,51 +792,30 @@ void process_packet(const struct iphdr *ip, const void *transport_hdr, uint64_t 
         if (key.protocol == IPPROTO_UDP) {
             update_udp_stats(stats, pkt_size, is_reverse, packet_timestamp);
         }
+        
+        // 优化：只在会话不存在时才创建会话，避免重复创建
+        static uint64_t last_session_check_time = 0;
+        uint64_t current_time = get_current_time();
+        
+        // 每100ms检查一次会话，而不是每个包都检查
+        if (current_time - last_session_check_time > 100000000ULL) { // 100ms in nanoseconds
+            transport_session_t *session = process_packet_with_conversation(&key, pkt_size, flags, packet_timestamp);
+            if (session) {
+                // 计算会话特征
+                calculate_session_features(session);
+            }
+            last_session_check_time = current_time;
+        }
     }
 }
 
 // =================== Wireshark风格的统计函数 ===================
 
-int count_wireshark_tcp_conversations() {
-    return get_tcp_conversation_count();
-}
 
-int count_wireshark_all_conversations() {
-    return get_total_conversation_count();
-}
 
-void count_tcp_conversations_by_completeness(int *complete, int *incomplete, int *partial) {
-    if (!complete || !incomplete || !partial) return;
-    
-    *complete = 0;
-    *incomplete = 0; 
-    *partial = 0;
-    
-    for (int i = 0; i < HASH_TABLE_SIZE; i++) {
-        struct flow_node *node = flow_table[i];
-        while (node) {
-            if (node->key.protocol == IPPROTO_TCP) {
-                uint8_t completeness = node->completeness;
-                
-                // 完整对话：有完整的三次握手（SYN -> SYN+ACK -> ACK）
-                if ((completeness & TCP_COMPLETENESS_SYNSENT) &&
-                    (completeness & TCP_COMPLETENESS_SYNACK) &&
-                    (completeness & TCP_COMPLETENESS_ACK)) {
-                    (*complete)++;
-                } 
-                // 部分对话：有一些TCP活动但不是完整的三次握手
-                else if (completeness != 0) {
-                    (*partial)++;
-                }
-                // 不完整对话：没有任何TCP完整性标志
-                else {
-                    (*incomplete)++;
-                }
-            }
-            node = node->next;
-        }
-    }
-}
+
+
+
 
 void print_wireshark_conversation_stats() {
     printf("\n================== Wireshark风格对话统计 ==================\n");
@@ -785,15 +855,7 @@ void print_wireshark_conversation_stats() {
     verify_tshark_style_counting();
 }
 
-// =================== 向后兼容函数 ===================
 
-int count_tshark_tcp_conversations() {
-    return get_tcp_conversation_count();
-}
-
-int count_tshark_udp_conversations() {
-    return get_udp_conversation_count();
-}
 
 int count_all_flows() {
     if (!flow_table_initialized) return 0;
@@ -850,27 +912,110 @@ void flow_table_destroy() {
     
     flow_table_initialized = 0;
     
-    DEBUG_PRINT(1, "流表销毁完成，所有计数器已重置\n");
+    log_info("Flow table destroyed, all counters reset");
 }
 
 void cleanup_flows() {
-    // 在这个简化版本中，我们不进行超时清理
-    // 如果需要，可以在这里添加基于时间的清理逻辑
+    if (!flow_table_initialized) return;
+    
+    uint64_t current_time = get_current_time();
+    
+    // 检查内存池使用情况，动态调整清理策略
+    size_t total_nodes, free_nodes, used_nodes;
+    mempool_get_stats(&global_pool, &total_nodes, &free_nodes, &used_nodes);
+    double usage_ratio = (double)used_nodes / total_nodes;
+    
+    // 根据内存使用情况调整超时时间 - 更激进的清理
+    uint64_t timeout;
+    if (usage_ratio > 0.8) {
+        timeout = ACTIVE_TIMEOUT_NS / 16; // 极其激进：使用1/16的超时时间
+    } else if (usage_ratio > 0.6) {
+        timeout = ACTIVE_TIMEOUT_NS / 8; // 非常激进：使用1/8的超时时间
+    } else if (usage_ratio > 0.4) {
+        timeout = ACTIVE_TIMEOUT_NS / 4; // 激进：使用1/4的超时时间
+    } else {
+        timeout = ACTIVE_TIMEOUT_NS / 2; // 标准：使用一半的超时时间
+    }
+    
+    int cleaned_count = 0;
+    
+    for (int i = 0; i < HASH_TABLE_SIZE; i++) {
+        struct flow_node *node = flow_table[i];
+        struct flow_node *prev = NULL;
+        
+        while (node) {
+            struct flow_node *next = node->next;
+            
+            // 检查流是否超时 - 更激进的清理条件
+            bool should_cleanup = false;
+            
+            // 条件1：超过超时时间
+            if (current_time - node->last_packet_time > timeout) {
+                should_cleanup = true;
+            }
+            
+            // 条件2：内存使用率很高时，清理更多流
+            if (usage_ratio > 0.5 && current_time - node->last_packet_time > ACTIVE_TIMEOUT_NS / 8) {
+                should_cleanup = true;
+            }
+            
+            // 条件3：会话已完成的流
+            if (node->stats.session_completed && current_time - node->last_packet_time > 30000000000ULL) {
+                should_cleanup = true;
+            }
+            
+            // 条件4：内存使用率极高时，清理所有不活跃的流
+            if (usage_ratio > 0.9 && current_time - node->last_packet_time > 10000000000ULL) {
+                should_cleanup = true;
+            }
+            
+            if (should_cleanup) {
+                // 从链表中移除节点
+                if (prev) {
+                    prev->next = next;
+                } else {
+                    flow_table[i] = next;
+                }
+                
+                // 释放时间戳数组内存
+                timestamp_array_free(&node->stats.fwd_timestamps);
+                timestamp_array_free(&node->stats.bwd_timestamps);
+                timestamp_array_free(&node->stats.udp.fwd_timestamps);
+                timestamp_array_free(&node->stats.udp.bwd_timestamps);
+                
+                // 释放active和idle数组内存
+                if (node->stats.active) {
+                    free(node->stats.active);
+                    node->stats.active = NULL;
+                    node->stats.active_count = 0;
+                }
+                if (node->stats.idle) {
+                    free(node->stats.idle);
+                    node->stats.idle = NULL;
+                    node->stats.idle_count = 0;
+                }
+                
+                // 返回到内存池
+                mempool_free(&global_pool, node);
+                cleaned_count++;
+            } else {
+                prev = node;
+            }
+            
+            node = next;
+        }
+    }
+    
+    if (cleaned_count > 0) {
+        log_info("Cleaned up %d inactive flows (memory usage: %.1f%%)", cleaned_count, usage_ratio * 100.0);
+    }
 }
 
 // =================== 简单统计函数 ===================
 
-void print_simple_stats() {
-    printf("流统计: TCP对话=%u, UDP对话=%u, 总对话=%u\n", 
-           get_tcp_conversation_count(), 
-           get_udp_conversation_count(), 
-           get_total_conversation_count());
-}
 
-void print_flow_stats() {
-    // 移除重复的Wireshark统计调用，只在print_final_stats中调用一次
-    // print_wireshark_conversation_stats();
-}
+
+
 
 // =================== 缺失的函数实现 ===================
 
@@ -897,57 +1042,9 @@ int count_active_flows() {
     return active_count;
 }
 
-void count_flow_directions(int *forward_flows, int *reverse_flows) {
-    if (!forward_flows || !reverse_flows) return;
-    
-    *forward_flows = 0;
-    *reverse_flows = 0;
-    
-    if (!flow_table_initialized) return;
-    
-    uint64_t current_time = get_current_time();
-    
-    for (int i = 0; i < HASH_TABLE_SIZE; i++) {
-        struct flow_node *node = flow_table[i];
-        while (node) {
-            // 使用ACTIVE_TIMEOUT_NS作为活跃流的判断标准
-            uint64_t timeout = ACTIVE_TIMEOUT_NS;
-            
-            // 只统计活跃流
-            if (current_time - node->last_packet_time <= timeout) {
-                // 简单的方向判断：如果正向包数更多，认为是正向流
-                if (node->stats.fwd_packets >= node->stats.bwd_packets) {
-                    (*forward_flows)++;
-                } else {
-                    (*reverse_flows)++;
-                }
-            }
-            node = node->next;
-        }
-    }
-}
 
-void count_all_flow_directions(int *forward_flows, int *reverse_flows) {
-    if (!forward_flows || !reverse_flows) return;
-    
-    *forward_flows = 0;
-    *reverse_flows = 0;
-    
-    if (!flow_table_initialized) return;
-    
-    for (int i = 0; i < HASH_TABLE_SIZE; i++) {
-        struct flow_node *node = flow_table[i];
-        while (node) {
-            // 统计所有流，不考虑是否活跃
-            if (node->stats.fwd_packets >= node->stats.bwd_packets) {
-                (*forward_flows)++;
-            } else {
-                (*reverse_flows)++;
-            }
-            node = node->next;
-        }
-    }
-}
+
+
 
 double time_diff(const struct timespec *end, const struct timespec *start) {
     if (!end || !start) return 0.0;
@@ -1194,68 +1291,9 @@ void calculate_flow_features(const struct flow_stats *stats, struct flow_feature
     features->pkt_len_va = 0; // 如有包到达间隔可计算，否则置0
 }
 
-// 添加新的TCP会话统计函数，基于会话完成度
-int count_tcp_sessions_by_lifecycle() {
-    if (!flow_table_initialized) return 0;
-    
-    int session_count = 0;
-    
-    for (int i = 0; i < HASH_TABLE_SIZE; i++) {
-        struct flow_node *node = flow_table[i];
-        while (node) {
-            if (node->key.protocol == IPPROTO_TCP) {
-                // 每个TCP流节点代表一个会话实例
-                // 不管完整性如何，只要有TCP活动就算一个会话
-                session_count++;
-            }
-            node = node->next;
-        }
-    }
-    
-    return session_count;
-}
 
-// 按照TCP会话状态分类统计
-void count_tcp_sessions_by_state(int *init_sessions, int *established_sessions, 
-                                 int *closing_sessions, int *reset_sessions, int *unknown_sessions) {
-    if (!init_sessions || !established_sessions || !closing_sessions || 
-        !reset_sessions || !unknown_sessions) return;
-    
-    *init_sessions = 0;
-    *established_sessions = 0;
-    *closing_sessions = 0;
-    *reset_sessions = 0;
-    *unknown_sessions = 0;
-    
-    for (int i = 0; i < HASH_TABLE_SIZE; i++) {
-        struct flow_node *node = flow_table[i];
-        while (node) {
-            if (node->key.protocol == IPPROTO_TCP) {
-                switch (node->tcp_state) {
-                    case TCP_CONV_INIT:
-                        (*init_sessions)++;
-                        break;
-                    case TCP_CONV_ESTABLISHED:
-                        (*established_sessions)++;
-                        break;
-                    case TCP_CONV_CLOSING:
-                        (*closing_sessions)++;
-                        break;
-                    case TCP_CONV_RESET:
-                        (*reset_sessions)++;
-                        break;
-                    case TCP_CONV_CLOSED:
-                        (*closing_sessions)++;
-                        break;
-                    default:
-                        (*unknown_sessions)++;
-                    break;
-                }
-            }
-            node = node->next;
-        }
-    }
-}
+
+
 
 // =================== Wireshark风格的UDP对话管理 ===================
 
@@ -1293,6 +1331,12 @@ uint32_t get_next_udp_stream_id() {
  * 基于find_or_create_conversation_strat()的逻辑
  */
 struct flow_stats* get_or_create_udp_conversation(const struct flow_key *key, int *is_reverse_ptr, uint64_t packet_timestamp) {
+    // 检查程序是否正在关闭
+    if (is_shutdown_requested()) {
+        log_debug("Skipping UDP conversation creation during shutdown");
+        return NULL;
+    }
+    
     // 标准化流键 - 确保较小的IP地址作为源地址
     struct flow_key normalized_key;
     bool is_reverse = false;
@@ -1324,6 +1368,18 @@ struct flow_stats* get_or_create_udp_conversation(const struct flow_key *key, in
     struct flow_node *node = flow_table[idx];
     
     while (node) {
+        // 移除 is_shutdown_requested() 检查，允许遍历所有节点
+        // if (is_shutdown_requested()) {
+        //     log_debug("Skipping UDP flow lookup during shutdown");
+        //     return NULL;
+        // }
+        // 验证节点指针的有效性
+        if (!node || (uintptr_t)node < 0x1000) {
+            log_debug("Invalid UDP node pointer detected, skipping");
+            node = node->next;
+            continue;
+        }
+        
         if (memcmp(&node->key, &normalized_key, sizeof(struct flow_key)) == 0) {
             // 找到现有UDP会话
             // **Wireshark风格**: UDP会话一旦创建就保持稳定，不轻易重置
@@ -1332,7 +1388,7 @@ struct flow_stats* get_or_create_udp_conversation(const struct flow_key *key, in
             node->stats.last_seen = packet_timestamp;
             node->last_packet_time = packet_timestamp;
             
-            DEBUG_PRINT(3, "重用UDP会话: stream_id=%u\n", node->stats.udp_conversation_id);
+            log_debug("Reusing UDP session: stream_id=%u", node->stats.udp_conversation_id);
             return &node->stats;
         }
         node = node->next;
@@ -1367,6 +1423,10 @@ struct flow_stats* get_or_create_udp_conversation(const struct flow_key *key, in
     new_node->first_packet_time = packet_timestamp;
     new_node->last_packet_time = packet_timestamp;
     
+    // 更新会话创建统计
+    total_sessions_created++;
+    udp_sessions_created++;
+    
     return &new_node->stats;
 }
 
@@ -1397,7 +1457,7 @@ int verify_udp_conversation_count() {
         }
     }
     
-    DEBUG_PRINT(2, "UDP对话计数验证: 计数器=%u, 手动统计=%d\n", 
+    log_debug("UDP conversation count verification: counter=%u, manual count=%d", 
                udp_stream_counter, manual_count);
     
     return manual_count;
@@ -1406,41 +1466,7 @@ int verify_udp_conversation_count() {
 /**
  * 打印UDP对话详细信息 - 类似Wireshark的conversation table
  */
-void print_udp_conversation_details() {
-    printf("\nUDP对话详情 (类似Wireshark conversation table):\n");
-    printf("%-15s %-6s %-15s %-6s %-8s %-8s %-8s %-8s %-10s\n",
-           "地址A", "端口A", "地址B", "端口B", "包数A→B", "字节A→B", "包数B→A", "字节B→A", "流ID");
-    printf("=============== ====== =============== ====== ======== ======== ======== ======== ==========\n");
-    
-    int udp_conv_printed = 0;
-    
-    for (int i = 0; i < HASH_TABLE_SIZE && udp_conv_printed < 15; i++) {
-        struct flow_node *node = flow_table[i];
-        while (node && udp_conv_printed < 15) {
-            if (node->key.protocol == IPPROTO_UDP && node->stats.udp_conversation_id > 0) {
-                struct in_addr src_addr = {.s_addr = node->key.src_ip};
-                struct in_addr dst_addr = {.s_addr = node->key.dst_ip};
-                
-                printf("%-15s %-6u %-15s %-6u %-8lu %-8lu %-8lu %-8lu %-10u\n",
-                       inet_ntoa(src_addr), node->original_src_port,
-                       inet_ntoa(dst_addr), node->original_dst_port,
-                       node->stats.fwd_packets, node->stats.fwd_bytes,
-                       node->stats.bwd_packets, node->stats.bwd_bytes,
-                       node->stats.udp_conversation_id);
-                
-                udp_conv_printed++;
-            }
-            node = node->next;
-        }
-    }
-    
-    if (udp_conv_printed == 15 && udp_stream_counter > 15) {
-        printf("... (显示前15个UDP对话，总共%u个)\n", udp_stream_counter);
-    }
-    
-    printf("\n注意: 此统计基于Wireshark的UDP stream机制\n");
-    printf("每个唯一的UDP 5-tuple创建一个稳定的stream ID\n");
-}
+
 
 // =================== 五元组会话统计函数 ===================
 
@@ -1699,274 +1725,8 @@ void count_sessions_by_five_tuple() {
     }
 }
 
-// =================== Wireshark风格的会话打印函数 ===================
 
-/**
- * 按照Wireshark的会话生成方式打印所有会话
- * 基于Wireshark的conversation table机制
- */
-void print_all_wireshark_sessions() {
-    printf("\n================== Wireshark风格会话表 ==================\n");
-    printf("基于Wireshark conversation table机制的完整会话列表\n\n");
-    
-    // 统计各类会话数量
-    uint32_t tcp_sessions = 0, udp_sessions = 0, other_sessions = 0;
-    uint32_t total_sessions = 0;
-    
-    // 首先统计各协议的会话数量
-    for (int i = 0; i < HASH_TABLE_SIZE; i++) {
-        struct flow_node *node = flow_table[i];
-        while (node) {
-            total_sessions++;
-            switch (node->key.protocol) {
-                case IPPROTO_TCP:
-                    tcp_sessions++;
-                    break;
-                case IPPROTO_UDP:
-                    udp_sessions++;
-                    break;
-                default:
-                    other_sessions++;
-                    break;
-            }
-            node = node->next;
-        }
-    }
-    
-    printf("会话统计概览:\n");
-    printf("  TCP会话: %u (基于连接状态和完整性)\n", tcp_sessions);
-    printf("  UDP会话: %u (基于稳定的stream ID)\n", udp_sessions);
-    printf("  其他协议会话: %u\n", other_sessions);
-    printf("  总会话数: %u\n", total_sessions);
-    printf("\n");
-    
-    if (total_sessions == 0) {
-        printf("未检测到任何会话\n");
-        printf("================== 会话表结束 ==================\n");
-        return;
-    }
-    
-    // 打印详细的会话表头
-    printf("详细会话表 (按照Wireshark conversation table格式):\n");
-    printf("%-4s %-15s %-6s %-15s %-6s %-8s %-10s %-10s %-10s %-10s %-12s %-12s %-10s %-15s\n",
-           "ID", "地址A", "端口A", "地址B", "端口B", "协议", "包数A→B", "字节A→B", "包数B→A", "字节B→A", 
-           "总包数", "总字节数", "持续时间", "会话状态");
-    printf("==== =============== ====== =============== ====== ======== ========== ========== ========== ========== ============ ============ ========== ===============\n");
-    
-    uint32_t session_id = 1;
-    
-    // TCP会话详情 (按照Wireshark的TCP conversation逻辑)
-    for (int i = 0; i < HASH_TABLE_SIZE; i++) {
-        struct flow_node *node = flow_table[i];
-        while (node) {
-            if (node->key.protocol == IPPROTO_TCP) {
-                
-                // 计算会话持续时间 (毫秒)
-                double duration_ms = 0.0;
-                if (node->last_packet_time > node->first_packet_time) {
-                    duration_ms = (node->last_packet_time - node->first_packet_time) / 1000000.0;
-                }
-                
-                // 总流量统计
-                uint64_t total_packets = node->stats.fwd_packets + node->stats.bwd_packets;
-                uint64_t total_bytes = node->stats.fwd_bytes + node->stats.bwd_bytes;
-                
-                // TCP会话状态 (基于Wireshark的TCP分析)
-                const char *session_state;
-                if (node->stats.session_completed) {
-                    if (node->tcp_state == TCP_CONV_RESET) {
-                        session_state = "RESET";
-                    } else if (node->tcp_state == TCP_CONV_CLOSING) {
-                        session_state = "CLOSED";
-                    } else {
-                        session_state = "COMPLETED";
-                    }
-                } else {
-                    switch (node->tcp_state) {
-                        case TCP_CONV_INIT:
-                            session_state = "INIT";
-                            break;
-                        case TCP_CONV_ESTABLISHED:
-                            session_state = "ESTABLISHED";
-                            break;
-                        case TCP_CONV_CLOSING:
-                            session_state = "CLOSING";
-                            break;
-                        default:
-                            session_state = "UNKNOWN";
-                            break;
-                    }
-                }
-                
-                char src_ip_str[INET_ADDRSTRLEN];
-                char dst_ip_str[INET_ADDRSTRLEN];
-                inet_ntop(AF_INET, &node->key.src_ip, src_ip_str, sizeof(src_ip_str));
-                inet_ntop(AF_INET, &node->key.dst_ip, dst_ip_str, sizeof(dst_ip_str));
-                
-                printf("%-4u %-15s %-6u %-15s %-6u %-8s %-10lu %-10lu %-10lu %-10lu %-12lu %-12lu %-10.2f %-15s\n",
-                       session_id,
-                       src_ip_str, node->original_src_port,
-                       dst_ip_str, node->original_dst_port,
-                       "TCP",
-                       node->stats.fwd_packets, node->stats.fwd_bytes,
-                       node->stats.bwd_packets, node->stats.bwd_bytes,
-                       total_packets, total_bytes,
-                       duration_ms, session_state);
-                
-                session_id++;
-            }
-            node = node->next;
-        }
-    }
-    
-    // UDP会话详情 (按照Wireshark的UDP stream逻辑)
-    for (int i = 0; i < HASH_TABLE_SIZE; i++) {
-        struct flow_node *node = flow_table[i];
-        while (node) {
-            if (node->key.protocol == IPPROTO_UDP) {
-                
-                char src_ip_str[INET_ADDRSTRLEN];
-                char dst_ip_str[INET_ADDRSTRLEN];
-                inet_ntop(AF_INET, &node->key.src_ip, src_ip_str, sizeof(src_ip_str));
-                inet_ntop(AF_INET, &node->key.dst_ip, dst_ip_str, sizeof(dst_ip_str));
-                
-                // 计算会话持续时间 (毫秒)
-                double duration_ms = 0.0;
-                if (node->last_packet_time > node->first_packet_time) {
-                    duration_ms = (node->last_packet_time - node->first_packet_time) / 1000000.0;
-                }
-                
-                // 总流量统计
-                uint64_t total_packets = node->stats.fwd_packets + node->stats.bwd_packets;
-                uint64_t total_bytes = node->stats.fwd_bytes + node->stats.bwd_bytes;
-                
-                // UDP会话状态 (基于Wireshark的UDP stream机制)
-                char session_state[32];
-                if (node->stats.udp_conversation_id > 0) {
-                    snprintf(session_state, sizeof(session_state), "STREAM_%u", node->stats.udp_conversation_id);
-                } else {
-                    strcpy(session_state, "NO_STREAM");
-                }
-                
-                printf("%-4u %-15s %-6u %-15s %-6u %-8s %-10lu %-10lu %-10lu %-10lu %-12lu %-12lu %-10.2f %-15s\n",
-                       session_id,
-                       src_ip_str, node->original_src_port,
-                       dst_ip_str, node->original_dst_port,
-                       "UDP",
-                       node->stats.fwd_packets, node->stats.fwd_bytes,
-                       node->stats.bwd_packets, node->stats.bwd_bytes,
-                       total_packets, total_bytes,
-                       duration_ms, session_state);
-                
-                session_id++;
-            }
-            node = node->next;
-        }
-    }
-    
-    // 其他协议会话详情
-    for (int i = 0; i < HASH_TABLE_SIZE; i++) {
-        struct flow_node *node = flow_table[i];
-        while (node) {
-            if (node->key.protocol != IPPROTO_TCP && node->key.protocol != IPPROTO_UDP) {
-                
-                char src_ip_str[INET_ADDRSTRLEN];
-                char dst_ip_str[INET_ADDRSTRLEN];
-                inet_ntop(AF_INET, &node->key.src_ip, src_ip_str, sizeof(src_ip_str));
-                inet_ntop(AF_INET, &node->key.dst_ip, dst_ip_str, sizeof(dst_ip_str));
-                
-                // 计算会话持续时间 (毫秒)
-                double duration_ms = 0.0;
-                if (node->last_packet_time > node->first_packet_time) {
-                    duration_ms = (node->last_packet_time - node->first_packet_time) / 1000000.0;
-                }
-                
-                // 总流量统计
-                uint64_t total_packets = node->stats.fwd_packets + node->stats.bwd_packets;
-                uint64_t total_bytes = node->stats.fwd_bytes + node->stats.bwd_bytes;
-                
-                // 协议名称
-                const char *protocol_name;
-                switch (node->key.protocol) {
-                    case IPPROTO_ICMP:
-                        protocol_name = "ICMP";
-                        break;
-                    case IPPROTO_IGMP:
-                        protocol_name = "IGMP";
-                        break;
-                    case IPPROTO_GRE:
-                        protocol_name = "GRE";
-                        break;
-                    case IPPROTO_ESP:
-                        protocol_name = "ESP";
-                        break;
-                    case IPPROTO_AH:
-                        protocol_name = "AH";
-                        break;
-                    case IPPROTO_SCTP:
-                        protocol_name = "SCTP";
-                        break;
-                    default:
-                        protocol_name = "OTHER";
-                        break;
-                }
-                
-                printf("%-4u %-15s %-6u %-15s %-6u %-8s %-10lu %-10lu %-10lu %-10lu %-12lu %-12lu %-10.2f %-15s\n",
-                       session_id,
-                       src_ip_str, node->original_src_port,
-                       dst_ip_str, node->original_dst_port,
-                       protocol_name,
-                       node->stats.fwd_packets, node->stats.fwd_bytes,
-                       node->stats.bwd_packets, node->stats.bwd_bytes,
-                       total_packets, total_bytes,
-                       duration_ms, "ACTIVE");
-                
-                session_id++;
-            }
-            node = node->next;
-        }
-    }
-    
-    printf("\n");
-    printf("会话生成规则说明 (基于Wireshark机制):\n");
-    printf("• TCP会话: 基于5-tuple + 连接状态，支持会话重用和状态跟踪\n");
-    printf("• UDP会话: 基于5-tuple + 稳定的stream ID，每个唯一5-tuple一个stream\n");
-    printf("• 其他协议: 基于5-tuple，简单的双向流统计\n");
-    printf("• 会话ID分配: TCP和UDP分别使用独立的计数器\n");
-    printf("• 状态跟踪: TCP支持完整的连接生命周期，UDP使用stream机制\n");
-    printf("\n");
-    
-    // 打印会话完整性分析 (仅适用于TCP)
-    if (tcp_sessions > 0) {
-        int complete_tcp = 0, incomplete_tcp = 0, partial_tcp = 0;
-        count_tcp_conversations_by_completeness(&complete_tcp, &incomplete_tcp, &partial_tcp);
-        
-        printf("TCP会话完整性分析:\n");
-        printf("  完整会话 (完整三次握手): %d (%.1f%%)\n", 
-               complete_tcp, tcp_sessions > 0 ? (complete_tcp * 100.0 / tcp_sessions) : 0.0);
-        printf("  部分会话 (部分TCP活动): %d (%.1f%%)\n", 
-               partial_tcp, tcp_sessions > 0 ? (partial_tcp * 100.0 / tcp_sessions) : 0.0);
-        printf("  不完整会话 (仅基本连接): %d (%.1f%%)\n", 
-               incomplete_tcp, tcp_sessions > 0 ? (incomplete_tcp * 100.0 / tcp_sessions) : 0.0);
-        printf("\n");
-    }
-    
-    // 打印UDP stream验证信息
-    if (udp_sessions > 0) {
-        int udp_manual_count = verify_udp_conversation_count();
-        printf("UDP Stream验证:\n");
-        printf("  计数器显示: %u streams\n", get_udp_conversation_count());
-        printf("  实际统计: %d streams\n", udp_manual_count);
-        if ((uint32_t)udp_manual_count == get_udp_conversation_count()) {
-            printf("  ✅ UDP stream计数一致性验证通过\n");
-        } else {
-            printf("  ⚠️  UDP stream计数不一致\n");
-        }
-        printf("\n");
-    }
-    
-    printf("================== 会话表结束 ==================\n");
-}
+
 
 
 // **新增**: 专门的tshark风格会话计数函数
@@ -1978,12 +1738,12 @@ int count_tshark_style_tcp_sessions() {
         while (node) {
             if (node->key.protocol == IPPROTO_TCP && node->in_use) {
                 session_count++;
-                DEBUG_PRINT(3, "tshark计数: TCP会话 %s:%d -> %s:%d (ID: %u)\n",
-                           inet_ntoa((struct in_addr){.s_addr = node->key.src_ip}),
-                           node->key.src_port,
-                           inet_ntoa((struct in_addr){.s_addr = node->key.dst_ip}),
-                           node->key.dst_port,
-                           node->stats.tcp_conversation_id);
+                log_debug("tshark count: TCP session %s:%d -> %s:%d (ID: %u)",
+                            inet_ntoa((struct in_addr){.s_addr = node->key.src_ip}),
+                            node->key.src_port,
+                            inet_ntoa((struct in_addr){.s_addr = node->key.dst_ip}),
+                            node->key.dst_port,
+                            node->stats.tcp_conversation_id);
             }
             node = node->next;
         }
@@ -2013,6 +1773,12 @@ void verify_tshark_style_counting() {
 void update_tcp_flags(struct flow_stats *stats, uint8_t tcp_flags, int is_reverse) {
     if (!stats) return;
     
+    // 检查程序是否正在关闭
+    if (is_shutdown_requested()) {
+        log_debug("Skipping TCP flags update during shutdown");
+        return;
+    }
+    
     if (is_reverse) {
         // 反向流标志统计
         if (tcp_flags & TCP_FIN) stats->tcp_flags.bwd_fin_count++;
@@ -2039,14 +1805,24 @@ void update_tcp_flags(struct flow_stats *stats, uint8_t tcp_flags, int is_revers
 void update_active_idle(struct flow_stats *stats, uint64_t current_time) {
     if (!stats) return;
     
-    // 初始化活跃/空闲时间数组
+    // 检查程序是否正在关闭
+    if (is_shutdown_requested()) {
+        log_debug("Skipping active/idle update during shutdown");
+        return;
+    }
+    
+    // 初始化活跃/空闲时间数组（只在第一次调用时分配）
     if (!stats->active) {
         stats->active = malloc(MAX_TIMESTAMPS * sizeof(uint64_t));
-        stats->active_count = 0;
+        if (stats->active) {
+            stats->active_count = 0;
+        }
     }
     if (!stats->idle) {
         stats->idle = malloc(MAX_TIMESTAMPS * sizeof(uint64_t));
-        stats->idle_count = 0;
+        if (stats->idle) {
+            stats->idle_count = 0;
+        }
     }
     
     // 计算与上一个包的时间间隔
@@ -2055,12 +1831,12 @@ void update_active_idle(struct flow_stats *stats, uint64_t current_time) {
         
         if (time_diff <= ACTIVE_TIMEOUT_NS) {
             // 活跃状态
-            if (stats->active_count < MAX_TIMESTAMPS) {
+            if (stats->active && stats->active_count < MAX_TIMESTAMPS) {
                 stats->active[stats->active_count++] = time_diff;
             }
         } else {
             // 空闲状态
-            if (stats->idle_count < MAX_TIMESTAMPS) {
+            if (stats->idle && stats->idle_count < MAX_TIMESTAMPS) {
                 stats->idle[stats->idle_count++] = time_diff;
             }
         }
@@ -2072,95 +1848,12 @@ void update_active_idle(struct flow_stats *stats, uint64_t current_time) {
 
 // =================== 会话时间记录函数 ===================
 
-/**
- * 打印所有会话的开始和结束时间信息
- */
-void print_session_timing_info() {
-    printf("\n================== 会话时间记录信息 ==================\n");
-    printf("每个会话的开始和结束时间:\n\n");
-    
-    int session_count = 0;
-    
-    for (int i = 0; i < HASH_TABLE_SIZE; i++) {
-        struct flow_node *node = flow_table[i];
-        while (node) {
-            session_count++;
-            
-            // 获取IP地址字符串
-            char src_ip_str[INET_ADDRSTRLEN];
-            char dst_ip_str[INET_ADDRSTRLEN];
-            inet_ntop(AF_INET, &node->key.src_ip, src_ip_str, sizeof(src_ip_str));
-            inet_ntop(AF_INET, &node->key.dst_ip, dst_ip_str, sizeof(dst_ip_str));
-            
-            // 计算会话持续时间（毫秒）
-            double duration_ms = 0.0;
-            if (node->stats.last_seen > node->stats.first_seen) {
-                duration_ms = (double)(node->stats.last_seen - node->stats.first_seen) / 1000000.0;
-            }
-            
-            // 格式化时间戳
-            struct tm *start_tm = localtime(&node->stats.start_time.tv_sec);
-            struct tm *end_tm = localtime(&node->stats.end_time.tv_sec);
-            
-            char start_time_str[64], end_time_str[64];
-            if (start_tm) {
-                strftime(start_time_str, sizeof(start_time_str), "%Y-%m-%d %H:%M:%S", start_tm);
-            } else {
-                strcpy(start_time_str, "Unknown");
-            }
-            
-            if (end_tm) {
-                strftime(end_time_str, sizeof(end_time_str), "%Y-%m-%d %H:%M:%S", end_tm);
-            } else {
-                strcpy(end_time_str, "Unknown");
-            }
-            
-            // 协议名称
-            const char *protocol_name;
-            switch (node->key.protocol) {
-                case IPPROTO_TCP:
-                    protocol_name = "TCP";
-                    break;
-                case IPPROTO_UDP:
-                    protocol_name = "UDP";
-                    break;
-                case IPPROTO_ICMP:
-                    protocol_name = "ICMP";
-                    break;
-                default:
-                    protocol_name = "OTHER";
-                    break;
-            }
-            
-            // 会话状态
-            const char *session_status;
-            if (node->stats.session_completed) {
-                session_status = "COMPLETED";
-            } else {
-                session_status = "ACTIVE";
-            }
-            
-            printf("会话 %d:\n", session_count);
-            printf("  五元组: %s:%d -> %s:%d (%s)\n", 
-                   src_ip_str, node->original_src_port,
-                   dst_ip_str, node->original_dst_port,
-                   protocol_name);
-            printf("  开始时间: %s (纳秒: %lu)\n", start_time_str, node->stats.first_seen);
-            printf("  结束时间: %s (纳秒: %lu)\n", end_time_str, node->stats.last_seen);
-            printf("  持续时间: %.6f 毫秒\n", duration_ms);
-            printf("  会话状态: %s\n", session_status);
-            printf("  包数: %lu (正向: %lu, 反向: %lu)\n", 
-                   node->stats.fwd_packets + node->stats.bwd_packets,
-                   node->stats.fwd_packets, node->stats.bwd_packets);
-            printf("  字节数: %lu (正向: %lu, 反向: %lu)\n", 
-                   node->stats.fwd_bytes + node->stats.bwd_bytes,
-                   node->stats.fwd_bytes, node->stats.bwd_bytes);
-            printf("\n");
-            
-            node = node->next;
-        }
-    }
-    
-    printf("总会话数: %d\n", session_count);
-    printf("================== 会话时间记录信息结束 ==================\n\n");
+
+
+// 获取会话创建统计
+void get_session_creation_stats(uint64_t *total_created, uint64_t *tcp_created, uint64_t *udp_created, uint64_t *reused) {
+    *total_created = total_sessions_created;
+    *tcp_created = tcp_sessions_created;
+    *udp_created = udp_sessions_created;
+    *reused = sessions_reused;
 }

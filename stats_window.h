@@ -62,6 +62,6 @@ void get_latest_sessions(session_display_info_t *sessions, int max_count, int *a
 void draw_session_table(WINDOW *win, int start_y);
 void draw_stats_header(WINDOW *win);
 void draw_ebpf_stats_window(WINDOW *win);
-void run_realtime_monitor();
+
 
 #endif // STATS_WINDOW_H 

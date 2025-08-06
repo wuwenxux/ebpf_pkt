@@ -213,29 +213,4 @@ void log_debug(const char *fmt, ...) {
     fflush(output);
 }
 
-int log_init_file(const char *filename) {
-    if (log_file) {
-        fclose(log_file);
-    }
-    
-    log_file = fopen(filename, "a");
-    if (!log_file) {
-        log_error("Failed to open log file: %s", filename);
-        return -1;
-    }
-    
-    log_info("Log file initialized: %s", filename);
-    return 0;
-}
-
-void log_close_file(void) {
-    if (log_file) {
-        log_info("Closing log file");
-        fclose(log_file);
-        log_file = NULL;
-    }
-}
-
-void log_set_output(FILE *output) {
-    log_output = output;
-} 
+ 
