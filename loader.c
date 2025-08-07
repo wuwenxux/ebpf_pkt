@@ -708,9 +708,9 @@ static void handle_batch(void *ctx, int cpu, void *data, __u32 size) {
         if (debug_count < 10) {
             struct in_addr src_addr = {.s_addr = pkt->src_ip};
             struct in_addr dst_addr = {.s_addr = pkt->dst_ip};
-            log_debug("Packet %d - IP: %s -> %s, Protocol: %d, Ports: %u -> %u, TCP flags: 0x%02x", 
+            log_debug("Packet %d - IP: %s -> %s, Protocol: %d, Ports: %u -> %u, TCP flags: 0x%02x, Length: %u bytes", 
                    debug_count + 1, inet_ntoa(src_addr), inet_ntoa(dst_addr), 
-                   pkt->protocol, pkt->src_port, pkt->dst_port, pkt->tcp_flags);
+                   pkt->protocol, pkt->src_port, pkt->dst_port, pkt->tcp_flags, pkt->pkt_len);
             debug_count++;
         }
         
@@ -756,6 +756,18 @@ void process_pcap_packet(const u_char *packet, const struct pcap_pkthdr *header)
     // 检查IP版本
     if (ip_header.version != 4) {
         return;  // Skip non-IPv4 packets
+    }
+    
+    // 更新字节统计 - 使用pcap头部的实际长度
+    __sync_fetch_and_add(&total_bytes_captured, header->len);
+    __sync_fetch_and_add(&total_packets_captured, 1);
+    
+    // 调试输出（前5个包）- 显示字节统计更新
+    static int debug_count = 0;
+    if (debug_count < 5) {
+        log_debug("PCAP Packet %d - Length: %u bytes, Total bytes: %lu", 
+                   debug_count + 1, header->len, total_bytes_captured);
+        debug_count++;
     }
     
     // 计算时间戳
@@ -876,7 +888,8 @@ int process_pcap_file(const char *pcap_file) {
         uint64_t last_packets = 0;
         uint64_t last_bytes = 0;
         uint64_t total_packets_processed = 0;
-        uint64_t total_bytes_processed = 0;
+        // 使用全局变量而不是局部变量
+        total_bytes_processed = 0;
         
         while (running && (packet = pcap_next(handle, &header)) != NULL) {
             // 直接处理数据包
@@ -1334,7 +1347,7 @@ int run_live_capture(const char *ifname) {
             char time_only[9];
             strftime(time_only, sizeof(time_only), "%H:%M:%S", &tm);
             
-            printf("\r⏰ %s | 🔄 %s | 📦 %lu (%.1f pkt/s) | 💾 %.2f MB (%.1f kb/s) | 🔗 TCP:%u UDP:%u Total:%u | 🗄️ %d/%d | 📊 Created:%lu Reused:%lu | 🖥️  CPU:%.1f%% MEM:%.1f%% | 📈 eBPF:%lu/%lu",
+            printf("\r⏰ %s | 🔄 %s | 📦 %lu (%.1f pkt/s) | 💾 %.2f MB (%.1f kb/s) | 🔗 TCP:%u UDP:%u Total:%u | 🗄️ %d/%d | 📊 Created:%lu Reused:%lu | 🖥️  CPU:%.1f%% MEM:%.1f%%",
                    time_only, progress,
                    total_packets_captured, pps,
                    total_bytes_captured / (1024.0 * 1024.0), bps * 8 / 1000.0,
@@ -1346,8 +1359,7 @@ int run_live_capture(const char *ifname) {
                    total_created,
                    reused,
                    system_stats.cpu_usage,
-                   system_stats.memory_usage,
-                   total_packets_processed, total_packets_captured);
+                   system_stats.memory_usage);
             
             // 更新上次统计值
             last_packets = total_packets_captured;
@@ -1576,6 +1588,14 @@ int run_single_interface_capture(const char *ifname) {
             uint64_t captured_packets = get_ebpf_captured_packets();
             uint64_t captured_bytes = get_ebpf_captured_bytes();
             
+            // 调试输出（每10次更新显示一次）
+            static int debug_count = 0;
+            if (debug_count % 10 == 0) {
+                log_debug("Stats Update - Packets: %lu, Bytes: %lu (%.2f MB)", 
+                         captured_packets, captured_bytes, captured_bytes / (1024.0 * 1024.0));
+            }
+            debug_count++;
+            
             // 计算捕获速率
             static uint64_t last_captured_packets = 0;
             static uint64_t last_captured_bytes = 0;
@@ -1621,7 +1641,7 @@ int run_single_interface_capture(const char *ifname) {
             char time_only[9];
             strftime(time_only, sizeof(time_only), "%H:%M:%S", &tm);
             
-            printf("\r⏰ %s | 🔄 %s | 📦 %lu (%.1f pkt/s) | 💾 %.2f MB (%.1f kb/s) | 🔗 TCP:%u UDP:%u Total:%u | 🗄️ %d/%d | 📊 Created:%lu Reused:%lu | 🖥️  CPU:%.1f%% MEM:%.1f%%\n",
+            printf("\r⏰ %s | 🔄 %s | 📦 %lu (%.1f pkt/s) | 💾 %.2f MB (%.1f kb/s) | 🔗 TCP:%u UDP:%u Total:%u | 🗄️ %d/%d | 📊 Created:%lu Reused:%lu | 🖥️  CPU:%.1f%% MEM:%.1f%%                    ",
                    time_only, progress,
                    captured_packets, pps,
                    captured_bytes / (1024.0 * 1024.0), bps * 8 / 1000.0,
