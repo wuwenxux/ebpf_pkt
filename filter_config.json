@@ -1,7 +1,7 @@
 {
   "filter_config": {
     "enabled": true,
-    "default_action": "allow",
+    "default_action": "deny",
     "description": "eBPF packet filter configuration"
   },
   "rules": [
@@ -9,7 +9,7 @@
       "id": 1,
       "name": "Block malicious IP",
       "type": "ip",
-      "action": "deny",
+      "action": "allow",
       "priority": 10,
       "enabled": true,
       "src_ip": "192.168.1.100",

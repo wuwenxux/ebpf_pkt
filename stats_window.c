@@ -23,9 +23,6 @@ typedef struct lockfree_queue lockfree_queue_t;
 extern uint64_t packet_queue_size(lockfree_queue_t *queue);
 extern lockfree_queue_t packet_queue;
 
-// 会话管理器类型定义
-typedef struct session_manager session_manager_t;
-
 // 实时统计结构定义
 typedef struct {
     atomic_uint packet_count;
@@ -295,9 +292,9 @@ void draw_stats_header(WINDOW *win) {
     
     // 显示eBPF统计信息
     mvwprintw(win, 1, 2, "Time: %s", time_str);
-    mvwprintw(win, 2, 2, "eBPF Captured: %lu pkts (%.1f pkt/s) | %.2f MB (%.1f KB/s) | Processing: %.1f%%", 
+            mvwprintw(win, 2, 2, "eBPF Captured: %lu pkts (%.1f pkt/s) | %.2f MB (%.1f kb/s) | Processing: %.1f%%", 
                total_packets_captured, pps,
-               total_bytes_captured / (1024.0 * 1024.0), bps / 1024.0,
+                               total_bytes_captured / (1024.0 * 1024.0), bps * 8 / 1000.0,
                processing_ratio);
     
     // 分隔线

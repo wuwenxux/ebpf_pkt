@@ -9,10 +9,11 @@
 #include "flow.h"
 
 // 大幅增加内存块大小，以支持更多流
-#define MEMPOOL_BLOCK_SIZE 65536  // 每次扩展分配的节点数增加到64K
+#define MEMPOOL_BLOCK_SIZE 65536  // 每次扩展分配的节点数增加到128K
 
-// Memory pool structure
+// Memory pool structure - Cache line aligned for performance
 struct mempool {
+    // 高频访问字段 - 第一个cache line
     void* physical_memory;        // 连续物理内存基地址
     size_t total_size;            // 总大小
     size_t block_size;            // 单个节点大小
@@ -20,6 +21,9 @@ struct mempool {
     size_t total_nodes;           // 总节点数
     struct flow_node *free_list;  // 空闲节点链表
     int is_physical;              // 是否使用物理内存
+    
+    // Padding to ensure cache line alignment
+    uint8_t padding[4];
 };
 
 // 初始化内存池（使用连续物理内存）

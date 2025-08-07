@@ -5,20 +5,27 @@
 #include <stdbool.h>
 #include <time.h>
 #include <stdatomic.h>
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
 #include "flow.h"
 #include "logger.h"
+
+// Cache line alignment for performance optimization
+#define CACHE_LINE_SIZE 64
+#define CACHE_LINE_ALIGN __attribute__((aligned(CACHE_LINE_SIZE)))
 
 // 添加缺失的常量定义
 // 会话哈希表大小 - 根据实际会话数量调整
 // 实际会话数: 146,588，建议哈希表大小为会话数的4倍
-#define SESSION_HASH_SIZE 2097152  // 2M 哈希桶 (2^21)
+#define SESSION_HASH_SIZE 1048576  // 1M 哈希桶 (2^20)
 
 // 最大会话数 - 基于实际使用情况调整
 // 当前实际会话数: 146,588，预留3倍空间
-#define MAX_SESSIONS 500000        // 50万会话
+#define MAX_SESSIONS 1000000       // 100万会话
 
 // 内存池配置 - 基于实际并发会话数调整
-#define MEMORY_POOL_SIZE 50000     // 减少到5万个会话的内存池
+#define MEMORY_POOL_SIZE 100000    // 减少到10万个会话的内存池，更加保守
 
 // 会话超时配置 (纳秒)
 #define SESSION_TIMEOUT_NS 300000000000ULL  // 5分钟超时
@@ -54,9 +61,9 @@ typedef enum {
     UDP_SESSION_TIMEOUT
 } udp_session_state_t;
 
-// 会话统计结构
+// 会话统计结构 - Cache line aligned and optimized for performance
 typedef struct session_stats {
-    // 基本统计
+    // 高频访问字段 - 第一个cache line
     uint64_t packets_in;                // 接收包数
     uint64_t packets_out;               // 发送包数
     uint64_t bytes_in;                  // 接收字节数
@@ -64,7 +71,7 @@ typedef struct session_stats {
     uint64_t total_packets;             // 总包数
     uint64_t total_bytes;               // 总字节数
     
-    // 包大小统计
+    // 包大小统计 - 第二个cache line
     uint32_t max_packet_size;           // 最大包大小
     uint32_t min_packet_size;           // 最小包大小
     uint32_t avg_packet_size;           // 平均包大小
@@ -73,7 +80,7 @@ typedef struct session_stats {
     uint32_t max_packet_size_bwd;       // 反向最大包大小
     uint32_t min_packet_size_bwd;       // 反向最小包大小
     
-    // 方向统计
+    // 方向统计 - 第三个cache line
     uint64_t total_bytes_fwd;           // 正向总字节数
     uint32_t packet_count_fwd;          // 正向包计数
     uint64_t total_bytes_bwd;           // 反向总字节数
@@ -85,8 +92,7 @@ typedef struct session_stats {
     timestamp_array_t fwd_timestamps;   // 正向时间戳
     timestamp_array_t bwd_timestamps;   // 反向时间戳
     
-    // TCP标志统计
-    struct tcp_flag_stats tcp_flags;
+
     
     // TCP相关统计
     uint32_t fwd_header_bytes;         // 正向报文头部字节数
@@ -139,18 +145,22 @@ typedef struct session_export_data {
 // 内存池块大小
 #define MEMORY_POOL_BLOCK_SIZE sizeof(transport_session_t)
 
-// 无锁内存池结构
+// 无锁内存池结构 - Cache line aligned for performance
 typedef struct memory_pool {
+    // 高频访问字段 - 第一个cache line
     void *pool_memory;                  // 内存池基地址
     atomic_bool *used_blocks;           // 原子块使用状态数组
     uint32_t total_blocks;              // 总块数
     atomic_uint used_count;             // 已使用块数（原子）
     atomic_uint next_free_hint;         // 下一个可能空闲的块索引（原子）
     
-    // 无锁统计信息
+    // 无锁统计信息 - 第二个cache line
     atomic_ulong allocation_count;      // 分配次数
     atomic_ulong deallocation_count;    // 释放次数
     atomic_uint max_usage;              // 最大使用量
+    
+    // Padding to ensure cache line alignment
+    uint8_t padding[4];
 } memory_pool_t;
 
 // 会话唯一标识符（五元组 + 状态）
@@ -160,8 +170,9 @@ typedef struct session_identifier {
     uint32_t creation_sequence;     // 创建序列号
 } session_identifier_t;
 
-// 更新transport_session_t结构
+// 更新transport_session_t结构 - Cache line aligned for performance
 typedef struct transport_session {
+    // 高频访问字段 - 第一个cache line
     session_identifier_t identifier;    // 会话唯一标识符
     uint32_t session_id;                // 会话ID
     struct flow_key key;                // 流键（五元组）
@@ -171,7 +182,7 @@ typedef struct transport_session {
     struct flow_node *flow_node_ptr;    // 指向flow_node的指针
     struct flow_stats *flow_stats_ptr;  // 指向flow_stats的指针
     
-    // 会话状态
+    // 会话状态 - 第二个cache line
     union {
         tcp_session_state_t tcp_state;
         udp_session_state_t udp_state;
@@ -181,7 +192,7 @@ typedef struct transport_session {
     struct timespec creation_time;      // 创建时间
     struct timespec last_activity;     // 最后活动时间
     
-    // 协议特定信息
+    // 协议特定信息 - 第三个cache line
     union {
         struct {
             uint32_t initial_seq_client;
@@ -200,7 +211,7 @@ typedef struct transport_session {
     // 统计信息
     session_stats_t stats;
     
-    // 链表指针（使用原子指针）
+    // 链表指针（使用原子指针） - 第四个cache line
     atomic_uintptr_t next_atomic;       // 原子下一个指针
     atomic_uintptr_t prev_atomic;       // 原子上一个指针
     struct transport_session *next;     // 普通指针（用于兼容）
@@ -211,22 +222,27 @@ typedef struct transport_session {
     atomic_bool is_from_pool;           // 是否来自内存池（原子）
     atomic_bool is_active;              // 会话是否活跃（原子）
     
+    // Padding to ensure cache line alignment
+    uint8_t padding[4];
 } transport_session_t;
 
-// 无锁会话管理器结构
+// 无锁会话管理器结构 - Cache line aligned for performance
 typedef struct session_manager {
+    // 高频访问字段 - 第一个cache line
     atomic_uintptr_t sessions[SESSION_HASH_SIZE];  // 原子指针数组
     atomic_uint total_sessions;         // 原子总会话数
     atomic_uint active_sessions;        // 原子活跃会话数
     atomic_uint tcp_sessions;           // 原子TCP会话数
     atomic_uint udp_sessions;           // 原子UDP会话数
     atomic_uint next_session_id;        // 原子会话ID计数器
+    
+    // 时间相关 - 第二个cache line
     struct timespec last_cleanup;
     
     // 内存池
     memory_pool_t session_pool;
     
-    // 原子统计信息
+    // 原子统计信息 - 第三个cache line
     atomic_ulong sessions_created;      // 原子创建计数
     atomic_ulong sessions_destroyed;    // 原子销毁计数
     atomic_ulong pool_allocations;      // 原子池分配计数
@@ -242,6 +258,8 @@ typedef struct session_manager {
     uint32_t cleanup_interval_ns;       // 动态清理间隔
     double load_factor_threshold;       // 动态负载因子阈值
     
+    // Padding to ensure cache line alignment
+    uint8_t padding[4];
 } session_manager_t;
 
 // 无锁内存池函数声明

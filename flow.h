@@ -13,9 +13,30 @@
 #include <netinet/udp.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
+#include <stdatomic.h>
 
-// 添加缺失的宏定义
+// Cache line alignment for performance optimization
+#define CACHE_LINE_SIZE 64
+#define CACHE_LINE_ALIGN __attribute__((aligned(CACHE_LINE_SIZE)))
+
+// 最大时间戳数组大小
 #define MAX_TIMESTAMPS 1000
+
+// 流表大小
+#define HASH_TABLE_SIZE 1048576  // 1M 哈希桶
+
+// 活跃超时时间（纳秒）
+#define ACTIVE_TIMEOUT_NS 60000000000ULL  // 60秒
+
+// TCP标志位定义
+#define TCP_FIN 0x01
+#define TCP_SYN 0x02
+#define TCP_RST 0x04
+#define TCP_PSH 0x08
+#define TCP_ACK 0x10
+#define TCP_URG 0x20
+#define TCP_CWR 0x40
+#define TCP_ECE 0x80
 
 // =================== 调试级别控制 ===================
 void set_debug_level(int level);
@@ -28,7 +49,6 @@ int get_debug_level();
 #define TCP_FLOW_TIMEOUT_NS (120 * 1000000000ULL) // TCP流120秒超时，与Wireshark一致
 
 // cicflowmeter 活跃超时配置
-#define ACTIVE_TIMEOUT_NS (5 * 1000000ULL)       // 活跃超时时间 (5毫秒 = 0.005秒)
 #define CLUMP_TIMEOUT_NS (1 * 1000000000ULL)     // 集群超时时间 (1秒)，用于子流和批量传输分割
 #define BULK_BOUND 4                             // 批量传输阈值 (4个数据包)
 
@@ -100,8 +120,7 @@ int get_debug_level();
 #define TCP_PSH  0x08
 #define TCP_ACK  0x10
 #define TCP_URG  0x20
-#define TCP_ECE  0x40
-#define TCP_CWR  0x80
+
 
 // =================== Wireshark风格TCP对话完整性标志 ===================
 // 基于Wireshark的conversation.h中的对话完整性追踪
@@ -129,6 +148,25 @@ typedef enum {
     TCP_CONV_RESET              // 被重置
 } tcp_conversation_state_t;
 
+// =================== 简化的会话状态管理 ===================
+
+// 会话状态枚举
+typedef enum {
+    SESSION_STATE_INIT = 0,      // 初始状态
+    SESSION_STATE_ESTABLISHED,   // 已建立
+    SESSION_STATE_CLOSING,       // 正在关闭
+    SESSION_STATE_CLOSED,        // 已关闭
+    SESSION_STATE_RESET          // 被重置
+} session_state_t;
+
+// 会话完成度标志
+#define SESSION_FLAG_SYN_SENT    0x01    // SYN已发送
+#define SESSION_FLAG_SYN_ACK     0x02    // SYN-ACK已发送
+#define SESSION_FLAG_ACK_SENT    0x04    // ACK已发送
+#define SESSION_FLAG_DATA_SENT   0x08    // 数据已发送
+#define SESSION_FLAG_FIN_SENT    0x10    // FIN已发送
+#define SESSION_FLAG_RST_SENT    0x20    // RST已发送
+
 // NIPQUAD macro for printing IP addresses
 #define NIPQUAD(addr) \
     ((unsigned char *)&addr)[0], \
@@ -136,13 +174,15 @@ typedef enum {
     ((unsigned char *)&addr)[2], \
     ((unsigned char *)&addr)[3]
 
-// 流键结构增强版
+// 流键结构增强版 - Cache line aligned for performance
 struct flow_key {
     uint32_t src_ip;
     uint32_t dst_ip;
     uint16_t src_port;
     uint16_t dst_port;
     uint8_t  protocol;
+    // Padding to ensure cache line alignment
+    uint8_t  padding[3];
 };
 
 // 用于存储包间隔时间的数组
@@ -153,198 +193,41 @@ typedef struct {
 } timestamp_array_t;
 
 // UDP流量统计结构
-struct udp_stats {
-    // 正向流统计
-    uint64_t fwd_packets;        // 正向UDP包数量
-    uint64_t fwd_bytes;          // 正向UDP字节总数
-    uint32_t fwd_max_size;       // 正向UDP包最大大小
-    uint32_t fwd_min_size;       // 正向UDP包最小大小
-    double   fwd_sum_squares;    // 正向UDP包大小平方和
-    uint64_t fwd_header_bytes;   // 正向UDP头部字节数
-    
-    // 反向流统计
-    uint64_t bwd_packets;        // 反向UDP包数量
-    uint64_t bwd_bytes;          // 反向UDP字节总数
-    uint32_t bwd_max_size;       // 反向UDP包最大大小
-    uint32_t bwd_min_size;       // 反向UDP包最小大小
-    double   bwd_sum_squares;    // 反向UDP包大小平方和
-    uint64_t bwd_header_bytes;   // 反向UDP头部字节数
-    
-    // 时间相关统计
-    timestamp_array_t fwd_timestamps;  // 正向UDP包时间戳
-    timestamp_array_t bwd_timestamps;  // 反向UDP包时间戳
-};
+
 
 // TCP标志统计结构
-struct tcp_flag_stats {
-    // 正向流标志统计
-    uint32_t fwd_fin_count;      // FIN标志计数
-    uint32_t fwd_syn_count;      // SYN标志计数
-    uint32_t fwd_rst_count;      // RST标志计数
-    uint32_t fwd_psh_count;      // PSH标志计数
-    uint32_t fwd_ack_count;      // ACK标志计数
-    uint32_t fwd_urg_count;      // URG标志计数
-    uint32_t fwd_cwr_count;      // CWR标志计数
-    uint32_t fwd_ece_count;      // ECE标志计数
-    
-    // 反向流标志统计
-    uint32_t bwd_fin_count;      // FIN标志计数
-    uint32_t bwd_syn_count;      // SYN标志计数
-    uint32_t bwd_rst_count;      // RST标志计数
-    uint32_t bwd_psh_count;      // PSH标志计数
-    uint32_t bwd_ack_count;      // ACK标志计数
-    uint32_t bwd_urg_count;      // URG标志计数
-    uint32_t bwd_cwr_count;      // CWR标志计数
-    uint32_t bwd_ece_count;      // ECE标志计数
-};
 
-// 流量统计指标
+
+// 流量统计指标 - 简化版本，只保留flow_features实际使用的参数
 struct flow_stats {
-    // 时间相关
-    struct timespec start_time;   // 会话开始时间
-    struct timespec end_time;     // 最后报文时间
+    // 高频访问字段 - 放在第一个cache line
     uint64_t first_seen;         // 第一个包的时间戳(ns)
     uint64_t last_seen;          // 上次看到的时间戳(ns)
-    
-    // 正向流（src->dst）
     uint64_t fwd_packets;        // 正向包数量
     uint64_t fwd_bytes;          // 正向总字节
+    uint64_t bwd_packets;        // 反向包数量
+    uint64_t bwd_bytes;          // 反向总字节
     uint32_t fwd_max_size;       // 正向最大包大小
     uint32_t fwd_min_size;       // 正向最小包大小
+    uint32_t bwd_max_size;       // 反向最大包大小
+    uint32_t bwd_min_size;       // 反向最小包大小
     double   fwd_sum_squares;    // 平方和（用于标准差）
+    double   bwd_sum_squares;    // 反向平方和
     
-    // 反向流（dst->src）
-    uint64_t bwd_packets;
-    uint64_t bwd_bytes;
-    uint32_t bwd_max_size;
-    uint32_t bwd_min_size;
-    double   bwd_sum_squares;
-
+    // 时间相关 - 第二个cache line
+    struct timespec start_time;   // 会话开始时间
+    
     // 包间隔时间统计
     timestamp_array_t fwd_timestamps;  // 正向包时间戳 
     timestamp_array_t bwd_timestamps;  // 反向包时间戳
 
-    // TCP相关统计
+    // TCP相关统计 - 第三个cache line
     uint32_t fwd_header_bytes;      // 正向报文头部字节数
     uint32_t bwd_header_bytes;      // 反向报文头部字节数
     uint32_t fwd_init_win_bytes;    // 前向初始窗口字节数
     uint32_t bwd_init_win_bytes;    // 反向初始窗口字节数
     uint32_t fwd_tcp_payload_bytes; // 至少有1字节payload的TCP流量
     uint32_t fwd_min_segment;       // 前向观察到的最小segment大小
-
-    // 从cicflowmeter添加的TCP流数据结构
-    uint32_t flow_interarrival_time_count;    // 流包间隔时间计数
-    uint64_t *flow_interarrival_time;         // 流包间隔时间数组
-    uint32_t active_count;                    // 活跃状态计数
-    uint64_t *active;                         // 活跃状态数组
-    uint32_t idle_count;                      // 空闲状态计数
-    uint64_t *idle;                           // 空闲状态数组
-
-    // 添加Bulk分析相关字段
-    uint64_t forward_bulk_last_timestamp;     // 前向bulk最后时间戳
-    uint64_t forward_bulk_start_tmp;          // 前向bulk开始时间
-    uint32_t forward_bulk_count;              // 前向bulk计数
-    uint32_t forward_bulk_count_tmp;          // 前向bulk临时计数
-    uint64_t forward_bulk_duration;           // 前向bulk持续时间
-    uint32_t forward_bulk_packet_count;       // 前向bulk包计数
-    uint32_t forward_bulk_size;               // 前向bulk大小
-    uint32_t forward_bulk_size_tmp;           // 前向bulk临时大小
-    uint64_t backward_bulk_last_timestamp;    // 反向bulk最后时间戳
-    uint64_t backward_bulk_start_tmp;         // 反向bulk开始时间
-    uint32_t backward_bulk_count;             // 反向bulk计数
-    uint32_t backward_bulk_count_tmp;         // 反向bulk临时计数
-    uint64_t backward_bulk_duration;          // 反向bulk持续时间
-    uint32_t backward_bulk_packet_count;      // 反向bulk包计数
-    uint32_t backward_bulk_size;              // 反向bulk大小
-    uint32_t backward_bulk_size_tmp;          // 反向bulk临时大小
-
-    // TCP标志统计
-    struct tcp_flag_stats tcp_flags;
-
-    // UDP特定统计
-    struct udp_stats udp;
-
-    // 子流相关统计
-    uint64_t subflow_fwd_packets;   // 前向子流中的包数量
-    uint64_t subflow_fwd_bytes;     // 前向子流中的字节数
-    uint64_t subflow_bwd_packets;   // 反向子流中的包数量
-    uint64_t subflow_bwd_bytes;     // 反向子流中的字节数
-
-    // 流长度相关
-    uint32_t flow_min_length;       // 流的最小长度
-    uint32_t flow_max_length;       // 流的最大长度
-    double   flow_length_sum;       // 流长度总和
-    double   flow_length_sum_squares; // 流长度平方和
-    
-    // =================== cicflowmeter 状态管理字段 ===================
-    
-    // 流状态管理 (cicflowmeter 兼容)
-    uint64_t last_activity_time;            // 最后活跃时间 (纳秒)
-    uint32_t packet_count;                  // 总包数计数器
-    uint32_t subflow_count;                 // 子流计数
-    
-    // 批量传输特性字段 (新的 cicflowmeter 实现)
-    uint64_t fwd_bulk_bytes;                // 前向批量传输字节数
-    uint32_t fwd_bulk_packets;              // 前向批量传输包数
-    uint32_t fwd_bulk_state_count;          // 前向批量传输状态计数
-    uint64_t fwd_bulk_duration_ns;          // 前向批量传输持续时间
-    uint64_t fwd_bulk_start;                // 前向批量传输开始时间
-    double   fwd_bulk_rate;                 // 前向批量传输速率
-    
-    uint64_t bwd_bulk_bytes;                // 反向批量传输字节数
-    uint32_t bwd_bulk_packets;              // 反向批量传输包数
-    uint32_t bwd_bulk_state_count;          // 反向批量传输状态计数
-    uint64_t bwd_bulk_duration_ns;          // 反向批量传输持续时间
-    uint64_t bwd_bulk_start;                // 反向批量传输开始时间
-    double   bwd_bulk_rate;                 // 反向批量传输速率
-    
-    // 子流管理字段
-    uint64_t last_subflow_time;             // 最后子流时间
-    uint32_t subflow_packets;               // 当前子流包数
-    uint64_t subflow_bytes;                 // 当前子流字节数
-    uint64_t subflow_start;                 // 当前子流开始时间
-    uint64_t subflow_duration_ns;           // 当前子流持续时间
-    
-    // 活跃/空闲时间管理字段
-    uint64_t active_time_ns;                // 累积活跃时间
-    uint64_t idle_time_ns;                  // 累积空闲时间
-    uint64_t active_max_ns;                 // 最大活跃时间
-    uint64_t active_min_ns;                 // 最小活跃时间
-    uint64_t active_mean_ns;                // 平均活跃时间
-    uint64_t idle_max_ns;                   // 最大空闲时间
-    uint64_t idle_min_ns;                   // 最小空闲时间
-    uint64_t idle_mean_ns;                  // 平均空闲时间
-    uint64_t idle_std_ns;                   // 空闲状态标准差
-    
-    // 流分割控制 (cicflowmeter 逻辑)
-    uint64_t last_fin_time;                 // 最后FIN包时间
-    uint8_t  fin_seen;                      // 是否看到FIN包
-    uint8_t  rst_seen;                      // 是否看到RST包
-    
-    // 第一个包的方向 (用于确定正向/反向)
-    uint8_t  first_packet_direction;
-    
-    // 垃圾回收和流管理
-    uint8_t  should_expire;                 // 标记是否应该过期
-    uint8_t  in_garbage_collect;            // 标记是否在垃圾回收中
-    uint8_t  session_completed;             // 标记TCP会话是否已完成（FIN或RST）
-
-    // TCP端口重用检测字段
-    uint32_t tcp_base_seq;          // TCP基础序列号，用于检测端口重用
-    bool tcp_base_seq_set;       // 是否已设置TCP基础序列号
-    bool tcp_session_ended;      // TCP会话是否已结束（收到RST或FIN）
-
-    uint64_t forward_packets;
-    uint64_t reverse_packets;
-    uint64_t total_packets;
-    uint64_t total_bytes;
-    uint64_t first_packet_time;
-    uint64_t last_packet_time;
-    uint64_t timestamps[MAX_TIMESTAMPS];
-    uint32_t timestamp_index;
-    uint32_t tcp_conversation_id;
-    uint32_t udp_conversation_id;
-    uint8_t conversation_completeness;
 };
 
 // UDP特征统计结构
@@ -487,7 +370,7 @@ struct flow_features {
 #define TCP_STATE_RST     5  // 连接被重置
 #define TCP_STATE_CLOSED  6  // 连接已关闭
 
-// 会话记录哈希表节点
+// 流节点结构 - Cache line aligned for performance
 struct flow_node {
     struct flow_key key;
     struct flow_stats stats;
@@ -503,15 +386,22 @@ struct flow_node {
     
     // =================== Wireshark风格的对话字段 ===================
     uint32_t conversation_id;       // 对话ID (类似Wireshark的stream)
-    uint8_t  completeness;          // 对话完整性标志
     uint64_t first_packet_time;     // 第一个包的时间戳
     uint64_t last_packet_time;      // 最后一个包的时间戳
     uint32_t packet_num;            // 流内包序号
     uint8_t  create_flags;          // 创建时的标志 (SYN/UDP等)
+    
+    // =================== 简化的会话状态管理 ===================
+    uint8_t session_state;          // 会话状态
+    uint8_t session_flags;          // 会话完成度标志
+    uint8_t last_tcp_flags;         // 上次TCP标志（用于检测标志变化）
+    
+    // Padding to ensure cache line alignment
+    uint8_t padding[1];
 };
 
 // 大幅增加哈希表大小以减少冲突
-#define HASH_TABLE_SIZE 262144  // 增加到256K
+
 extern struct flow_node* flow_table[HASH_TABLE_SIZE]; // 哈希表
 
 void flow_table_init();
@@ -528,8 +418,6 @@ double time_diff(const struct timespec *end, const struct timespec *start);
 struct flow_stats* get_flow_stats(const struct flow_key *key, int *is_reverse_ptr, uint64_t packet_timestamp) ;
 void update_flow_stats(struct flow_stats *stats, uint32_t pkt_size, int is_reverse, uint64_t packet_timestamp);
 void reset_flow_stats_for_new_session(struct flow_stats *stats, uint64_t packet_timestamp);
-void update_tcp_flags(struct flow_stats *stats, uint8_t tcp_flags, int is_reverse);
-void update_udp_stats(struct flow_stats *stats, uint32_t pkt_size, int is_reverse, uint64_t packet_timestamp);
 void calculate_flow_features(const struct flow_stats *stats, struct flow_features *features);
 
 void process_packet(const struct iphdr *ip, const void *transport_hdr, uint64_t packet_timestamp);
@@ -543,7 +431,7 @@ int verify_udp_conversation_count(void);
 
 
 // 活跃/空闲时间管理
-void update_active_idle(struct flow_stats *stats, uint64_t current_time);
+
 
 
 
@@ -583,8 +471,10 @@ void assign_conversation_id_for_protocol(struct flow_stats *stats, uint8_t proto
 // Wireshark风格的流创建函数 (类似find_or_create_conversation)
 struct flow_stats* get_or_create_conversation(const struct flow_key *key, int *is_reverse_ptr, uint64_t packet_timestamp, uint8_t tcp_flags);
 
-// 更新对话完整性函数 (类似Wireshark的completeness tracking)
-void update_conversation_completeness(struct flow_node *node, uint8_t tcp_flags);
+// 简化的会话状态管理函数
+void update_session_state(struct flow_node *node, uint8_t tcp_flags);
+bool is_session_complete(struct flow_node *node);
+bool should_create_new_session(struct flow_node *node, uint8_t tcp_flags, uint64_t packet_timestamp);
 
 // Wireshark风格的统计打印函数
 void print_wireshark_conversation_stats();
@@ -617,7 +507,7 @@ void process_packet(const struct iphdr *ip, const void *transport_hdr, uint64_t 
 
 // 统计函数
 void update_flow_stats(struct flow_stats *stats, uint32_t pkt_size, int is_reverse, uint64_t packet_timestamp);
-void update_udp_stats(struct flow_stats *stats, uint32_t pkt_size, int is_reverse, uint64_t packet_timestamp);
+
 
 // 对话计数器管理
 void reset_conversation_counters(void);
@@ -671,7 +561,11 @@ void count_sessions_by_five_tuple();
 int count_tshark_style_tcp_sessions();
 void verify_tshark_style_counting();
 
+// 会话创建统计
+void get_session_creation_stats(uint64_t *total_created, uint64_t *tcp_created, uint64_t *udp_created, uint64_t *reused);
 
+// tshark风格会话验证
+void verify_tshark_style_session_creation();
 
 
 void format_ebpf_packet_time(uint64_t ktime_ns, char *buf, size_t buflen);

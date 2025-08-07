@@ -1071,17 +1071,17 @@ void print_session_manager_stats(const session_manager_t *manager) {
     if (!manager) return;
     
     log_info("=== Lockfree Session Manager Statistics ===");
-    log_info("Total sessions: %u", atomic_load(&manager->total_sessions));
-    log_info("Active sessions: %u", atomic_load(&manager->active_sessions));
-    log_info("TCP sessions: %u", atomic_load(&manager->tcp_sessions));
-    log_info("UDP sessions: %u", atomic_load(&manager->udp_sessions));
-    log_info("Sessions created: %lu", atomic_load(&manager->sessions_created));
-    log_info("Sessions destroyed: %lu", atomic_load(&manager->sessions_destroyed));
+    log_info("Total transport sessions: %u", atomic_load(&manager->total_sessions));
+    log_info("Active transport sessions: %u", atomic_load(&manager->active_sessions));
+    log_info("TCP transport sessions: %u", atomic_load(&manager->tcp_sessions));
+    log_info("UDP transport sessions: %u", atomic_load(&manager->udp_sessions));
+    log_info("Transport sessions created: %lu", atomic_load(&manager->sessions_created));
+    log_info("Transport sessions destroyed: %lu", atomic_load(&manager->sessions_destroyed));
     log_info("Pool allocations: %lu", atomic_load(&manager->pool_allocations));
     log_info("Malloc allocations: %lu", atomic_load(&manager->malloc_allocations));
     log_info("Hash collisions: %lu", atomic_load(&manager->hash_collisions));
     log_info("Lookup operations: %lu", atomic_load(&manager->lookup_operations));
-    log_info("Next session ID: %u", atomic_load(&manager->next_session_id));
+    log_info("Next session ID: %lu", atomic_load(&session_id_counter));
     log_info("=============================================");
 }
 
@@ -1103,14 +1103,14 @@ int calculate_session_features(transport_session_t *session) {
     features->tot_1_bw_pk = session->stats.bytes_in;   // 反向字节数
     
     // 重新计算流持续时间（fl_dur）
-    log_debug("first_packet=%lu, last_packet=%lu\n", 
+    log_debug("first_packet=%lu, last_packet=%lu", 
            session->stats.first_packet, session->stats.last_packet);
     if (session->stats.last_packet > session->stats.first_packet) {
         features->fl_dur = (double)(session->stats.last_packet - session->stats.first_packet) / 1000000000.0; // 纳秒转秒
-        log_debug("fl_dur calculated = %.6f\n", features->fl_dur);
+        log_debug("fl_dur calculated = %.6f", features->fl_dur);
     } else {
         features->fl_dur = 0.0; // 如果只有一个包，持续时间为0
-        log_debug("fl_dur = 0.0 (no duration)\n");
+        log_debug("fl_dur = 0.0 (no duration)");
     }
     
     // 生成开始时间字符串（可读格式）
@@ -2116,6 +2116,12 @@ int export_comprehensive_flow_features_to_csv(const char *filename) {
     uint32_t tcp_session_count = 0;
     uint32_t udp_session_count = 0;
     
+    // 添加进度报告和内存管理
+    uint32_t processed_buckets = 0;
+    const uint32_t progress_interval = SESSION_HASH_SIZE / 100; // 每1%报告一次进度
+    
+    log_info("Starting CSV export to %s...", filename);
+    
     // 遍历所有会话
     for (uint32_t i = 0; i < SESSION_HASH_SIZE; i++) {
         transport_session_t *session = atomic_load_session_ptr(&global_session_manager->sessions[i]);
@@ -2137,10 +2143,23 @@ int export_comprehensive_flow_features_to_csv(const char *filename) {
                 // 导出会话数据
                 if (export_comprehensive_session_features(session, fp) == 0) {
                     exported_count++;
+                    
+                    // 定期刷新文件缓冲区，防止内存累积
+                    if (exported_count % 1000 == 0) {
+                        fflush(fp);
+                        log_info("Exported %d sessions...", exported_count);
+                    }
                 }
             }
             
             session = session->next;
+        }
+        
+        // 进度报告
+        processed_buckets++;
+        if (processed_buckets % progress_interval == 0) {
+            int progress = (processed_buckets * 100) / SESSION_HASH_SIZE;
+            log_info("Export progress: %d%% (%u buckets processed)", progress, processed_buckets);
         }
     }
     
@@ -2162,14 +2181,6 @@ int export_comprehensive_flow_features_to_csv(const char *filename) {
 int export_comprehensive_session_features(transport_session_t *session, FILE *fp) {
     if (!session || !fp) return -1;
     
-    // 添加调试信息
-    log_debug("Session %s:%u -> %s:%u, first_packet=%lu, last_packet=%lu\n",
-           inet_ntoa((struct in_addr){.s_addr = session->key.src_ip}),
-           ntohs(session->key.src_port),
-           inet_ntoa((struct in_addr){.s_addr = session->key.dst_ip}),
-           ntohs(session->key.dst_port),
-           session->stats.first_packet, session->stats.last_packet);
-    
     struct flow_features *features = &session->stats.features;
     
     // 转换IP地址为字符串
@@ -2182,13 +2193,15 @@ int export_comprehensive_session_features(transport_session_t *session, FILE *fp
     char dst_ip_str[INET_ADDRSTRLEN];
     inet_ntop(AF_INET, &addr, dst_ip_str, INET_ADDRSTRLEN);
     
-    // 写入CSV行 - 修改字段顺序和格式
-    fprintf(fp, "%s,%u,%s,%u,%u,%s,%.6f,",
+    // 计算时间戳（纳秒转秒）
+    double timestamp = (double)session->stats.first_packet / 1000000000.0;
+    
+    // 写入CSV行 - 修复格式问题
+    fprintf(fp, "%s,%u,%s,%u,%u,%.6f,%.6f,",
                 src_ip_str, ntohs(session->key.src_port),
                 dst_ip_str, ntohs(session->key.dst_port), 
                 session->key.protocol,
-        features->start_time_str,
-        features->fl_dur);
+                timestamp, features->fl_dur);
                 
                 // 基本统计
     fprintf(fp, "%lu,%lu,%lu,",
@@ -2199,7 +2212,7 @@ int export_comprehensive_session_features(transport_session_t *session, FILE *fp
             features->fwd_pkt_1_min, features->fwd_pkt_1_max, features->fwd_pkt_1_avg, features->fwd_pkt_1_std,
             features->bwd_pkt_1_min, features->bwd_pkt_1_max, features->bwd_pkt_1_avg, features->bwd_pkt_1_std);
                 
-                // 流量率特征 (KB/s, pkts/s) - 总计、源到目标、目标到源
+    // 流量率特征
     fprintf(fp, "%.2f,%.2f,",
             features->fl_byt_s, features->fl_pkt_s);
     
@@ -2233,10 +2246,9 @@ int export_comprehensive_session_features(transport_session_t *session, FILE *fp
             (double)features->subfl_bw_pk, (double)features->subfl_bw_byt);
     
     // 窗口和段大小特征
-    fprintf(fp, "%.2f,%.2f,%.2f,%.2f,",
+    fprintf(fp, "%.2f,%.2f,%.2f,%.2f\n",
             (double)features->fw_win_byt, (double)features->bw_win_byt,
             (double)features->fw_act_pkt, (double)features->fw_seg_min);
-    fprintf(fp, "\n");
     
     return 0;
 }

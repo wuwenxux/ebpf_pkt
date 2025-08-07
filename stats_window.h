@@ -7,11 +7,11 @@
 
 // 实时统计结构
 typedef struct {
-    atomic_ulong packet_count;
+    atomic_uint packet_count;
     atomic_uint tcp_session_count;
     atomic_uint udp_session_count;
     double memory_usage_percent;
-    uint64_t last_update_time;
+    time_t last_update_time;
 } realtime_stats_t;
 
 // 会话信息结构（用于显示）
