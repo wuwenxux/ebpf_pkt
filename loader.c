@@ -993,8 +993,8 @@ static int get_available_interfaces(char interfaces[][IF_NAMESIZE], int max_coun
     for (i = if_ni; i->if_index != 0 || i->if_name != NULL; i++) {
         if (count >= max_count) break;
         
-        // 跳过回环接口
-        if (strcmp(i->if_name, "lo") == 0) continue;
+        // 跳过回环接口和enp1s0
+        if (strcmp(i->if_name, "lo") == 0 || strcmp(i->if_name, "enp1s0") == 0) continue;
         
         strncpy(interfaces[count], i->if_name, IF_NAMESIZE - 1);
         interfaces[count][IF_NAMESIZE - 1] = '\0';
