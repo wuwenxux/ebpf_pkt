@@ -1428,7 +1428,7 @@ void transport_session_manager_cleanup(void) {
     free(global_session_manager);
     global_session_manager = NULL;
     
-    log_info("Lockfree transport session manager cleaned up\n");
+    log_info("Lockfree transport session manager cleaned up");
 }
 
 // =================== 基于Conversation的会话管理 ===================

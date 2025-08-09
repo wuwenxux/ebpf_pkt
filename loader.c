@@ -53,7 +53,7 @@ typedef unsigned char u_char;
 #define PREFETCH_LOCALITY_NONE 0
 
 // 多线程相关配置
-#define PACKET_QUEUE_SIZE 50000  // 数据包队列大小
+#define PACKET_QUEUE_SIZE 100000  // 数据包队列大小（优化：从50000增加到100000以减少队列满丢包）
 #define MAX_INTERFACES 32        // 最大支持的接口数量
 
 // ANSI转义序列用于终端控制
@@ -163,7 +163,7 @@ typedef struct {
 #define TCPHDR_URG  0x20
 #define TCPHDR_ECE  0x40
 #define TCPHDR_CWR  0x80
-#define PERF_BUFFER_PAGES 32
+#define PERF_BUFFER_PAGES 128  // 优化：从32增加到128页(512KB)以减少内核态丢包
 
 // NIPQUAD macro for printing IP addresses
 #define NIPQUAD(addr) \
@@ -354,8 +354,8 @@ static int packet_queue_enqueue(lockfree_queue_t *queue, const packet_data_t *pa
             if (queue->expanding == 0) {
                 expand_queue(queue);
             }
-            // 短暂等待后重试
-            usleep(1);
+            // 短暂让出CPU，减少延迟（优化：从usleep(1)改为CPU yield）
+            __asm__ __volatile__("pause" ::: "memory");
             retry_count++;
             continue;
         }
@@ -408,8 +408,8 @@ static int packet_queue_dequeue(lockfree_queue_t *queue, packet_data_t *packet) 
         
         // 检查队列是否为空
         if (head == tail) {
-            // 队列为空，短暂等待
-            usleep(1);
+            // 队列为空，短暂让出CPU（优化：减少延迟）
+            __asm__ __volatile__("pause" ::: "memory");
             retry_count++;
             continue;
         }
@@ -571,26 +571,15 @@ void sig_handler(int sig) {
     if (signal_count == 1) {
         log_info("Received signal %d, initiating graceful shutdown...", sig);
         
-        // 立即停止所有处理
-        log_info("Stopping all processing threads...");
+        // 只设置退出标志，让主线程处理清理
+        log_info("Setting shutdown flag, main thread will handle cleanup...");
         __sync_fetch_and_and(&running, 0);
         __sync_fetch_and_and(&monitor_running, 0);
         
-        // 等待一小段时间让处理线程停止
-        usleep(100000); // 等待100ms
-        
-        // 执行完整的清理操作
-        log_info("Performing complete cleanup on signal...");
-        cleanup();
-        log_info("Complete cleanup finished on signal");
-        
         // 设置较短的超时时间
-        alarm(3); // 3秒超时
+        alarm(5); // 5秒超时
     } else {
         log_info("Forcing immediate exit...");
-        
-        // 再次执行完整清理
-        cleanup();
         
         // 恢复终端到正常状态
         printf("\033[?25h");  // 显示光标
@@ -1267,7 +1256,7 @@ int run_live_capture(const char *ifname) {
     
     log_info("Found %d available interfaces:\n", available_count);
     for (int i = 0; i < available_count; i++) {
-        log_info("  %d: %s\n", i + 1, interfaces[i]);
+        log_info("  %d: %s", i + 1, interfaces[i]);
     }
     
     // 初始化全局资源
@@ -1372,21 +1361,25 @@ int run_live_capture(const char *ifname) {
             // 定期清理不活跃的流（每1秒清理一次）
             static uint64_t last_cleanup_time = 0;
             if (current_time - last_cleanup_time >= 1000) { // 1秒（毫秒）
-                cleanup_flows();
-                last_cleanup_time = current_time;
+                if (running) {  // 只在程序运行时进行清理
+                    cleanup_flows();
+                    last_cleanup_time = current_time;
+                }
             }
             
             // 紧急清理：当内存池使用率过高时立即清理
             static uint64_t last_emergency_cleanup = 0;
             if (current_time - last_emergency_cleanup >= 250) { // 每0.25秒检查一次（毫秒）
-                size_t total_nodes, free_nodes, used_nodes;
-                mempool_get_stats(&global_pool, &total_nodes, &free_nodes, &used_nodes);
-                
-                if (used_nodes > total_nodes * 0.2) { // 使用率超过20%就触发紧急清理
-                    log_debug("Emergency cleanup triggered - memory usage: %.1f%%", 
-                             (double)used_nodes * 100.0 / total_nodes);
-                    cleanup_flows();
-                    last_emergency_cleanup = current_time;
+                if (running) {  // 只在程序运行时进行紧急清理
+                    size_t total_nodes, free_nodes, used_nodes;
+                    mempool_get_stats(&global_pool, &total_nodes, &free_nodes, &used_nodes);
+                    
+                    if (used_nodes > total_nodes * 0.2) { // 使用率超过20%就触发紧急清理
+                        log_debug("Emergency cleanup triggered - memory usage: %.1f%%", 
+                                 (double)used_nodes * 100.0 / total_nodes);
+                        cleanup_flows();
+                        last_emergency_cleanup = current_time;
+                    }
                 }
             }
         }
@@ -1397,6 +1390,38 @@ int run_live_capture(const char *ifname) {
         // 处理队列中的数据包
         process_packet_queue();
     }
+    
+    // 主循环结束后的清理逻辑
+    log_info("Main loop ended, performing cleanup...");
+    
+    // 等待队列处理完所有数据包
+    while (packet_queue_size(&packet_queue) > 0) {
+        packet_data_t packet;
+        if (packet_queue_dequeue(&packet_queue, &packet) == 0) {
+            // 直接处理数据包
+            if (packet.ip_header.protocol == IPPROTO_TCP) {
+                // 从存储的TCP头部数据中提取标志位
+                struct tcphdr *tcp_header = (struct tcphdr *)packet.transport_header.tcp.flags_byte;
+                uint8_t tcp_flags = *((uint8_t*)tcp_header + 13);  // TCP标志位在第13字节
+                uint32_t tcp_seq = packet.transport_header.tcp.seq;
+                
+                process_packet_direct(&packet.ip_header, 
+                                    packet.transport_header.tcp.source,
+                                    packet.transport_header.tcp.dest,
+                                    tcp_seq, tcp_flags, packet.timestamp);
+            } else if (packet.ip_header.protocol == IPPROTO_UDP) {
+                process_packet_direct(&packet.ip_header,
+                                    packet.transport_header.udp.source,
+                                    packet.transport_header.udp.dest,
+                                    0, 0, packet.timestamp);  // UDP没有序列号和标志位
+            }
+        }
+    }
+    
+    // 执行完整的清理操作
+    log_info("Performing complete cleanup...");
+    cleanup();
+    log_info("Cleanup completed");
     
     // 打印最终统计信息（包括CSV文件生成）
     
@@ -1522,8 +1547,8 @@ int run_single_interface_capture(const char *ifname) {
     // 添加定期处理变量
     uint64_t last_process_time = 0;
     uint64_t current_time = 0;
-    const uint64_t PROCESS_INTERVAL_MS = 300;  // 300ms处理间隔
-    const int MAX_BATCH_SIZE = 500;  // 每次最多处理500个包，避免长时间占用CPU
+    const uint64_t PROCESS_INTERVAL_MS = 50;  // 50ms处理间隔（优化：从300ms减少到50ms以减少丢包）
+    const int MAX_BATCH_SIZE = 2000;  // 每次最多处理2000个包（优化：从500增加到2000以提高吞吐量）
     
     // 添加统计输出变量
     uint64_t last_stats_time = 0;
@@ -1573,9 +1598,9 @@ int run_single_interface_capture(const char *ifname) {
             // 重置时间
             last_process_time = current_time;
             
-            // 如果队列仍然很大，给其他进程一些CPU时间
-            if (packet_queue_size(&packet_queue) > 1000) {
-                usleep(1000);  // 休眠1ms，让出CPU时间片
+            // 如果队列仍然很大，短暂让出CPU（优化：减少延迟）
+            if (packet_queue_size(&packet_queue) > 5000) {
+                usleep(100);  // 休眠0.1ms，让出CPU时间片（优化：从1ms减少到0.1ms）
             }
         }
         
@@ -1666,21 +1691,25 @@ int run_single_interface_capture(const char *ifname) {
             // 定期清理不活跃的流（每1秒清理一次）
             static uint64_t last_cleanup_time = 0;
             if (current_time - last_cleanup_time >= 1000) { // 1秒（毫秒）
-                cleanup_flows();
-                last_cleanup_time = current_time;
+                if (running) {  // 只在程序运行时进行清理
+                    cleanup_flows();
+                    last_cleanup_time = current_time;
+                }
             }
             
             // 紧急清理：当内存池使用率过高时立即清理
             static uint64_t last_emergency_cleanup = 0;
             if (current_time - last_emergency_cleanup >= 250) { // 每0.25秒检查一次（毫秒）
-                size_t total_nodes, free_nodes, used_nodes;
-                mempool_get_stats(&global_pool, &total_nodes, &free_nodes, &used_nodes);
-                
-                if (used_nodes > total_nodes * 0.2) { // 使用率超过20%就触发紧急清理
-                    log_debug("Emergency cleanup triggered - memory usage: %.1f%%", 
-                             (double)used_nodes * 100.0 / total_nodes);
-                    cleanup_flows();
-                    last_emergency_cleanup = current_time;
+                if (running) {  // 只在程序运行时进行紧急清理
+                    size_t total_nodes, free_nodes, used_nodes;
+                    mempool_get_stats(&global_pool, &total_nodes, &free_nodes, &used_nodes);
+                    
+                    if (used_nodes > total_nodes * 0.2) { // 使用率超过20%就触发紧急清理
+                        log_debug("Emergency cleanup triggered - memory usage: %.1f%%", 
+                                 (double)used_nodes * 100.0 / total_nodes);
+                        cleanup_flows();
+                        last_emergency_cleanup = current_time;
+                    }
                 }
             }
         }
