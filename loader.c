@@ -99,13 +99,19 @@ volatile uint64_t total_bytes_captured = 0;
 volatile uint64_t total_packets_processed = 0;
 volatile uint64_t total_bytes_processed = 0;
 
-
+// 详细统计计数器
+volatile uint64_t total_packets_filtered = 0;      // 被过滤的包数
+volatile uint64_t total_packets_invalid = 0;       // 无效包数
+volatile uint64_t total_packets_dropped = 0;       // 队列满丢弃的包数
+volatile uint64_t total_packets_queued = 0;        // 成功入队的包数
+volatile uint64_t total_packets_dequeued = 0;      // 成功出队的包数
 
 // 全局实时统计
 realtime_stats_t g_realtime_stats = {0};
 
 // 函数前向声明
 void print_final_stats(void);
+void analyze_packet_count_mismatch(void);
 int run_single_interface_capture(const char *ifname);
 // 删除未使用的函数声明
 static int run_monitor_mode(const char *ifname);
@@ -521,7 +527,7 @@ static void cleanup(void) {
 
     // Cleanup flow table
     if (flow_table_initialized) {
-        // print_final_stats();  // 注释掉统计结果输出
+        print_final_stats();  // 注释掉统计结果输出
         flow_table_destroy();
     }
 
@@ -683,7 +689,10 @@ static void handle_batch(void *ctx, int cpu, void *data, __u32 size) {
         
         // 使用位操作进行有效性判断
         int is_valid = (pkt->src_ip != 0) & (pkt->dst_ip != 0) & (pkt->pkt_len != 0);
-        if (!is_valid) continue;
+        if (!is_valid) {
+            __sync_fetch_and_add(&total_packets_invalid, 1);
+            continue;
+        }
         
         // 更新全局包计数器
         __sync_fetch_and_add(&global_packet_count, 1);
@@ -727,8 +736,11 @@ static void handle_batch(void *ctx, int cpu, void *data, __u32 size) {
         
         // 将数据包添加到队列
         if (packet_queue_enqueue(&packet_queue, &packet_data) != 0) {
-            // 入队失败，检查是否应该退出
+            // 入队失败，统计丢包
+            __sync_fetch_and_add(&total_packets_dropped, 1);
             if (!running) break;
+        } else {
+            __sync_fetch_and_add(&total_packets_queued, 1);
         }
     }
 }
@@ -1217,6 +1229,7 @@ static void process_packet_queue(void) {
     while (packet_queue_size(&packet_queue) > 0 && running) {
         packet_data_t packet;
         if (packet_queue_dequeue(&packet_queue, &packet) == 0) {
+            __sync_fetch_and_add(&total_packets_dequeued, 1);
             // 直接处理数据包
             if (packet.ip_header.protocol == IPPROTO_TCP) {
                 // 从存储的TCP头部数据中提取标志位
@@ -1724,6 +1737,7 @@ int run_single_interface_capture(const char *ifname) {
     while (packet_queue_size(&packet_queue) > 0 && running) {
         packet_data_t packet;
         if (packet_queue_dequeue(&packet_queue, &packet) == 0) {
+            __sync_fetch_and_add(&total_packets_dequeued, 1);
             // 直接处理数据包
             if (packet.ip_header.protocol == IPPROTO_TCP) {
                 // 从存储的TCP头部数据中提取标志位
@@ -1790,55 +1804,58 @@ void print_final_stats(void) {
     // 显示eBPF统计信息
     print_ebpf_stats();
     
+    // 分析包数不匹配
+    analyze_packet_count_mismatch();
+    
     // 获取会话创建统计
     uint64_t total_created, tcp_created, udp_created, reused;
     get_session_creation_stats(&total_created, &tcp_created, &udp_created, &reused);
     
-    printf("Session Statistics:\\n");
-    printf("  Created Sessions: %lu\\n", total_created);
-    printf("  TCP Sessions: %lu\\n", tcp_created);
-    printf("  UDP Sessions: %lu\\n", udp_created);
-    printf("  Reused Sessions: %lu\\n", reused);
+    printf("Session Statistics:\n");
+    printf("  Created Sessions: %lu\n", total_created);
+    printf("  TCP Sessions: %lu\n", tcp_created);
+    printf("  UDP Sessions: %lu\n", udp_created);
+    printf("  Reused Sessions: %lu\n", reused);
     
     // 显示流统计信息
     int all_flow_count = count_all_flows();
     int active_flow_count = count_active_flows();
     
-    printf("\\nFlow Statistics:\\n");
-    printf("  Total Flows: %d\\n", all_flow_count);
-    printf("  Active Flows: %d\\n", active_flow_count);
-    printf("  TCP Conversations: %u\\n", get_tcp_conversation_count());
-    printf("  UDP Conversations: %u\\n", get_udp_conversation_count());
-    printf("  Total Conversations: %u\\n", get_total_conversation_count());
+    printf("\nFlow Statistics:\n");
+    printf("  Total Flows: %d\n", all_flow_count);
+    printf("  Active Flows: %d\n", active_flow_count);
+    printf("  TCP Conversations: %u\n", get_tcp_conversation_count());
+    printf("  UDP Conversations: %u\n", get_udp_conversation_count());
+    printf("  Total Conversations: %u\n", get_total_conversation_count());
     
     // 显示内存使用情况
     size_t total_nodes, free_nodes, used_nodes;
     mempool_get_stats(&global_pool, &total_nodes, &free_nodes, &used_nodes);
     double usage_percent = (double)used_nodes * 100.0 / total_nodes;
     
-    printf("\\nMemory Usage:\\n");
-    printf("  Total Nodes: %zu\\n", total_nodes);
-    printf("  Used Nodes: %zu\\n", used_nodes);
-    printf("  Free Nodes: %zu\\n", free_nodes);
-    printf("  Memory Usage: %.2f%%\\n", usage_percent);
+    printf("\nMemory Usage:\n");
+    printf("  Total Nodes: %zu\n", total_nodes);
+    printf("  Used Nodes: %zu\n", used_nodes);
+    printf("  Free Nodes: %zu\n", free_nodes);
+    printf("  Memory Usage: %.2f%%\n", usage_percent);
     
     // ================== CSV导出功能 ==================
     if (csv_file) {
-        printf("\\n================== CSV Export ==================\\n");
+        printf("\n================== CSV Export ==================\n");
         
         // 检查内存状态
         check_memory_status("CSV export");
         
         // 在导出前进行内存清理
-        printf("Cleaning up memory...\\n");
+        printf("Cleaning up memory...\n");
         cleanup_flows();
         
         // 导出综合流特征到CSV
         int exported_count = export_comprehensive_flow_features_to_csv(csv_file);
         if (exported_count >= 0) {
-            printf("✅ Successfully exported %d session flow features to: %s\\n", exported_count, csv_file);
+            printf("✅ Successfully exported %d session flow features to: %s\n", exported_count, csv_file);
         } else {
-            printf("❌ Failed to export comprehensive flow features\\n");
+            printf("❌ Failed to export comprehensive flow features\n");
         }
         
         // 导出基于对话的会话到CSV（用于对比）
@@ -1846,39 +1863,39 @@ void print_final_stats(void) {
         snprintf(conversation_file, sizeof(conversation_file), "%s.conversation", csv_file);
         int conversation_count = export_conversation_based_sessions_to_csv(conversation_file);
         if (conversation_count >= 0) {
-            printf("✅ Successfully exported %d conversation-based sessions to: %s\\n", conversation_count, conversation_file);
+            printf("✅ Successfully exported %d conversation-based sessions to: %s\n", conversation_count, conversation_file);
         } else {
-            printf("❌ Failed to export conversation-based sessions\\n");
+            printf("❌ Failed to export conversation-based sessions\n");
         }
         
 
         
-        printf("\\n================== Export Complete ==================\\n");
+        printf("\n================== Export Complete ==================\n");
     }
     
-    printf("================================================\\n\\n");
+    printf("================================================\n\n");
 }
 
 // 打印使用帮助
 void print_usage(const char *prog_name) {
-    printf("Usage: %s [OPTIONS]\\n", prog_name);
-    printf("  -i, --interface <ifname>    Network interface to monitor (default: enp1s0)\\n");
-    printf("                               Use 'all' to monitor all available interfaces\\n");
-    printf("  -r, --read <pcap-file>      Read packets from pcap file instead of network\\n");
-    printf("  -d, --duration <seconds>    Run for specified duration in seconds (default: indefinite)\\n");
-    printf("  -s, --stats-interval <sec>  Interval between statistics printing (default: %d seconds)\\n", 
+    printf("Usage: %s [OPTIONS]\n", prog_name);
+    printf("  -i, --interface <ifname>    Network interface to monitor (default: enp1s0)\n");
+    printf("                               Use 'all' to monitor all available interfaces\n");
+    printf("  -r, --read <pcap-file>      Read packets from pcap file instead of network\n");
+    printf("  -d, --duration <seconds>    Run for specified duration in seconds (default: indefinite)\n");
+    printf("  -s, --stats-interval <sec>  Interval between statistics printing (default: %d seconds)\n", 
            DEFAULT_STATS_INTERVAL);
-    printf("  -p, --packets <count>       Print stats every N packets (default: %d)\\n", 
+    printf("  -p, --packets <count>       Print stats every N packets (default: %d)\n", 
            DEFAULT_STATS_PACKETS);
-    printf("  -c, --cleanup <seconds>     Flow cleanup interval (default: %d seconds)\\n", 
+    printf("  -c, --cleanup <seconds>     Flow cleanup interval (default: %d seconds)\n", 
            DEFAULT_CLEANUP_INTERVAL);
-    printf("  -o, --output <csv-file>     Export features to CSV file\\n");
-    printf("  -l, --loop <count>          Loop pcap file N times (0 = infinite, default: 1)\\n");
-    printf("  -w, --wait <seconds>        Wait N seconds between loops (default: 0)\\n");
-    printf("  -v, --verbose <level>       Debug level: 0=none, 1=basic, 2=detailed (default: 0)\\n");
-    printf("  -q, --quiet                 Quiet mode, don't print statistics to screen\\n");
-    printf("  -m, --monitor               Realtime monitor mode with ncurses interface\\n");
-    printf("  -h, --help                  Show this help message\\n");
+    printf("  -o, --output <csv-file>     Export features to CSV file\n");
+    printf("  -l, --loop <count>          Loop pcap file N times (0 = infinite, default: 1)\n");
+    printf("  -w, --wait <seconds>        Wait N seconds between loops (default: 0)\n");
+    printf("  -v, --verbose <level>       Debug level: 0=none, 1=basic, 2=detailed (default: 0)\n");
+    printf("  -q, --quiet                 Quiet mode, don't print statistics to screen\n");
+    printf("  -m, --monitor               Realtime monitor mode with ncurses interface\n");
+    printf("  -h, --help                  Show this help message\n");
 }
 
 // 启动时初始化时间基准
@@ -1946,11 +1963,11 @@ int main(int argc, char **argv) {
     ret = check_single_instance();
     if (ret > 0) {
         // 已有实例运行
-        fprintf(stderr, "Another instance is already running\\n");
+        fprintf(stderr, "Another instance is already running\n");
         return 1;
     } else if (ret < 0) {
         // 错误
-        fprintf(stderr, "Failed to check single instance, continuing...\\n");
+        fprintf(stderr, "Failed to check single instance, continuing...\n");
         // 继续运行，因为这不是致命错误
     }
 
@@ -1982,73 +1999,73 @@ int main(int argc, char **argv) {
             case 'd':
                 duration = atoi(optarg);
                 if (duration < 0) {
-                    fprintf(stderr, "Duration must be a positive number\\n");
+                    fprintf(stderr, "Duration must be a positive number\n");
                     return 1;
                 }
-                printf("Setting duration to %d seconds\\n", duration);
+                printf("Setting duration to %d seconds\n", duration);
                 break;
             case 's':
                 stats_interval = atoi(optarg);
                 if (stats_interval <= 0) {
-                    fprintf(stderr, "Stats interval must be a positive number\\n");
+                    fprintf(stderr, "Stats interval must be a positive number\n");
                     return 1;
                 }
-                printf("Setting stats interval to %d seconds\\n", stats_interval);
+                printf("Setting stats interval to %d seconds\n", stats_interval);
                 break;
             case 'p':
                 stats_packet_count = atoi(optarg);
                 if (stats_packet_count <= 0) {
-                    fprintf(stderr, "Packet count must be a positive number\\n");
+                    fprintf(stderr, "Packet count must be a positive number\n");
                     return 1;
                 }
-                printf("Setting stats packet count to %d packets\\n", stats_packet_count);
+                printf("Setting stats packet count to %d packets\n", stats_packet_count);
                 break;
             case 'c':
                 cleanup_interval = atoi(optarg);
                 if (cleanup_interval <= 0) {
-                    fprintf(stderr, "Cleanup interval must be a positive number\\n");
+                    fprintf(stderr, "Cleanup interval must be a positive number\n");
                     return 1;
                 }
-                printf("Setting cleanup interval to %d seconds\\n", cleanup_interval);
+                printf("Setting cleanup interval to %d seconds\n", cleanup_interval);
                 break;
             case 'o':
                 csv_file = optarg;
-                printf("Will export flow features to CSV file: %s\\n", csv_file);
+                printf("Will export flow features to CSV file: %s\n", csv_file);
                 break;
             case 'l':
                 loop_count = atoi(optarg);
                 if (loop_count < 0) {
-                    fprintf(stderr, "Loop count must be a non-negative number\\n");
+                    fprintf(stderr, "Loop count must be a non-negative number\n");
                     return 1;
                 }
-                printf("Setting loop count to %d\\n", loop_count);
+                printf("Setting loop count to %d\n", loop_count);
                 break;
             case 'w':
                 loop_delay = atoi(optarg);
                 if (loop_delay < 0) {
-                    fprintf(stderr, "Loop delay must be a non-negative number\\n");
+                    fprintf(stderr, "Loop delay must be a non-negative number\n");
                     return 1;
                 }
-                printf("Setting loop delay to %d seconds\\n", loop_delay);
+                printf("Setting loop delay to %d seconds\n", loop_delay);
                 break;
             case 'v':
                 {
                     int debug_level = atoi(optarg);
                     if (debug_level < 0 || debug_level > 2) {
-                        fprintf(stderr, "Debug level must be 0, 1, or 2\\n");
+                        fprintf(stderr, "Debug level must be 0, 1, or 2\n");
                         return 1;
                     }
                     set_debug_level(debug_level);
-                    printf("Setting debug level to %d\\n", debug_level);
+                    printf("Setting debug level to %d\n", debug_level);
                 }
                 break;
             case 'q':
                 quiet_mode = 1;
-                printf("Quiet mode enabled, statistics will not be printed to screen\\n");
+                printf("Quiet mode enabled, statistics will not be printed to screen\n");
                 break;
             case 'm':
                 monitor_mode = 1;
-                printf("Monitor mode enabled, will start realtime monitor interface\\n");
+                printf("Monitor mode enabled, will start realtime monitor interface\n");
                 break;
             case 'h':
                 print_usage(argv[0]);
@@ -2069,14 +2086,14 @@ int main(int argc, char **argv) {
 
     if (monitor_mode) {
         // 实时监控模式
-        printf("Starting realtime monitor mode...\\n");
+        printf("Starting realtime monitor mode...\n");
         
         // 在monitor模式下显示信息、警告和错误日志，但不显示调试信息
         set_log_level(LOG_LEVEL_INFO);
         
         // 初始化会话管理器
         if (transport_session_manager_init() != 0) {
-            fprintf(stderr, "Failed to initialize session manager\\n");
+            fprintf(stderr, "Failed to initialize session manager\n");
             return 1;
         }
         
@@ -2086,7 +2103,7 @@ int main(int argc, char **argv) {
         // 清理
         transport_session_manager_cleanup();
         
-        printf("\\nMonitor mode finished\\n");
+        printf("\nMonitor mode finished\n");
         
         return ret;
     }
@@ -2100,7 +2117,7 @@ int main(int argc, char **argv) {
     }
 
     // 打印最终消息
-    //printf("\\n程序结束\\n");
+    //printf("\n程序结束\n");
 
     return ret;
 }
@@ -2314,10 +2331,10 @@ static int run_monitor_mode(const char *ifname) {
             }
         } else if (ch == 'h' || ch == 'H') {
             // 显示帮助信息
-            printf("\\n按键帮助:\\n");
-            printf("  Q/q - 退出程序\\n");
-            printf("  E/e - 切换eBPF统计显示\\n");
-            printf("  H/h - 显示此帮助信息\\n");
+            printf("\n按键帮助:\n");
+            printf("  Q/q - 退出程序\n");
+            printf("  E/e - 切换eBPF统计显示\n");
+            printf("  H/h - 显示此帮助信息\n");
         }
         
         // 短暂休眠
@@ -2403,7 +2420,7 @@ void get_ebpf_stats(uint64_t *captured_packets, uint64_t *captured_bytes,
  * 打印eBPF统计信息
  */
 void print_ebpf_stats(void) {
-    printf("\\n================== eBPF Statistics ==================\\n");
+    printf("\n================== eBPF Statistics ==================\n");
     
     // 获取eBPF统计信息
     uint64_t captured_packets = get_ebpf_captured_packets();
@@ -2411,14 +2428,14 @@ void print_ebpf_stats(void) {
     uint64_t processed_packets = get_ebpf_processed_packets();
     uint64_t processed_bytes = get_ebpf_processed_bytes();
     
-    printf("eBPF Capture Statistics:\\n");
-    printf("  Captured Packets: %lu\\n", captured_packets);
-    printf("  Captured Bytes: %lu (%.2f MB)\\n", captured_bytes, 
+    printf("eBPF Capture Statistics:\n");
+    printf("  Captured Packets: %lu\n", captured_packets);
+    printf("  Captured Bytes: %lu (%.2f MB)\n", captured_bytes, 
            captured_bytes / (1024.0 * 1024.0));
     
-    printf("\\nProcessing Statistics:\\n");
-    printf("  Processed Packets: %lu\\n", processed_packets);
-    printf("  Processed Bytes: %lu (%.2f MB)\\n", processed_bytes, 
+    printf("\nProcessing Statistics:\n");
+    printf("  Processed Packets: %lu\n", processed_packets);
+    printf("  Processed Bytes: %lu (%.2f MB)\n", processed_bytes, 
            processed_bytes / (1024.0 * 1024.0));
     
     // 计算处理效率
@@ -2432,27 +2449,27 @@ void print_ebpf_stats(void) {
         byte_processing_ratio = (double)processed_bytes / captured_bytes * 100.0;
     }
     
-    printf("\\nProcessing Efficiency:\\n");
-    printf("  Packet Processing Rate: %.2f%%\\n", packet_processing_ratio);
-    printf("  Byte Processing Rate: %.2f%%\\n", byte_processing_ratio);
+    printf("\nProcessing Efficiency:\n");
+    printf("  Packet Processing Rate: %.2f%%\n", packet_processing_ratio);
+    printf("  Byte Processing Rate: %.2f%%\n", byte_processing_ratio);
     
     // 状态评估
-    printf("\\nStatus Assessment:\\n");
+    printf("\nStatus Assessment:\n");
     if (packet_processing_ratio < 95.0) {
-        printf("  ⚠️  Warning: Low packet processing efficiency\\n");
+        printf("  ⚠️  Warning: Low packet processing efficiency\n");
     } else {
-        printf("  ✅ Good: Packet processing efficiency is normal\\n");
+        printf("  ✅ Good: Packet processing efficiency is normal\n");
     }
     
     if (byte_processing_ratio < 95.0) {
-        printf("  ⚠️  Warning: Low byte processing efficiency\\n");
+        printf("  ⚠️  Warning: Low byte processing efficiency\n");
     } else {
-        printf("  ✅ Good: Byte processing efficiency is normal\\n");
+        printf("  ✅ Good: Byte processing efficiency is normal\n");
     }
     
-    printf("\\nNote: These statistics show the data captured by eBPF program\\n");
-    printf("and the actual processing efficiency in the user space.\\n");
-    printf("================== eBPF Statistics End ==================\\n\\n");
+    printf("\nNote: These statistics show the data captured by eBPF program\n");
+    printf("and the actual processing efficiency in the user space.\n");
+    printf("================== eBPF Statistics End ==================\n\n");
 }
 
 // 内存监控函数
@@ -2476,6 +2493,81 @@ static void check_memory_status(const char *operation) {
             log_warn("High memory usage detected (%.1f%%). Consider reducing workload or increasing system memory.", mem_usage_percent);
         }
     }
+}
+
+// 分析包数不匹配的原因
+void analyze_packet_count_mismatch(void) {
+    printf("\n================== 包数不匹配分析 ==================\n");
+    
+    // 获取各种统计
+    uint64_t captured_packets = get_ebpf_captured_packets();
+    uint64_t processed_packets = get_ebpf_processed_packets();
+    uint64_t queue_size = packet_queue_size(&packet_queue);
+    
+    // 获取会话统计
+    uint64_t total_created, tcp_created, udp_created, reused;
+    get_session_creation_stats(&total_created, &tcp_created, &udp_created, &reused);
+    
+    // 获取流统计
+    int active_flows = count_active_flows();
+    int total_flows = count_all_flows();
+    
+    printf("包数统计对比:\n");
+    printf("  eBPF捕获包数: %lu\n", captured_packets);
+    printf("  实际处理包数: %lu\n", processed_packets);
+    printf("  当前队列大小: %lu\n", queue_size);
+    
+    // 详细统计
+    printf("\n详细统计:\n");
+    printf("  成功入队包数: %lu\n", total_packets_queued);
+    printf("  成功出队包数: %lu\n", total_packets_dequeued);
+    printf("  队列满丢弃包数: %lu\n", total_packets_dropped);
+    printf("  无效包数: %lu\n", total_packets_invalid);
+    
+    if (captured_packets > processed_packets) {
+        uint64_t diff = captured_packets - processed_packets;
+        double loss_rate = (double)diff / captured_packets * 100.0;
+        printf("  ⚠️  包数差异: %lu (%.2f%%)\n", diff, loss_rate);
+        
+        printf("\n可能的原因分析:\n");
+        
+        // 检查队列是否满
+        if (queue_size > 0) {
+            printf("  1. 队列中还有 %lu 个包未处理\n", queue_size);
+        }
+        
+        // 检查处理效率
+        if (loss_rate > 5.0) {
+            printf("  2. 处理效率较低 (%.2f%% 丢包率)\n", loss_rate);
+        }
+        
+        // 检查会话创建
+        printf("  3. 会话统计:\n");
+        printf("     - 总会话创建数: %lu\n", total_created);
+        printf("     - TCP会话数: %lu\n", tcp_created);
+        printf("     - UDP会话数: %lu\n", udp_created);
+        printf("     - 会话重用数: %lu\n", reused);
+        
+        // 检查流统计
+        printf("  4. 流统计:\n");
+        printf("     - 活跃流数: %d\n", active_flows);
+        printf("     - 总流数: %d\n", total_flows);
+        
+    } else if (captured_packets < processed_packets) {
+        uint64_t diff = processed_packets - captured_packets;
+        printf("  ⚠️  处理包数多于捕获包数: %lu\n", diff);
+        printf("  可能原因: 重复处理或统计错误\n");
+    } else {
+        printf("  ✅ 包数匹配\n");
+    }
+    
+    printf("\n建议:\n");
+    printf("  1. 检查网络接口统计: ethtool -S <interface>\n");
+    printf("  2. 检查内核网络统计: cat /proc/net/softnet_stat\n");
+    printf("  3. 检查XDP程序统计: bpftool prog show name xdp_packet_capture\n");
+    printf("  4. 调整队列大小和处理间隔以减少丢包\n");
+    
+    printf("================== 分析结束 ==================\n\n");
 }
 
 

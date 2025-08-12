@@ -242,6 +242,11 @@ static transport_session_t *lockfree_allocate_session_from_pool(void) {
         atomic_store(&session->is_from_pool, true);
         atomic_store(&session->is_active, true);
         atomic_fetch_add(&global_session_manager->pool_allocations, 1);
+        
+        // Initialize timestamp arrays
+        timestamp_array_init(&session->stats.fwd_timestamps);
+        timestamp_array_init(&session->stats.bwd_timestamps);
+        
         return session;
     }
     
@@ -252,6 +257,10 @@ static transport_session_t *lockfree_allocate_session_from_pool(void) {
         atomic_store(&session->is_from_pool, false);
         atomic_store(&session->is_active, true);
         atomic_fetch_add(&global_session_manager->malloc_allocations, 1);
+        
+        // Initialize timestamp arrays
+        timestamp_array_init(&session->stats.fwd_timestamps);
+        timestamp_array_init(&session->stats.bwd_timestamps);
     }
     
     return session;
@@ -261,6 +270,10 @@ void lockfree_free_session_to_pool(transport_session_t *session) {
     if (!session || !global_session_manager) return;
     
     atomic_store(&session->is_active, false);
+    
+    // Free timestamp arrays before returning session to pool or freeing
+    timestamp_array_free(&session->stats.fwd_timestamps);
+    timestamp_array_free(&session->stats.bwd_timestamps);
     
     if (atomic_load(&session->is_from_pool)) {
         free_to_lockfree_pool(&global_session_manager->session_pool, session, session->pool_block_index);
