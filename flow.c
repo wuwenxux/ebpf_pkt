@@ -76,6 +76,12 @@ static uint64_t tcp_sessions_created = 0;
 static uint64_t udp_sessions_created = 0;
 static uint64_t sessions_reused = 0;
 
+// 添加会话创建限制
+static uint64_t max_sessions_created = 10000000; // 最大创建1000万个会话
+static uint64_t session_creation_rate_limit = 100000; // 每秒最多创建10万个会话
+static uint64_t last_session_creation_time = 0;
+static uint64_t session_creation_count_this_second = 0;
+
 // 全局对话计数器 (类似Wireshark的conversation tracking)
 static volatile uint32_t tcp_conversation_count = 0;
 static volatile uint32_t udp_conversation_count = 0;
@@ -280,22 +286,22 @@ void flow_table_init() {
     long available_memory = pages * page_size;
     long available_gb = available_memory / (1024 * 1024 * 1024);
     
-    // 根据可用内存动态调整内存池大小，更加激进
+    // 根据可用内存动态调整内存池大小，支持更大规模
     size_t pool_blocks;
     if (available_gb >= 64) {
-        pool_blocks = 200;  // 64GB+ 系统：200个块
+        pool_blocks = 1000; // 64GB+ 系统：1000个块 (约6550万个节点)
     } else if (available_gb >= 32) {
-        pool_blocks = 150;  // 32GB+ 系统：150个块
+        pool_blocks = 500;  // 32GB+ 系统：500个块 (约3270万个节点)
     } else if (available_gb >= 16) {
-        pool_blocks = 100;  // 16GB+ 系统：100个块
+        pool_blocks = 300;  // 16GB+ 系统：300个块 (约1960万个节点)
     } else if (available_gb >= 8) {
-        pool_blocks = 50;   // 8GB+ 系统：50个块
+        pool_blocks = 150;  // 8GB+ 系统：150个块 (约980万个节点)
     } else if (available_gb >= 4) {
-        pool_blocks = 25;   // 4GB+ 系统：25个块
+        pool_blocks = 100;  // 4GB+ 系统：100个块 (约650万个节点)
     } else if (available_gb >= 2) {
-        pool_blocks = 15;   // 2GB+ 系统：15个块
+        pool_blocks = 50;   // 2GB+ 系统：50个块 (约330万个节点)
     } else {
-        pool_blocks = 10;   // 小内存系统：10个块
+        pool_blocks = 25;   // 小内存系统：25个块 (约160万个节点)
     }
     
     log_info("System available memory: %ld GB, using %zu pool blocks", available_gb, pool_blocks);
@@ -402,6 +408,9 @@ struct flow_node *flow_table_insert_with_timestamp(const struct flow_key *key, u
 
     set_flow_start_time_from_timestamp(&node->stats, packet_timestamp);
     
+    // 初始化引用计数为1（创建时有一个引用）
+    atomic_init(&node->ref_count, 1);
+    
     // 初始化流统计的最小值
     node->stats.fwd_min_size = UINT32_MAX;
     node->stats.bwd_min_size = UINT32_MAX;
@@ -432,15 +441,31 @@ struct flow_node *flow_table_insert_with_timestamp(const struct flow_key *key, u
 /**
  * 创建并初始化新会话节点
  */
-static struct flow_stats* create_and_init_session_node(const struct flow_key *normalized_key, 
-                                                     uint64_t packet_timestamp,
-                                                     uint8_t tcp_flags,
-                                                     bool is_reverse,
-                                                     uint16_t original_src_port,
-                                                     uint16_t original_dst_port,
-                                                     uint32_t original_src_ip,
-                                                     uint32_t original_dst_ip,
-                                                     uint8_t protocol) {
+struct flow_stats* create_and_init_session_node(const struct flow_key *normalized_key, 
+                                               uint64_t packet_timestamp, uint8_t tcp_flags,
+                                               bool is_reverse, uint16_t original_src_port, 
+                                               uint16_t original_dst_port, uint32_t original_src_ip,
+                                               uint32_t original_dst_ip, uint8_t protocol) {
+    // 检查会话创建限制
+    uint64_t current_time = get_current_time();
+    
+    // 检查总创建数量限制
+    if (total_sessions_created >= max_sessions_created) {
+        log_warn("Session creation limit reached (%lu), skipping new session creation", max_sessions_created);
+        return NULL;
+    }
+    
+    // 检查速率限制
+    if (current_time - last_session_creation_time >= 1000000000ULL) { // 1秒
+        session_creation_count_this_second = 0;
+        last_session_creation_time = current_time;
+    }
+    
+    if (session_creation_count_this_second >= session_creation_rate_limit) {
+        log_warn("Session creation rate limit reached (%lu per second), skipping new session creation", session_creation_rate_limit);
+        return NULL;
+    }
+    
     // 创建新会话节点
     struct flow_node *new_node = flow_table_insert_with_timestamp(normalized_key, packet_timestamp);
     if (!new_node) {
@@ -467,14 +492,15 @@ static struct flow_stats* create_and_init_session_node(const struct flow_key *no
     
     // 更新统计
     total_sessions_created++;
+    session_creation_count_this_second++;
+    
     if (protocol == IPPROTO_TCP) {
         tcp_sessions_created++;
         // 注意：tcp_conversation_count已经在flow_table_insert_with_timestamp中通过assign_conversation_id_for_protocol更新
     } else if (protocol == IPPROTO_UDP) {
         udp_sessions_created++;
         // 注意：udp_conversation_count已经在flow_table_insert_with_timestamp中通过assign_conversation_id_for_protocol更新
-        // 更新UDP流计数器 - 使用函数调用而不是直接访问静态变量
-        get_next_udp_stream_id();
+        // 不再重复调用get_next_udp_stream_id()，避免双重计数
     }
     
     log_debug("Created new session: %p", (void*)new_node);
@@ -705,6 +731,13 @@ struct flow_stats* get_or_create_conversation(const struct flow_key *key, int *i
                     node->session_state == SESSION_STATE_CLOSED) {
                     should_create_new_session = true;
                 }
+                
+                // 5. 优化：减少会话创建频率，只在真正需要时创建
+                // 如果会话状态是ESTABLISHED且没有特殊标志，继续使用现有会话
+                if (node->session_state == SESSION_STATE_ESTABLISHED && 
+                    !(tcp_flags & (TCP_FLAG_SYN | TCP_FLAG_RST | TCP_FLAG_FIN))) {
+                    should_create_new_session = false;
+                }
             } else if (key->protocol == IPPROTO_UDP) {
                 // UDP会话超时时间较短
                 if (packet_timestamp - node->last_packet_time > 300000000000ULL) { // 5分钟
@@ -727,6 +760,9 @@ struct flow_stats* get_or_create_conversation(const struct flow_key *key, int *i
             
             // 更新会话状态
             update_session_state(node, tcp_flags);
+            
+            // 增加引用计数（因为返回了flow的引用）
+            flow_ref_inc(node);
             
             log_debug("Reusing existing session: %p", (void*)node);
             return &node->stats;
@@ -819,24 +855,32 @@ void process_packet(const struct iphdr *ip, const void *transport_hdr, uint64_t 
     struct flow_stats *stats = get_or_create_conversation(&key, &is_reverse, packet_timestamp, flags);
     
     if (stats) {
+        // 获取对应的flow_node
+        struct flow_node *flow_node = (struct flow_node *)((char *)stats - offsetof(struct flow_node, stats));
+        
         uint32_t pkt_size = ntohs(ip->tot_len);
         
         // 更新流统计
         update_flow_stats(stats, pkt_size, is_reverse, packet_timestamp);
         
         // 优化：只在会话不存在时才创建会话，避免重复创建
-        static uint64_t last_session_check_time = 0;
+        // 修复：使用基于流键的时间检查，而不是全局静态变量
+        static uint64_t session_check_times[HASH_TABLE_SIZE] = {0};
+        uint32_t flow_hash = hash_flow_key(&key);
         uint64_t current_time = get_current_time();
         
-        // 每100ms检查一次会话，而不是每个包都检查
-        if (current_time - last_session_check_time > 100000000ULL) { // 100ms in nanoseconds
+        // 每个流独立检查，每100ms检查一次会话
+        if (current_time - session_check_times[flow_hash] > 100000000ULL) { // 100ms in nanoseconds
             transport_session_t *session = process_packet_with_conversation(&key, pkt_size, flags, packet_timestamp);
             if (session) {
                 // 计算会话特征
                 calculate_session_features(session);
             }
-            last_session_check_time = current_time;
+            session_check_times[flow_hash] = current_time;
         }
+        
+        // 处理完成后减少引用计数
+        flow_ref_dec(flow_node);
     }
 }
 
@@ -908,16 +952,29 @@ int count_all_flows() {
 void flow_table_destroy() {
     if (!flow_table_initialized) return;
     
+    log_info("Starting flow table destruction - releasing all flows and sessions");
+    
+    int total_flows = 0;
+    int total_sessions_cleaned = 0;
+    
     for (int i = 0; i < HASH_TABLE_SIZE; i++) {
         struct flow_node *node = flow_table[i];
         while (node) {
             struct flow_node *next = node->next;
+            total_flows++;
+            
+            // 清理对应的所有session
+            int session_cleaned = cleanup_sessions_by_flow_key(&node->key);
+            if (session_cleaned > 0) {
+                total_sessions_cleaned += session_cleaned;
+                log_debug("Cleaned up %d sessions for flow during destruction", session_cleaned);
+            }
             
             // 清理时间戳数组
             timestamp_array_free(&node->stats.fwd_timestamps);
             timestamp_array_free(&node->stats.bwd_timestamps);
-
-
+            
+            // 释放flow节点
             mempool_free(&global_pool, node);
             node = next;
         }
@@ -932,7 +989,8 @@ void flow_table_destroy() {
     
     flow_table_initialized = 0;
     
-    log_info("Flow table destroyed, all counters reset");
+    log_info("Flow table destroyed: %d flows and %d sessions released, all counters reset", 
+             total_flows, total_sessions_cleaned);
 }
 
 void cleanup_flows() {
@@ -961,7 +1019,6 @@ void cleanup_flows() {
     
     for (int i = 0; i < HASH_TABLE_SIZE; i++) {
         struct flow_node *node = flow_table[i];
-        struct flow_node *prev = NULL;
         
         while (node) {
             struct flow_node *next = node->next;
@@ -990,25 +1047,15 @@ void cleanup_flows() {
             }
             
             if (should_cleanup) {
-                // 从链表中移除节点
-                if (prev) {
-                    prev->next = next;
-                } else {
-                    flow_table[i] = next;
-                }
-                
-                // 释放时间戳数组内存
-                timestamp_array_free(&node->stats.fwd_timestamps);
-                timestamp_array_free(&node->stats.bwd_timestamps);
-
-                
-
-                
-                // 返回到内存池
-                mempool_free(&global_pool, node);
+                // 对于超时的flow，只是减少引用计数，让引用计数机制决定何时释放
+                log_debug("Flow timeout, decreasing ref count: %u.%u.%u.%u:%u -> %u.%u.%u.%u:%u (proto: %u)", 
+                         (node->key.src_ip >> 24) & 0xFF, (node->key.src_ip >> 16) & 0xFF, 
+                         (node->key.src_ip >> 8) & 0xFF, node->key.src_ip & 0xFF, ntohs(node->key.src_port),
+                         (node->key.dst_ip >> 24) & 0xFF, (node->key.dst_ip >> 16) & 0xFF, 
+                         (node->key.dst_ip >> 8) & 0xFF, node->key.dst_ip & 0xFF, ntohs(node->key.dst_port),
+                         node->key.protocol);
+                flow_ref_dec(node);
                 cleaned_count++;
-            } else {
-                prev = node;
             }
             
             node = next;
@@ -1016,7 +1063,7 @@ void cleanup_flows() {
     }
     
     if (cleaned_count > 0) {
-        log_info("Cleaned up %d inactive flows (memory usage: %.1f%%)", cleaned_count, usage_ratio * 100.0);
+        log_info("Decreased ref count for %d expired flows (memory usage: %.1f%%)", cleaned_count, usage_ratio * 100.0);
     }
 }
 
@@ -1025,6 +1072,135 @@ void cleanup_flows() {
 
 
 
+
+// =================== 引用计数管理函数 ===================
+
+void flow_ref_inc(struct flow_node *node) {
+    if (!node) return;
+    atomic_fetch_add(&node->ref_count, 1);
+    log_debug("Flow ref count increased to %d for flow: %u.%u.%u.%u:%u -> %u.%u.%u.%u:%u (proto: %u)", 
+              atomic_load(&node->ref_count),
+              (node->key.src_ip >> 24) & 0xFF, (node->key.src_ip >> 16) & 0xFF, 
+              (node->key.src_ip >> 8) & 0xFF, node->key.src_ip & 0xFF, ntohs(node->key.src_port),
+              (node->key.dst_ip >> 24) & 0xFF, (node->key.dst_ip >> 16) & 0xFF, 
+              (node->key.dst_ip >> 8) & 0xFF, node->key.dst_ip & 0xFF, ntohs(node->key.dst_port),
+              node->key.protocol);
+}
+
+void flow_ref_dec(struct flow_node *node) {
+    if (!node) return;
+    
+    int old_count = atomic_fetch_sub(&node->ref_count, 1);
+    int new_count = old_count - 1;
+    
+    log_debug("Flow ref count decreased to %d for flow: %u.%u.%u.%u:%u -> %u.%u.%u.%u:%u (proto: %u)", 
+              new_count,
+              (node->key.src_ip >> 24) & 0xFF, (node->key.src_ip >> 16) & 0xFF, 
+              (node->key.src_ip >> 8) & 0xFF, node->key.src_ip & 0xFF, ntohs(node->key.src_port),
+              (node->key.dst_ip >> 24) & 0xFF, (node->key.dst_ip >> 16) & 0xFF, 
+              (node->key.dst_ip >> 8) & 0xFF, node->key.dst_ip & 0xFF, ntohs(node->key.dst_port),
+              node->key.protocol);
+    
+    // 当引用计数为0时，释放flow
+    if (new_count == 0) {
+        log_info("Flow ref count reached 0, releasing flow: %u.%u.%u.%u:%u -> %u.%u.%u.%u:%u (proto: %u)", 
+                 (node->key.src_ip >> 24) & 0xFF, (node->key.src_ip >> 16) & 0xFF, 
+                 (node->key.src_ip >> 8) & 0xFF, node->key.src_ip & 0xFF, ntohs(node->key.src_port),
+                 (node->key.dst_ip >> 24) & 0xFF, (node->key.dst_ip >> 16) & 0xFF, 
+                 (node->key.dst_ip >> 8) & 0xFF, node->key.dst_ip & 0xFF, ntohs(node->key.dst_port),
+                 node->key.protocol);
+        
+        // 使用专门的清理函数
+        cleanup_flow_and_sessions(node);
+    }
+}
+
+int flow_get_ref_count(struct flow_node *node) {
+    if (!node) return 0;
+    return atomic_load(&node->ref_count);
+}
+
+void print_flow_ref_counts() {
+    if (!flow_table_initialized) return;
+    
+    printf("\n================== Flow Reference Counts ==================\n");
+    int total_flows = 0;
+    int flows_with_refs = 0;
+    
+    for (int i = 0; i < HASH_TABLE_SIZE; i++) {
+        struct flow_node *node = flow_table[i];
+        while (node) {
+            total_flows++;
+            int ref_count = flow_get_ref_count(node);
+            if (ref_count > 0) {
+                flows_with_refs++;
+                printf("Flow: %u.%u.%u.%u:%u -> %u.%u.%u.%u:%u (proto: %u) - Ref Count: %d\n",
+                       (node->key.src_ip >> 24) & 0xFF, (node->key.src_ip >> 16) & 0xFF, 
+                       (node->key.src_ip >> 8) & 0xFF, node->key.src_ip & 0xFF, ntohs(node->key.src_port),
+                       (node->key.dst_ip >> 24) & 0xFF, (node->key.dst_ip >> 16) & 0xFF, 
+                       (node->key.dst_ip >> 8) & 0xFF, node->key.dst_ip & 0xFF, ntohs(node->key.dst_port),
+                       node->key.protocol, ref_count);
+            }
+            node = node->next;
+        }
+    }
+    
+    printf("Total flows: %d, Flows with refs: %d\n", total_flows, flows_with_refs);
+    printf("========================================================\n\n");
+}
+
+/**
+ * 释放flow及其所有相关session
+ * 返回清理的session数量
+ */
+int cleanup_flow_and_sessions(struct flow_node *node) {
+    if (!node || !flow_table_initialized) {
+        return -1;
+    }
+    
+    log_info("Cleaning up flow and sessions: %u.%u.%u.%u:%u -> %u.%u.%u.%u:%u (proto: %u)", 
+             (node->key.src_ip >> 24) & 0xFF, (node->key.src_ip >> 16) & 0xFF, 
+             (node->key.src_ip >> 8) & 0xFF, node->key.src_ip & 0xFF, ntohs(node->key.src_port),
+             (node->key.dst_ip >> 24) & 0xFF, (node->key.dst_ip >> 16) & 0xFF, 
+             (node->key.dst_ip >> 8) & 0xFF, node->key.dst_ip & 0xFF, ntohs(node->key.dst_port),
+             node->key.protocol);
+    
+    // 清理对应的所有session
+    int session_cleaned = cleanup_sessions_by_flow_key(&node->key);
+    if (session_cleaned > 0) {
+        log_info("Cleaned up %d sessions for flow", session_cleaned);
+    }
+    
+    // 从哈希表中移除flow节点
+    uint32_t hash = hash_flow_key(&node->key);
+    struct flow_node *current = flow_table[hash];
+    struct flow_node *prev = NULL;
+    
+    while (current) {
+        if (current == node) {
+            // 从链表中移除节点
+            if (prev) {
+                prev->next = current->next;
+            } else {
+                flow_table[hash] = current->next;
+            }
+            
+            // 释放时间戳数组内存
+            timestamp_array_free(&node->stats.fwd_timestamps);
+            timestamp_array_free(&node->stats.bwd_timestamps);
+            
+            // 返回到内存池
+            mempool_free(&global_pool, node);
+            log_info("Flow and sessions released successfully");
+            return session_cleaned;
+        }
+        prev = current;
+        current = current->next;
+    }
+    
+    log_warn("Flow node not found in hash table during cleanup");
+    return -1;
+}
 
 // =================== 缺失的函数实现 ===================
 
@@ -1383,7 +1559,7 @@ struct flow_stats* get_or_create_udp_conversation(const struct flow_key *key, in
         //     return NULL;
         // }
         // 验证节点指针的有效性
-        if (!node || (uintptr_t)node < 0x1000) {
+        if (!node || (uintptr_t)node < 0x1000) { 
             log_debug("Invalid UDP node pointer detected, skipping");
             node = node->next;
             continue;
@@ -1396,6 +1572,12 @@ struct flow_stats* get_or_create_udp_conversation(const struct flow_key *key, in
             // 更新时间戳
             node->stats.last_seen = packet_timestamp;
             node->last_packet_time = packet_timestamp;
+            
+            // 更新重用统计
+            sessions_reused++;
+            
+            // 增加引用计数（因为返回了flow的引用）
+            flow_ref_inc(node);
             
             log_debug("Reusing UDP session: stream_id=%u", 0);  // 简化版本
             return &node->stats;
@@ -1436,8 +1618,8 @@ int verify_udp_conversation_count() {
         }
     }
     
-    log_debug("UDP conversation count verification: counter=%u, manual count=%d", 
-               udp_stream_counter, manual_count);
+    log_debug("UDP conversation count verification: udp_stream_counter=%u, udp_conversation_count=%u, manual count=%d", 
+               udp_stream_counter, atomic_load(&udp_conversation_count), manual_count);
     
     return manual_count;
 }
@@ -1473,8 +1655,8 @@ void print_udp_conversation_details() {
         }
     }
     
-    if (udp_conv_printed == 15 && udp_stream_counter > 15) {
-        printf("... (显示前15个UDP对话，总共%u个)\n", udp_stream_counter);
+    if (udp_conv_printed == 15 && atomic_load(&udp_conversation_count) > 15) {
+        printf("... (显示前15个UDP对话，总共%u个)\n", atomic_load(&udp_conversation_count));
     }
     
     printf("\n注意: 此统计基于Wireshark的UDP stream机制\n");

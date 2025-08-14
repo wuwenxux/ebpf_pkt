@@ -182,7 +182,7 @@ void get_latest_sessions(session_display_info_t *sessions, int max_count, int *a
                 info->bytes_total = session->stats.total_bytes;
                 
                 // features前20个属性
-                struct flow_features *features = &session->stats.features;
+                struct flow_features *features = session->stats.features;
                 info->fl_dur = features->fl_dur;
                 strncpy(info->features_start_time, features->start_time_str, sizeof(info->features_start_time) - 1);
                 info->tot_fw_pk = features->tot_fw_pk;

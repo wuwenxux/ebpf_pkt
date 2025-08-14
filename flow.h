@@ -14,6 +14,7 @@
 #include <netinet/in.h>
 #include <arpa/inet.h>
 #include <stdatomic.h>
+#include "common_types.h"  // 添加共享类型支持
 
 // Cache line alignment for performance optimization
 #define CACHE_LINE_SIZE 64
@@ -174,23 +175,7 @@ typedef enum {
     ((unsigned char *)&addr)[2], \
     ((unsigned char *)&addr)[3]
 
-// 流键结构增强版 - Cache line aligned for performance
-struct flow_key {
-    uint32_t src_ip;
-    uint32_t dst_ip;
-    uint16_t src_port;
-    uint16_t dst_port;
-    uint8_t  protocol;
-    // Padding to ensure cache line alignment
-    uint8_t  padding[3];
-};
-
-// 用于存储包间隔时间的数组
-typedef struct {
-    uint64_t *times;       // 时间戳数组 (纳秒)
-    size_t count;          // 当前数组大小
-    size_t capacity;       // 数组容量
-} timestamp_array_t;
+// 流键结构和timestamp_array_t现在在common_types.h中定义
 
 // UDP流量统计结构
 
@@ -377,6 +362,7 @@ struct flow_node {
     struct flow_node *next;
     uint8_t in_use;         // 标记是否使用中
     uint8_t tcp_state;      // TCP连接状态
+    atomic_int ref_count;   // 引用计数
     
     // =================== 原始端口号字段（用于CSV输出）===================
     uint16_t original_src_port;     // 原始源端口号（数据包中的实际端口）
@@ -412,6 +398,15 @@ void ns_to_timespec(uint64_t timestamp_ns, struct timespec *ts);
 void flow_table_destroy();
 void cleanup_flows();
 
+// 引用计数管理函数
+void flow_ref_inc(struct flow_node *node);  // 增加引用计数
+void flow_ref_dec(struct flow_node *node);  // 减少引用计数，当计数为0时自动释放
+int flow_get_ref_count(struct flow_node *node);  // 获取引用计数
+void print_flow_ref_counts();  // 打印所有flow的引用计数（调试用）
+
+// Flow清理函数
+int cleanup_flow_and_sessions(struct flow_node *node);  // 释放flow及其所有session
+
 // Time utility function
 double time_diff(const struct timespec *end, const struct timespec *start);
 
@@ -422,7 +417,7 @@ void calculate_flow_features(const struct flow_stats *stats, struct flow_feature
 
 void process_packet(const struct iphdr *ip, const void *transport_hdr, uint64_t packet_timestamp);
 int count_active_flows();
-int count_all_flows();
+int count_all_flows();  // 统计唯一的五元组数量
 
 // UDP流管理 - Wireshark风格
 void reset_udp_stream_counter(void);
@@ -500,7 +495,12 @@ struct flow_node *flow_table_insert_with_timestamp(const struct flow_key *key, u
 struct flow_stats* get_or_create_conversation(const struct flow_key *key, int *is_reverse_ptr, uint64_t packet_timestamp, uint8_t tcp_flags);
 struct flow_stats* get_or_create_udp_conversation(const struct flow_key *key, int *is_reverse_ptr, uint64_t packet_timestamp);
 
-
+// 会话创建函数
+struct flow_stats* create_and_init_session_node(const struct flow_key *normalized_key, 
+                                               uint64_t packet_timestamp, uint8_t tcp_flags,
+                                               bool is_reverse, uint16_t original_src_port, 
+                                               uint16_t original_dst_port, uint32_t original_src_ip,
+                                               uint32_t original_dst_ip, uint8_t protocol);
 
 // 包处理
 void process_packet(const struct iphdr *ip, const void *transport_hdr, uint64_t packet_timestamp);

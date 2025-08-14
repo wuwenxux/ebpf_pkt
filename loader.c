@@ -181,7 +181,7 @@ typedef struct {
 // Default settings
 #define DEFAULT_STATS_INTERVAL 2   // 5 seconds between stats prints
 #define DEFAULT_STATS_PACKETS 1000 // Print stats every 1000 packets
-#define DEFAULT_CLEANUP_INTERVAL 10 // 10 seconds between flow cleanups
+#define DEFAULT_CLEANUP_INTERVAL 5  // 4GB优化：5秒清理间隔，更频繁清理
 #define DEFAULT_DURATION 0         // 0 means run indefinitely
 #define DEFAULT_CSV_FILE NULL      // Default CSV file (none)
 #define DEFAULT_LOOP_COUNT 1       // Default loop count (1 = no loop)
@@ -1797,15 +1797,9 @@ struct flow_info {
 
 
 
-// 实现print_final_stats函数 - 在程序结束时打印最终统计（按时间顺序）
+// 实现print_final_stats函数 - 精简版本
 void print_final_stats(void) {
     printf("\n================== Final Statistics ==================\n");
-    
-    // 显示eBPF统计信息
-    print_ebpf_stats();
-    
-    // 分析包数不匹配
-    analyze_packet_count_mismatch();
     
     // 获取会话创建统计
     uint64_t total_created, tcp_created, udp_created, reused;
@@ -1826,29 +1820,16 @@ void print_final_stats(void) {
     printf("  Active Flows: %d\n", active_flow_count);
     printf("  TCP Conversations: %u\n", get_tcp_conversation_count());
     printf("  UDP Conversations: %u\n", get_udp_conversation_count());
-    printf("  Total Conversations: %u\n", get_total_conversation_count());
-    
-    // 显示内存使用情况
-    size_t total_nodes, free_nodes, used_nodes;
-    mempool_get_stats(&global_pool, &total_nodes, &free_nodes, &used_nodes);
-    double usage_percent = (double)used_nodes * 100.0 / total_nodes;
-    
-    printf("\nMemory Usage:\n");
-    printf("  Total Nodes: %zu\n", total_nodes);
-    printf("  Used Nodes: %zu\n", used_nodes);
-    printf("  Free Nodes: %zu\n", free_nodes);
-    printf("  Memory Usage: %.2f%%\n", usage_percent);
     
     // ================== CSV导出功能 ==================
     if (csv_file) {
         printf("\n================== CSV Export ==================\n");
         
-        // 检查内存状态
-        check_memory_status("CSV export");
-        
         // 在导出前进行内存清理
         printf("Cleaning up memory...\n");
+        printf("TCP sessions before cleanup: %u\n", get_tcp_conversation_count());
         cleanup_flows();
+        printf("TCP sessions after cleanup: %u\n", get_tcp_conversation_count());
         
         // 导出综合流特征到CSV
         int exported_count = export_comprehensive_flow_features_to_csv(csv_file);
@@ -1858,18 +1839,7 @@ void print_final_stats(void) {
             printf("❌ Failed to export comprehensive flow features\n");
         }
         
-        // 导出基于对话的会话到CSV（用于对比）
-        char conversation_file[512];
-        snprintf(conversation_file, sizeof(conversation_file), "%s.conversation", csv_file);
-        int conversation_count = export_conversation_based_sessions_to_csv(conversation_file);
-        if (conversation_count >= 0) {
-            printf("✅ Successfully exported %d conversation-based sessions to: %s\n", conversation_count, conversation_file);
-        } else {
-            printf("❌ Failed to export conversation-based sessions\n");
-        }
-        
-
-        
+        printf("TCP sessions after export: %u\n", get_tcp_conversation_count());
         printf("\n================== Export Complete ==================\n");
     }
     

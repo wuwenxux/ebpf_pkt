@@ -275,6 +275,12 @@ void lockfree_free_session_to_pool(transport_session_t *session) {
     timestamp_array_free(&session->stats.fwd_timestamps);
     timestamp_array_free(&session->stats.bwd_timestamps);
     
+    // Free features memory
+    if (session->stats.features) {
+        free(session->stats.features);
+        session->stats.features = NULL;
+    }
+    
     if (atomic_load(&session->is_from_pool)) {
         free_to_lockfree_pool(&global_session_manager->session_pool, session, session->pool_block_index);
     } else {
@@ -766,7 +772,7 @@ int export_session_detailed_features(transport_session_t *session, FILE *fp) {
         return -1;
     }
 
-    struct flow_features *features = &session->stats.features;
+    struct flow_features *features = session->stats.features;
     
     // IP地址转换为字符串
     struct in_addr addr;
@@ -906,7 +912,7 @@ int export_all_sessions_to_csv(const char *filename) {
 
 // =================== 内部辅助函数声明 ===================
 
-static transport_session_t *find_session_by_flow_key(const struct flow_key *key);
+// 移除static声明，因为函数已经在头文件中声明为非static
 static tcp_session_state_t determine_tcp_state_from_flags(uint8_t tcp_flags);
 static void sync_session_stats_from_conversation(transport_session_t *session);
 
@@ -1104,7 +1110,13 @@ int calculate_session_features(transport_session_t *session) {
     if (!session) {
         return -1;
     }
-    struct flow_features *features = &session->stats.features;
+    struct flow_features *features = session->stats.features;
+    
+    // 检查features指针是否有效
+    if (!features) {
+        log_error("Session features pointer is NULL in calculate_session_features");
+        return -1;
+    }
     
     // 重置特征结构
     memset(features, 0, sizeof(struct flow_features));
@@ -1225,7 +1237,7 @@ int calculate_session_features(transport_session_t *session) {
 static void calculate_iat_features(transport_session_t *session) {
     if (!session) return;
     
-    struct flow_features *features = &session->stats.features;
+    struct flow_features *features = session->stats.features;
     
     // 计算正向IAT统计
     if (session->stats.fwd_timestamps.count > 1) {
@@ -1297,7 +1309,7 @@ static int compare_timestamps(const void *a, const void *b) {
 static void calculate_flow_iat_stats(transport_session_t *session) {
     if (!session) return;
     
-    struct flow_features *features = &session->stats.features;
+    struct flow_features *features = session->stats.features;
     
     // 合并正向和反向时间戳
     uint32_t total_count = session->stats.fwd_timestamps.count + session->stats.bwd_timestamps.count;
@@ -1477,6 +1489,15 @@ transport_session_t *get_or_create_session_from_conversation(const struct flow_k
         ts.tv_nsec = timestamp % 1000000000ULL;
         session->last_activity = ts;
         session->stats.last_packet = timestamp;
+        
+        // 优化：只有在会话状态发生变化时才更新
+        if (key->protocol == IPPROTO_TCP) {
+            tcp_session_state_t new_state = determine_tcp_state_from_flags(tcp_flags);
+            if (new_state != session->state.tcp_state) {
+                session->state.tcp_state = new_state;
+            }
+        }
+        
         return session;
     }
     
@@ -1512,6 +1533,14 @@ transport_session_t *get_or_create_session_from_conversation(const struct flow_k
     session->stats.bytes_in = flow_stats->bwd_bytes;
     session->stats.bytes_out = flow_stats->fwd_bytes;
     
+    // 初始化features指针 - 分配内存并初始化为0
+    session->stats.features = (struct flow_features*)calloc(1, sizeof(struct flow_features));
+    if (!session->stats.features) {
+        log_error("Failed to allocate memory for session features");
+        lockfree_free_session_to_pool(session);
+        return NULL;
+    }
+    
     // 设置会话状态
     if (key->protocol == IPPROTO_TCP) {
         session->state.tcp_state = determine_tcp_state_from_flags(tcp_flags);
@@ -1521,6 +1550,7 @@ transport_session_t *get_or_create_session_from_conversation(const struct flow_k
     
     // 使用无锁插入到哈希表
     if (lockfree_insert_session(session) != 0) {
+        free(session->stats.features);  // 释放features内存
         lockfree_free_session_to_pool(session);
         return NULL;
     }
@@ -1533,13 +1563,77 @@ transport_session_t *get_or_create_session_from_conversation(const struct flow_k
 /**
  * 根据flow key查找会话
  */
-static transport_session_t *find_session_by_flow_key(const struct flow_key *key) {
+transport_session_t *find_session_by_flow_key(const struct flow_key *key) {
     if (!atomic_load(&session_manager_initialized) || !global_session_manager || !key) {
         return NULL;
     }
     
     // 直接使用现有的lockfree_find_session函数
     return lockfree_find_session(key);
+}
+
+/**
+ * 清理指定flow key的所有相关session
+ * 返回清理的session数量
+ */
+int cleanup_sessions_by_flow_key(const struct flow_key *key) {
+    if (!atomic_load(&session_manager_initialized) || !global_session_manager || !key) {
+        return 0;
+    }
+    
+    int cleaned_count = 0;
+    uint32_t hash = hash_flow_key(key);
+    
+    // 遍历哈希桶中的所有session
+    transport_session_t *session = atomic_load_session_ptr(&global_session_manager->sessions[hash]);
+    transport_session_t *prev = NULL;
+    
+    while (session) {
+        transport_session_t *next = atomic_load_session_ptr(&session->next_atomic);
+        
+        // 检查session是否匹配指定的flow key
+        if (memcmp(&session->key, key, sizeof(struct flow_key)) == 0) {
+            // 从链表中移除session
+            if (prev) {
+                atomic_store_session_ptr(&prev->next_atomic, next);
+                prev->next = next;
+            } else {
+                atomic_store(&global_session_manager->sessions[hash], (uintptr_t)next);
+            }
+            
+            if (next) {
+                atomic_store_session_ptr(&next->prev_atomic, prev);
+                next->prev = prev;
+            }
+            
+            // 更新统计信息
+            atomic_fetch_sub(&global_session_manager->active_sessions, 1);
+            atomic_fetch_add(&global_session_manager->sessions_destroyed, 1);
+            
+            if (session->type == SESSION_TYPE_TCP) {
+                atomic_fetch_sub(&global_session_manager->tcp_sessions, 1);
+            } else if (session->type == SESSION_TYPE_UDP) {
+                atomic_fetch_sub(&global_session_manager->udp_sessions, 1);
+            }
+            
+            // 释放session到内存池
+            lockfree_free_session_to_pool(session);
+            cleaned_count++;
+            
+            log_debug("Cleaned up session for flow key: %u.%u.%u.%u:%u -> %u.%u.%u.%u:%u (proto: %u)", 
+                     (key->src_ip >> 24) & 0xFF, (key->src_ip >> 16) & 0xFF, 
+                     (key->src_ip >> 8) & 0xFF, key->src_ip & 0xFF, ntohs(key->src_port),
+                     (key->dst_ip >> 24) & 0xFF, (key->dst_ip >> 16) & 0xFF, 
+                     (key->dst_ip >> 8) & 0xFF, key->dst_ip & 0xFF, ntohs(key->dst_port),
+                     key->protocol);
+        } else {
+            prev = session;
+        }
+        
+        session = next;
+    }
+    
+    return cleaned_count;
 }
 
 /**
@@ -2194,7 +2288,7 @@ int export_comprehensive_flow_features_to_csv(const char *filename) {
 int export_comprehensive_session_features(transport_session_t *session, FILE *fp) {
     if (!session || !fp) return -1;
     
-    struct flow_features *features = &session->stats.features;
+    struct flow_features *features = session->stats.features;
     
     // 转换IP地址为字符串
     struct in_addr addr;

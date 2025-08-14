@@ -8,7 +8,7 @@
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
-#include "flow.h"
+#include "common_types.h"
 #include "logger.h"
 
 // Cache line alignment for performance optimization
@@ -20,20 +20,24 @@
 // 实际会话数: 146,588，建议哈希表大小为会话数的4倍
 #define SESSION_HASH_SIZE 1048576  // 1M 哈希桶 (2^20)
 
-// 最大会话数 - 基于实际使用情况调整
-// 当前实际会话数: 146,588，预留3倍空间
-#define MAX_SESSIONS 1000000       // 100万会话
+// 最大会话数 - 恢复原来的配置，支持14万会话
+#define MAX_SESSIONS 10000000      // 1000万会话，支持更大规模的创建逻辑
 
 // 内存池配置 - 基于实际并发会话数调整
-#define MEMORY_POOL_SIZE 100000    // 减少到10万个会话的内存池，更加保守
+#define MEMORY_POOL_SIZE 100000    // 10万个会话的内存池
 
-// 会话超时配置 (纳秒)
-#define SESSION_TIMEOUT_NS 300000000000ULL  // 5分钟超时
-#define SESSION_CLEANUP_INTERVAL_NS 60000000000ULL  // 1分钟清理间隔
+// 会话超时配置 (纳秒) - 更激进的清理策略
+#define SESSION_TIMEOUT_NS 180000000000ULL  // 3分钟超时（更短）
+#define SESSION_CLEANUP_INTERVAL_NS 30000000000ULL  // 30秒清理间隔（更频繁）
 
 // 性能调优参数 - 基于实际负载调整
-#define HASH_COLLISION_THRESHOLD 5   // 哈希冲突阈值 (降低)
-#define LOAD_FACTOR_THRESHOLD 0.70   // 负载因子阈值 (降低)
+#define HASH_COLLISION_THRESHOLD 5   // 哈希冲突阈值
+#define LOAD_FACTOR_THRESHOLD 0.70   // 负载因子阈值
+
+// 会话清理策略配置
+#define SESSION_CLEANUP_BATCH_SIZE 1000    // 每次清理1000个会话
+#define SESSION_CLEANUP_MEMORY_THRESHOLD 0.8  // 内存使用率超过80%时触发清理
+#define SESSION_CLEANUP_AGE_THRESHOLD 60000000000ULL  // 1分钟无活动的会话优先清理
 
 // 会话类型枚举
 typedef enum {
@@ -121,8 +125,8 @@ typedef struct session_stats {
     uint64_t idle_max_ns;               // 最大空闲时间
     uint64_t idle_min_ns;               // 最小空闲时间
     
-    // 流特征
-    struct flow_features features;      // 流特征结构
+    // 流特征（使用指针避免循环依赖）
+    struct flow_features *features;     // 流特征结构指针
 } session_stats_t;
 
 // 会话导出数据结构
@@ -273,13 +277,21 @@ uint32_t get_lockfree_pool_usage_percent(const memory_pool_t *pool);
 transport_session_t *lockfree_find_session(const struct flow_key *key);
 int lockfree_insert_session(transport_session_t *session);
 int lockfree_remove_session(transport_session_t *session);
+transport_session_t *find_session_by_flow_key(const struct flow_key *key);  // 根据flow key查找会话
+int cleanup_sessions_by_flow_key(const struct flow_key *key);  // 清理指定flow key的所有相关session
 
 // 会话创建函数更新
 transport_session_t *create_transport_session_with_state(const struct flow_key *key, 
                                                         uint8_t state_id, 
                                                         uint64_t timestamp);
 
-
+// 会话清理函数声明
+int cleanup_expired_sessions(uint64_t current_time);
+int cleanup_sessions_by_memory_pressure(void);
+int cleanup_oldest_sessions(int max_cleanup_count);
+void start_session_cleanup_thread(void);
+void stop_session_cleanup_thread(void);
+uint32_t get_session_cleanup_stats(uint64_t *total_cleaned, uint64_t *expired_cleaned, uint64_t *memory_cleaned);
 
 // 性能监控函数
 void print_lockfree_pool_stats(const memory_pool_t *pool);
