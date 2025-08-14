@@ -234,10 +234,15 @@ void timestamp_array_init(timestamp_array_t *arr) {
 }
 
 void timestamp_array_add(timestamp_array_t *arr, uint64_t timestamp) {
+    // 注意：调用此函数时，调用者应该已经锁定了相应的对象
+    // 这里不再重复加锁，避免死锁
+    
     if (arr->count >= arr->capacity) {
         size_t new_capacity = arr->capacity == 0 ? 16 : arr->capacity * 2;
         uint64_t *new_times = realloc(arr->times, new_capacity * sizeof(uint64_t));
-        if (!new_times) return;
+        if (!new_times) {
+            return;
+        }
         
         arr->times = new_times;
         arr->capacity = new_capacity;
@@ -247,6 +252,9 @@ void timestamp_array_add(timestamp_array_t *arr, uint64_t timestamp) {
 }
 
 void timestamp_array_free(timestamp_array_t *arr) {
+    // 注意：调用此函数时，调用者应该已经锁定了相应的对象
+    // 这里不再重复加锁，避免死锁
+    
     if (arr->times) {
         free(arr->times);
         arr->times = NULL;
@@ -339,19 +347,38 @@ void flow_table_init() {
     log_info("Flow table initialization completed, all counters reset");
 }
 
-uint32_t hash_flow_key(const struct flow_key *key) {
-    uint32_t hash = 0;
-    hash ^= key->src_ip;
-    hash ^= key->dst_ip;
-    hash ^= ((uint32_t)key->src_port << 16) | key->dst_port;
-    hash ^= key->protocol;
+// 哈希性能统计
+static volatile uint64_t hash_collision_count = 0;
+static volatile uint64_t hash_total_operations = 0;
+
+
+
+// 获取哈希统计信息
+void get_hash_stats(uint64_t *collisions, uint64_t *operations) {
+    if (collisions) *collisions = hash_collision_count;
+    if (operations) *operations = hash_total_operations;
+}
+
+// 哈希分布分析
+void analyze_hash_distribution(void) {
+    uint64_t collisions, operations;
+    get_hash_stats(&collisions, &operations);
     
-    // 简单的哈希函数
-    hash = ((hash >> 16) ^ hash) * 0x45d9f3b;
-    hash = ((hash >> 16) ^ hash) * 0x45d9f3b;
-    hash = (hash >> 16) ^ hash;
-    
-    return hash % HASH_TABLE_SIZE;
+    if (operations > 0) {
+        double collision_rate = (double)collisions * 100.0 / operations;
+        double load_factor = (double)operations / HASH_TABLE_SIZE;
+        
+        log_info("Hash Distribution Analysis:");
+        log_info("  Total Operations: %lu", operations);
+        log_info("  Collisions: %lu", collisions);
+        log_info("  Collision Rate: %.2f%%", collision_rate);
+        log_info("  Load Factor: %.2f%%", load_factor * 100.0);
+        log_info("  Hash Table Size: %u", HASH_TABLE_SIZE);
+        
+        if (collision_rate > 50.0) {
+            log_warn("High collision rate detected! Consider increasing hash table size or improving hash function.");
+        }
+    }
 }
 
 // **新增函数**: 为指定协议分配对话ID
@@ -420,6 +447,15 @@ struct flow_node *flow_table_insert_with_timestamp(const struct flow_key *key, u
     
     // **关键修复**: 将新节点插入到哈希表中
     uint32_t idx = hash_flow_key(key);
+    
+    // 统计哈希冲突
+    __sync_fetch_and_add(&hash_total_operations, 1);
+    if (flow_table[idx] != NULL) {
+        __sync_fetch_and_add(&hash_collision_count, 1);
+    }
+    
+
+    
     node->next = flow_table[idx];  // 链接到现有链表头部
     flow_table[idx] = node;        // 设置为新的链表头部
     
@@ -779,15 +815,13 @@ struct flow_stats* get_or_create_conversation(const struct flow_key *key, int *i
 // =================== 流统计更新函数 ===================
 
 void update_flow_stats(struct flow_stats *stats, uint32_t pkt_size, int is_reverse, uint64_t packet_timestamp) {
-    if (!stats) return;
+    // 获取flow_node的指针
+    struct flow_node *flow_node = (struct flow_node *)((char *)stats - offsetof(struct flow_node, stats));
     
-    // 检查程序是否正在关闭
-    if (is_shutdown_requested()) {
-        log_debug("Skipping flow stats update during shutdown");
-        return;
-    }
+    // 锁定流对象
+    pthread_mutex_lock(&flow_node->mutex);
     
-    // 如果是第一次更新，设置first_seen
+    // 更新首次和最后看到的时间戳
     if (stats->first_seen == 0) {
         stats->first_seen = packet_timestamp;
     }
@@ -795,15 +829,13 @@ void update_flow_stats(struct flow_stats *stats, uint32_t pkt_size, int is_rever
     // 更新最后看到的时间戳
     stats->last_seen = packet_timestamp;
     
-    // 更新结束时间 - 简化版本，不再使用end_time
-    
     if (is_reverse) {
         // 反向流统计
         stats->bwd_packets++;
         stats->bwd_bytes += pkt_size;
         
         if (pkt_size > stats->bwd_max_size) stats->bwd_max_size = pkt_size;
-        if (pkt_size < stats->bwd_min_size) stats->bwd_min_size = pkt_size;
+        if (pkt_size < stats->bwd_min_size || stats->bwd_min_size == 0) stats->bwd_min_size = pkt_size;
         
         // 更新平方和用于标准差计算
         stats->bwd_sum_squares += (double)pkt_size * pkt_size;
@@ -815,13 +847,16 @@ void update_flow_stats(struct flow_stats *stats, uint32_t pkt_size, int is_rever
         stats->fwd_bytes += pkt_size;
         
         if (pkt_size > stats->fwd_max_size) stats->fwd_max_size = pkt_size;
-        if (pkt_size < stats->fwd_min_size) stats->fwd_min_size = pkt_size;
+        if (pkt_size < stats->fwd_min_size || stats->fwd_min_size == 0) stats->fwd_min_size = pkt_size;
         
         // 更新平方和用于标准差计算
         stats->fwd_sum_squares += (double)pkt_size * pkt_size;
         
         timestamp_array_add(&stats->fwd_timestamps, packet_timestamp);
     }
+    
+    // 解锁流对象
+    pthread_mutex_unlock(&flow_node->mutex);
 }
 
 
@@ -1185,9 +1220,15 @@ int cleanup_flow_and_sessions(struct flow_node *node) {
                 flow_table[hash] = current->next;
             }
             
+            // 锁定流对象以安全释放时间戳数组
+            pthread_mutex_lock(&node->mutex);
+            
             // 释放时间戳数组内存
             timestamp_array_free(&node->stats.fwd_timestamps);
             timestamp_array_free(&node->stats.bwd_timestamps);
+            
+            // 解锁流对象
+            pthread_mutex_unlock(&node->mutex);
             
             // 返回到内存池
             mempool_free(&global_pool, node);

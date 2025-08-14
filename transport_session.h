@@ -18,7 +18,7 @@
 // 添加缺失的常量定义
 // 会话哈希表大小 - 根据实际会话数量调整
 // 实际会话数: 146,588，建议哈希表大小为会话数的4倍
-#define SESSION_HASH_SIZE 1048576  // 1M 哈希桶 (2^20)
+#define SESSION_HASH_SIZE 1048576  // 1M 哈希桶 (恢复到原始大小)
 
 // 最大会话数 - 恢复原来的配置，支持14万会话
 #define MAX_SESSIONS 10000000      // 1000万会话，支持更大规模的创建逻辑
@@ -214,6 +214,9 @@ typedef struct transport_session {
     
     // 统计信息
     session_stats_t stats;
+    
+    // 线程安全保护
+    pthread_mutex_t mutex;              // 保护会话对象访问的互斥锁
     
     // 链表指针（使用原子指针） - 第四个cache line
     atomic_uintptr_t next_atomic;       // 原子下一个指针

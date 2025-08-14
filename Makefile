@@ -18,7 +18,7 @@ ifeq ($(BUILD_TYPE),debug)
     BUILD_SUFFIX = _debug
     DEBUG_INFO = 1
 else ifeq ($(BUILD_TYPE),release)
-    # Release版本配置
+    # Release版本配置 - 标准优化
     CFLAGS += -O3 -DNDEBUG -march=native -mtune=native
     CFLAGS += -flto -ffast-math -funroll-loops
     CFLAGS += -fomit-frame-pointer -DRELEASE_BUILD
@@ -152,6 +152,8 @@ loader_profile: loader.c flow.c mempool.c transport_session.c logger.c stats_win
 	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ $^ $(LDLIBS)
 
 loader_debug_noasan: loader.c flow.c mempool.c transport_session.c logger.c stats_window.o system_stats.o
+
+
 	@echo "编译loader (debug版本，无ASan，用于Valgrind)..."
 	$(CC) $(CFLAGS) -g -O0 -DDEBUG -DDEBUG_LEVEL=$(DEBUG_LEVEL) -Wall -Wextra -Wpedantic \
 		-fno-omit-frame-pointer -DTRACE_ENABLED -DASSERT_ENABLED \

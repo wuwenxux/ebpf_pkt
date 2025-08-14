@@ -11,6 +11,7 @@
 #include <math.h>
 #include <float.h>
 #include <stddef.h>
+#include <pthread.h>
 
 // =================== 全局变量 ===================
 
@@ -247,6 +248,16 @@ static transport_session_t *lockfree_allocate_session_from_pool(void) {
         timestamp_array_init(&session->stats.fwd_timestamps);
         timestamp_array_init(&session->stats.bwd_timestamps);
         
+        // Initialize mutex
+        if (pthread_mutex_init(&session->mutex, NULL) != 0) {
+            log_error("Failed to initialize session mutex");
+            // 清理并返回NULL
+            timestamp_array_free(&session->stats.fwd_timestamps);
+            timestamp_array_free(&session->stats.bwd_timestamps);
+            free_to_lockfree_pool(&global_session_manager->session_pool, session, block_index);
+            return NULL;
+        }
+        
         return session;
     }
     
@@ -261,6 +272,16 @@ static transport_session_t *lockfree_allocate_session_from_pool(void) {
         // Initialize timestamp arrays
         timestamp_array_init(&session->stats.fwd_timestamps);
         timestamp_array_init(&session->stats.bwd_timestamps);
+        
+        // Initialize mutex
+        if (pthread_mutex_init(&session->mutex, NULL) != 0) {
+            log_error("Failed to initialize session mutex");
+            // 清理并返回NULL
+            timestamp_array_free(&session->stats.fwd_timestamps);
+            timestamp_array_free(&session->stats.bwd_timestamps);
+            free(session);
+            return NULL;
+        }
     }
     
     return session;
@@ -271,9 +292,18 @@ void lockfree_free_session_to_pool(transport_session_t *session) {
     
     atomic_store(&session->is_active, false);
     
+    // 锁定会话对象以安全释放时间戳数组
+    pthread_mutex_lock(&session->mutex);
+    
     // Free timestamp arrays before returning session to pool or freeing
     timestamp_array_free(&session->stats.fwd_timestamps);
     timestamp_array_free(&session->stats.bwd_timestamps);
+    
+    // 解锁会话对象
+    pthread_mutex_unlock(&session->mutex);
+    
+    // Destroy mutex
+    pthread_mutex_destroy(&session->mutex);
     
     // Free features memory
     if (session->stats.features) {
@@ -968,6 +998,9 @@ static void update_session_statistics(transport_session_t *session, uint32_t pac
                                      bool is_inbound, uint64_t timestamp) {
     if (!session) return;
     
+    // 锁定会话对象
+    pthread_mutex_lock(&session->mutex);
+    
     // 更新最后包时间戳
     session->stats.last_packet = timestamp;
     
@@ -1023,6 +1056,9 @@ static void update_session_statistics(transport_session_t *session, uint32_t pac
     if (session->stats.total_packets > 0) {
         session->stats.avg_packet_size = session->stats.total_bytes / session->stats.total_packets;
     }
+    
+    // 解锁会话对象
+    pthread_mutex_unlock(&session->mutex);
 }
 
 static void calculate_session_features_export(const transport_session_t *session, session_export_data_t *export_data) {
@@ -1968,7 +2004,9 @@ transport_session_t *get_or_create_session_from_flow(const struct flow_key *key,
 // 更新基于flow的会话统计
 int update_session_from_flow(transport_session_t *session, uint32_t packet_size, 
                             bool is_reverse, uint64_t timestamp) {
-    if (!session) return -1;
+    if (!session) return -1;    
+    // 锁定会话对象
+    pthread_mutex_lock(&session->mutex);
     
     // 更新基本统计
     if (is_reverse) {
@@ -2031,6 +2069,9 @@ int update_session_from_flow(transport_session_t *session, uint32_t packet_size,
     ts.tv_sec = timestamp / 1000000000ULL;
     ts.tv_nsec = timestamp % 1000000000ULL;
     session->last_activity = ts;
+    
+    // 解锁会话对象
+    pthread_mutex_unlock(&session->mutex);
     
     return 0;
 }

@@ -24,7 +24,7 @@
 #define MAX_TIMESTAMPS 1000
 
 // 流表大小
-#define HASH_TABLE_SIZE 1048576  // 1M 哈希桶
+#define HASH_TABLE_SIZE 1048576  // 1M 哈希桶 (恢复到原始大小)
 
 // 活跃超时时间（纳秒）
 #define ACTIVE_TIMEOUT_NS 60000000000ULL  // 60秒
@@ -363,6 +363,7 @@ struct flow_node {
     uint8_t in_use;         // 标记是否使用中
     uint8_t tcp_state;      // TCP连接状态
     atomic_int ref_count;   // 引用计数
+    pthread_mutex_t mutex;  // 保护流对象访问的互斥锁
     
     // =================== 原始端口号字段（用于CSV输出）===================
     uint16_t original_src_port;     // 原始源端口号（数据包中的实际端口）
@@ -432,7 +433,6 @@ int verify_udp_conversation_count(void);
 
 uint32_t get_total_conversation_count();
 
-uint32_t hash_flow_key(const struct flow_key *key);
 uint64_t get_current_time();
 
 // 时间戳数组操作函数
@@ -488,7 +488,6 @@ extern int tshark_stats_mode; // tshark兼容统计模式变量
 // 流表管理
 void flow_table_init(void);
 void flow_table_destroy(void);
-uint32_t hash_flow_key(const struct flow_key *key);
 struct flow_node *flow_table_insert_with_timestamp(const struct flow_key *key, uint64_t packet_timestamp);
 
 // 对话管理
@@ -563,6 +562,81 @@ void verify_tshark_style_counting();
 
 // 会话创建统计
 void get_session_creation_stats(uint64_t *total_created, uint64_t *tcp_created, uint64_t *udp_created, uint64_t *reused);
+
+// 哈希性能统计
+void get_hash_stats(uint64_t *collisions, uint64_t *operations);
+void analyze_hash_distribution(void);
+
+#include "xxhash.h"
+
+// 哈希算法枚举
+typedef enum {
+    HASH_ALGO_ORIGINAL = 0,
+    HASH_ALGO_XXHASH = 1,
+    HASH_ALGO_SIMPLE = 2,
+    HASH_ALGO_XOR_COMBINE = 3,   // 五元组异或组合
+    HASH_ALGO_XOR_AGGRESSIVE = 4 // 激进异或组合
+} hash_algorithm_t;
+
+// 当前使用的哈希算法
+static hash_algorithm_t current_hash_algo = HASH_ALGO_XXHASH;
+
+// 设置哈希算法
+static inline void set_hash_algorithm(hash_algorithm_t algo) {
+    current_hash_algo = algo;
+}
+
+// 获取当前哈希算法名称
+static inline const char* get_hash_algorithm_name(void) {
+    switch (current_hash_algo) {
+        case HASH_ALGO_ORIGINAL: return "Original";
+        case HASH_ALGO_XXHASH: return "xxHash";
+        case HASH_ALGO_SIMPLE: return "Simple XOR";
+        case HASH_ALGO_XOR_COMBINE: return "XOR Combine";
+        case HASH_ALGO_XOR_AGGRESSIVE: return "XOR Aggressive";
+        default: return "Unknown";
+    }
+}
+
+// 哈希函数 - 支持多种算法
+static inline uint32_t hash_flow_key(const struct flow_key *key) {
+    switch (current_hash_algo) {
+        case HASH_ALGO_XXHASH:
+            // 使用字节级混合的xxHash，避免字段对齐问题
+            return xxhash32_flow_key(key, sizeof(struct flow_key)) % HASH_TABLE_SIZE;
+            
+        case HASH_ALGO_SIMPLE:
+            // 使用简单哈希
+            {
+                uint32_t hash = key->src_ip ^ (key->dst_ip << 1) ^ (key->src_port << 2) ^ (key->dst_port << 3) ^ key->protocol;
+                return hash % HASH_TABLE_SIZE;
+            }
+        case HASH_ALGO_XOR_COMBINE:
+            // 使用五元组异或组合哈希
+            return xor_hash_flow_key(key, sizeof(struct flow_key)) % HASH_TABLE_SIZE;
+        case HASH_ALGO_XOR_AGGRESSIVE:
+            // 使用激进异或组合哈希
+            return xor_hash_aggressive(key, sizeof(struct flow_key)) % HASH_TABLE_SIZE;
+            
+        case HASH_ALGO_ORIGINAL:
+        default:
+            // 原始哈希函数
+            {
+                uint32_t hash = 0;
+                hash ^= key->src_ip;
+                hash ^= key->dst_ip;
+                hash ^= ((uint32_t)key->src_port << 16) | key->dst_port;
+                hash ^= key->protocol;
+                
+                // 简单的哈希函数
+                hash = ((hash >> 16) ^ hash) * 0x45d9f3b;
+                hash = ((hash >> 16) ^ hash) * 0x45d9f3b;
+                hash = (hash >> 16) ^ hash;
+                
+                return hash % HASH_TABLE_SIZE;
+            }
+    }
+}
 
 // tshark风格会话验证
 void verify_tshark_style_session_creation();

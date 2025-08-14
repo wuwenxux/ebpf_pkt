@@ -52,9 +52,34 @@ typedef unsigned char u_char;
 #define PREFETCH_LOCALITY_LOW 1
 #define PREFETCH_LOCALITY_NONE 0
 
+// SIMD优化宏定义
 // 多线程相关配置
-#define PACKET_QUEUE_SIZE 100000  // 数据包队列大小（优化：从50000增加到100000以减少队列满丢包）
+#define PACKET_QUEUE_SIZE 500000  // 数据包队列大小（优化：预分配更大容量避免扩容）
 #define MAX_INTERFACES 32        // 最大支持的接口数量
+#define MAX_WORKER_THREADS 4     // 最大工作线程数（减少到4）
+#define DEFAULT_WORKER_THREADS 2 // 默认工作线程数（等于CPU核心数）
+#define WORKER_THREAD_STACK_SIZE (64 * 1024) // 工作线程栈大小64KB
+
+// 线程池相关结构体
+typedef struct {
+    pthread_t thread;           // 线程ID
+    int thread_id;             // 线程编号
+    volatile int running;      // 线程运行状态
+    volatile int busy;         // 线程忙碌状态
+    uint64_t packets_processed; // 该线程处理的包数
+    uint64_t bytes_processed;   // 该线程处理的字节数
+    struct timespec last_activity; // 最后活动时间
+} worker_thread_t;
+
+// 线程池管理器
+typedef struct {
+    worker_thread_t workers[MAX_WORKER_THREADS]; // 工作线程数组
+    int thread_count;          // 实际线程数
+    volatile int shutdown;     // 关闭标志
+    pthread_mutex_t stats_mutex; // 统计信息互斥锁
+    pthread_cond_t work_cond;  // 工作条件变量
+    pthread_mutex_t work_mutex; // 工作互斥锁
+} thread_pool_t;
 
 // ANSI转义序列用于终端控制
 const char *ANSI_CLEAR_SCREEN = "\033[2J\033[H";  // 清屏并将光标移到开头
@@ -97,7 +122,35 @@ static volatile int monitor_running = 1;  // 监控模式运行状态
 volatile uint64_t total_packets_captured = 0;
 volatile uint64_t total_bytes_captured = 0;
 volatile uint64_t total_packets_processed = 0;
+
+// 哈希算法测试相关变量
+static int hash_test_mode = 0;
+static int hash_test_iterations = 1000000;
 volatile uint64_t total_bytes_processed = 0;
+
+// 线程池相关全局变量
+static thread_pool_t g_thread_pool = {0};
+static int worker_thread_count = DEFAULT_WORKER_THREADS; // 可配置的工作线程数
+
+// 线程池最终统计保存
+static uint64_t final_thread_pool_packets = 0;
+static uint64_t final_thread_pool_bytes = 0;
+static int final_thread_pool_busy = 0;
+static int final_thread_pool_total = 0;
+static int thread_pool_initialized = 0;  // 线程池初始化标志
+
+// 函数声明
+static void print_stats_line(const char *time_str, const char *progress, 
+                            uint64_t packets, double pps, double mb_processed, double kbps,
+                            uint32_t tcp_count, uint32_t udp_count, uint32_t total_count,
+                            int active_flows, int total_flows, uint64_t created, uint64_t reused,
+                            double cpu_usage, double memory_usage, const char *suffix);
+
+static void print_pcap_stats_line(int current_loop, uint64_t processed, uint64_t total, 
+                                 double progress_percent, double pps, double mb_processed, double kbps,
+                                 uint32_t tcp_count, uint32_t udp_count, uint32_t total_count,
+                                 int active_flows, int total_flows, uint64_t created, uint64_t reused,
+                                 double cpu_usage, double memory_usage);
 
 // 详细统计计数器
 volatile uint64_t total_packets_filtered = 0;      // 被过滤的包数
@@ -105,6 +158,7 @@ volatile uint64_t total_packets_invalid = 0;       // 无效包数
 volatile uint64_t total_packets_dropped = 0;       // 队列满丢弃的包数
 volatile uint64_t total_packets_queued = 0;        // 成功入队的包数
 volatile uint64_t total_packets_dequeued = 0;      // 成功出队的包数
+
 
 // 全局实时统计
 realtime_stats_t g_realtime_stats = {0};
@@ -135,8 +189,21 @@ extern int calculate_session_features(transport_session_t *session);
 extern int export_comprehensive_flow_features_to_csv(const char *filename);
 extern int export_conversation_based_sessions_to_csv(const char *filename);
 
+// 哈希算法测试函数声明
+static void test_hash_algorithms(void);
+static void generate_random_flow_key(struct flow_key *key);
+
+// 线程池相关函数声明
+static int thread_pool_init(int thread_count);
+static void thread_pool_destroy(void);
+static void *worker_thread_func(void *arg);
+static void process_packet_queue_mt(void);
+static void update_thread_pool_stats(void);
+void get_thread_pool_stats(uint64_t *total_packets, uint64_t *total_bytes, 
+                          int *busy_threads, int *total_threads);
+
 // 内存监控函数声明
-static void check_memory_status(const char *operation);
+
 
 // 多接口监听相关结构
 typedef struct {
@@ -396,6 +463,8 @@ static int packet_queue_enqueue(lockfree_queue_t *queue, const packet_data_t *pa
     return -1;
 }
 
+
+
 // 无锁出队操作
 static int packet_queue_dequeue(lockfree_queue_t *queue, packet_data_t *packet) {
     // 检查队列是否已初始化
@@ -522,6 +591,16 @@ static void cleanup(void) {
 
     log_info("Starting cleanup process...");
 
+    // 保存线程池统计信息
+    log_info("Saving thread pool stats before destruction...");
+    get_thread_pool_stats(&final_thread_pool_packets, &final_thread_pool_bytes, 
+                         &final_thread_pool_busy, &final_thread_pool_total);
+    log_info("Thread pool stats saved: threads=%d, packets=%lu, bytes=%lu", 
+             final_thread_pool_total, final_thread_pool_packets, final_thread_pool_bytes);
+
+    // 销毁线程池
+    thread_pool_destroy();
+
     // 销毁数据包队列
     packet_queue_destroy(&packet_queue);
 
@@ -644,7 +723,7 @@ static int check_single_instance(void) {
     }
     
     // 注册退出时的清理函数
-    atexit(cleanup);
+    // atexit(cleanup);  // 注释掉，改为手动调用
     
     return 0;
 }
@@ -741,6 +820,12 @@ static void handle_batch(void *ctx, int cpu, void *data, __u32 size) {
             if (!running) break;
         } else {
             __sync_fetch_and_add(&total_packets_queued, 1);
+            
+            // 每入队1000个包输出一次调试信息
+            static uint64_t enqueue_debug_count = 0;
+            if (++enqueue_debug_count % 1000 == 0) {
+                log_info("Enqueued %lu packets, queue size: %lu", enqueue_debug_count, packet_queue_size(&packet_queue));
+            }
         }
     }
 }
@@ -820,6 +905,14 @@ int process_pcap_file(const char *pcap_file) {
     
     // 初始化流跟踪
     flow_table_init();
+    
+    // 初始化线程池
+    log_info("About to initialize thread pool with %d threads (PCAP mode)", worker_thread_count);
+    if (thread_pool_init(worker_thread_count) != 0) {
+        log_error("Failed to initialize thread pool\n");
+        return 1;
+    }
+    log_info("Thread pool initialization successful (PCAP mode)");
     
     // 初始化会话管理器
     if (transport_session_manager_init() != 0) {
@@ -920,26 +1013,23 @@ int process_pcap_file(const char *pcap_file) {
                 update_system_stats();
                 
                 // 显示实时统计（包含总包数和进度）
-                printf("\r⏰ PCAP | 🔄 Loop:%d | 📦 %lu/%lu (%.1f%%) (%.1f pkt/s) | 💾 %.2f MB (%.1f kb/s) | 🔗 TCP:%u UDP:%u Total:%u | 🗄️ %d/%d | 📊 Created:%lu Reused:%lu | 🖥️  CPU:%.1f%% MEM:%.1f%%",
-                       current_loop,
-                       total_packets_processed, pcap_total_packets, progress_percent, pps,
-                       total_bytes_processed / (1024.0 * 1024.0), bps * 8 / 1000.0,
-                       get_tcp_conversation_count(),
-                       get_udp_conversation_count(),
-                       get_total_conversation_count(),
-                       count_active_flows(),
-                       count_all_flows(),
-                       total_created,
-                       reused,
-                       system_stats.cpu_usage,
-                       system_stats.memory_usage);
+                print_pcap_stats_line(current_loop,
+                                     total_packets_processed, pcap_total_packets, progress_percent, pps,
+                                     total_bytes_processed / (1024.0 * 1024.0), bps * 8 / 1000.0,
+                                     get_tcp_conversation_count(),
+                                     get_udp_conversation_count(),
+                                     get_total_conversation_count(),
+                                     count_active_flows(),
+                                     count_all_flows(),
+                                     total_created,
+                                     reused,
+                                     system_stats.cpu_usage,
+                                     system_stats.memory_usage);
                 
                 // 更新上次统计值
                 last_packets = total_packets_processed;
                 last_bytes = total_bytes_processed;
                 last_stats_time = current_time;
-                
-                fflush(stdout);
             }
         }
         
@@ -978,6 +1068,32 @@ int process_pcap_file(const char *pcap_file) {
     printf("🗄️  Total flows: %d\n", count_all_flows());
     
     return ret;
+}
+
+// 显示统计信息的统一函数
+static void print_stats_line(const char *time_str, const char *progress, 
+                            uint64_t packets, double pps, double mb_processed, double kbps,
+                            uint32_t tcp_count, uint32_t udp_count, uint32_t total_count,
+                            int active_flows, int total_flows, uint64_t created, uint64_t reused,
+                            double cpu_usage, double memory_usage, const char *suffix) {
+    printf("\r⏰ %s | 🔄 %s | 📦 %lu (%.1f pkt/s) | 💾 %.2f MB (%.1f kb/s) | 🔗 TCP:%u UDP:%u Total:%u | 🗄️ %d/%d | 📊 Created:%lu Reused:%lu | 🖥️  CPU:%.1f%% MEM:%.1f%%%s",
+           time_str, progress, packets, pps, mb_processed, kbps,
+           tcp_count, udp_count, total_count, active_flows, total_flows,
+           created, reused, cpu_usage, memory_usage, suffix);
+    fflush(stdout);
+}
+
+// 显示PCAP处理统计信息的函数
+static void print_pcap_stats_line(int current_loop, uint64_t processed, uint64_t total, 
+                                 double progress_percent, double pps, double mb_processed, double kbps,
+                                 uint32_t tcp_count, uint32_t udp_count, uint32_t total_count,
+                                 int active_flows, int total_flows, uint64_t created, uint64_t reused,
+                                 double cpu_usage, double memory_usage) {
+    printf("\r⏰ PCAP | 🔄 Loop:%d | 📦 %lu/%lu (%.1f%%) (%.1f pkt/s) | 💾 %.2f MB (%.1f kb/s) | 🔗 TCP:%u UDP:%u Total:%u | 🗄️ %d/%d | 📊 Created:%lu Reused:%lu | 🖥️  CPU:%.1f%% MEM:%.1f%%",
+           current_loop, processed, total, progress_percent, pps, mb_processed, kbps,
+           tcp_count, udp_count, total_count, active_flows, total_flows,
+           created, reused, cpu_usage, memory_usage);
+    fflush(stdout);
 }
 
 // 获取系统所有网络接口
@@ -1230,6 +1346,7 @@ static void process_packet_queue(void) {
         packet_data_t packet;
         if (packet_queue_dequeue(&packet_queue, &packet) == 0) {
             __sync_fetch_and_add(&total_packets_dequeued, 1);
+            
             // 直接处理数据包
             if (packet.ip_header.protocol == IPPROTO_TCP) {
                 // 从存储的TCP头部数据中提取标志位
@@ -1276,6 +1393,14 @@ int run_live_capture(const char *ifname) {
     start_time = time(NULL);
     packet_queue_init(&packet_queue, PACKET_QUEUE_SIZE);
     flow_table_init();
+    
+    // 初始化线程池
+    log_info("About to initialize thread pool with %d threads", worker_thread_count);
+    if (thread_pool_init(worker_thread_count) != 0) {
+        log_error("Failed to initialize thread pool\n");
+        return 1;
+    }
+    log_info("Thread pool initialization successful");
     
     // 初始化会话管理器
     if (transport_session_manager_init() != 0) {
@@ -1349,26 +1474,23 @@ int run_live_capture(const char *ifname) {
             char time_only[9];
             strftime(time_only, sizeof(time_only), "%H:%M:%S", &tm);
             
-            printf("\r⏰ %s | 🔄 %s | 📦 %lu (%.1f pkt/s) | 💾 %.2f MB (%.1f kb/s) | 🔗 TCP:%u UDP:%u Total:%u | 🗄️ %d/%d | 📊 Created:%lu Reused:%lu | 🖥️  CPU:%.1f%% MEM:%.1f%%",
-                   time_only, progress,
-                   total_packets_captured, pps,
-                   total_bytes_captured / (1024.0 * 1024.0), bps * 8 / 1000.0,
-                   get_tcp_conversation_count(),
-                   get_udp_conversation_count(),
-                   get_total_conversation_count(),
-                   count_active_flows(),
-                   count_all_flows(),
-                   total_created,
-                   reused,
-                   system_stats.cpu_usage,
-                   system_stats.memory_usage);
+            print_stats_line(time_only, progress,
+                            total_packets_captured, pps,
+                            total_bytes_captured / (1024.0 * 1024.0), bps * 8 / 1000.0,
+                            get_tcp_conversation_count(),
+                            get_udp_conversation_count(),
+                            get_total_conversation_count(),
+                            count_active_flows(),
+                            count_all_flows(),
+                            total_created,
+                            reused,
+                            system_stats.cpu_usage,
+                            system_stats.memory_usage, "");
             
             // 更新上次统计值
             last_packets = total_packets_captured;
             last_bytes = total_bytes_captured;
             last_time = current_time;
-            
-            fflush(stdout);
             last_stats_time = current_time;
             
             // 定期清理不活跃的流（每1秒清理一次）
@@ -1395,39 +1517,52 @@ int run_live_capture(const char *ifname) {
                     }
                 }
             }
+            
+            // 显示线程池状态（每10秒显示一次）
+            static int thread_pool_display_count = 0;
+            if (thread_pool_display_count % 10 == 0) {
+                uint64_t tp_packets, tp_bytes;
+                int tp_busy, tp_total;
+                get_thread_pool_stats(&tp_packets, &tp_bytes, &tp_busy, &tp_total);
+                printf("\n🔧 Thread Pool Status: %d/%d threads busy, processed %lu packets (%.2f MB)", 
+                       tp_busy, tp_total, tp_packets, tp_bytes / (1024.0 * 1024.0));
+            }
+            thread_pool_display_count++;
         }
         
         // 短暂休眠，避免CPU占用过高
         usleep(10000); // 10ms
         
-        // 处理队列中的数据包
-        process_packet_queue();
+        // 多线程处理队列中的数据包
+        process_packet_queue_mt();
     }
     
     // 主循环结束后的清理逻辑
     log_info("Main loop ended, performing cleanup...");
     
-    // 等待队列处理完所有数据包
-    while (packet_queue_size(&packet_queue) > 0) {
-        packet_data_t packet;
-        if (packet_queue_dequeue(&packet_queue, &packet) == 0) {
-            // 直接处理数据包
-            if (packet.ip_header.protocol == IPPROTO_TCP) {
-                // 从存储的TCP头部数据中提取标志位
-                struct tcphdr *tcp_header = (struct tcphdr *)packet.transport_header.tcp.flags_byte;
-                uint8_t tcp_flags = *((uint8_t*)tcp_header + 13);  // TCP标志位在第13字节
-                uint32_t tcp_seq = packet.transport_header.tcp.seq;
-                
-                process_packet_direct(&packet.ip_header, 
-                                    packet.transport_header.tcp.source,
-                                    packet.transport_header.tcp.dest,
-                                    tcp_seq, tcp_flags, packet.timestamp);
-            } else if (packet.ip_header.protocol == IPPROTO_UDP) {
-                process_packet_direct(&packet.ip_header,
-                                    packet.transport_header.udp.source,
-                                    packet.transport_header.udp.dest,
-                                    0, 0, packet.timestamp);  // UDP没有序列号和标志位
+    // 等待工作线程处理完所有数据包
+    log_info("Waiting for worker threads to process remaining packets...");
+    uint64_t remaining_packets = packet_queue_size(&packet_queue);
+    if (remaining_packets > 0) {
+        log_info("Remaining packets in queue: %lu", remaining_packets);
+        
+        // 等待一段时间让工作线程处理剩余数据包
+        int wait_count = 0;
+        while (packet_queue_size(&packet_queue) > 0 && wait_count < 100) { // 最多等待10秒
+            usleep(100000); // 100ms
+            wait_count++;
+            
+            if (wait_count % 10 == 0) { // 每1秒输出一次状态
+                uint64_t current_remaining = packet_queue_size(&packet_queue);
+                log_info("Still waiting... remaining packets: %lu", current_remaining);
             }
+        }
+        
+        uint64_t final_remaining = packet_queue_size(&packet_queue);
+        if (final_remaining > 0) {
+            log_warn("Worker threads could not process all packets, %lu packets remaining", final_remaining);
+        } else {
+            log_info("All packets processed by worker threads");
         }
     }
     
@@ -1458,6 +1593,14 @@ int run_single_interface_capture(const char *ifname) {
 
     // Initialize flow tracking
     flow_table_init();
+    
+    // 初始化线程池
+    log_info("About to initialize thread pool with %d threads (single interface mode)", worker_thread_count);
+    if (thread_pool_init(worker_thread_count) != 0) {
+        log_error("Failed to initialize thread pool\n");
+        return 1;
+    }
+    log_info("Thread pool initialization successful (single interface mode)");
     
     // 初始化会话管理器
     if (transport_session_manager_init() != 0) {
@@ -1679,26 +1822,34 @@ int run_single_interface_capture(const char *ifname) {
             char time_only[9];
             strftime(time_only, sizeof(time_only), "%H:%M:%S", &tm);
             
-            printf("\r⏰ %s | 🔄 %s | 📦 %lu (%.1f pkt/s) | 💾 %.2f MB (%.1f kb/s) | 🔗 TCP:%u UDP:%u Total:%u | 🗄️ %d/%d | 📊 Created:%lu Reused:%lu | 🖥️  CPU:%.1f%% MEM:%.1f%%                    ",
-                   time_only, progress,
-                   captured_packets, pps,
-                   captured_bytes / (1024.0 * 1024.0), bps * 8 / 1000.0,
-                   get_tcp_conversation_count(),
-                   get_udp_conversation_count(),
-                   get_total_conversation_count(),
-                   count_active_flows(),
-                   count_all_flows(),
-                   total_created,
-                   reused,
-                   system_stats.cpu_usage,
-                   system_stats.memory_usage);
+            print_stats_line(time_only, progress,
+                            captured_packets, pps,
+                            captured_bytes / (1024.0 * 1024.0), bps * 8 / 1000.0,
+                            get_tcp_conversation_count(),
+                            get_udp_conversation_count(),
+                            get_total_conversation_count(),
+                            count_active_flows(),
+                            count_all_flows(),
+                            total_created,
+                            reused,
+                            system_stats.cpu_usage,
+                            system_stats.memory_usage, "                    ");
+            
+            // 显示线程池状态（每10秒显示一次）
+            static int thread_pool_display_count = 0;
+            if (thread_pool_display_count % 10 == 0) {
+                uint64_t tp_packets, tp_bytes;
+                int tp_busy, tp_total;
+                get_thread_pool_stats(&tp_packets, &tp_bytes, &tp_busy, &tp_total);
+                printf("\n🔧 Thread Pool Status: %d/%d threads busy, processed %lu packets (%.2f MB)", 
+                       tp_busy, tp_total, tp_packets, tp_bytes / (1024.0 * 1024.0));
+            }
+            thread_pool_display_count++;
             
             // 更新上次统计值
             last_captured_packets = captured_packets;
             last_captured_bytes = captured_bytes;
             last_time = current_time;
-            
-            fflush(stdout);
             last_stats_time = current_time;
             
             // 定期清理不活跃的流（每1秒清理一次）
@@ -1733,28 +1884,29 @@ int run_single_interface_capture(const char *ifname) {
     // 在退出时添加换行，确保统计信息行完整显示
     printf("\n");
     
-    // 等待队列处理完所有数据包
-    while (packet_queue_size(&packet_queue) > 0 && running) {
-        packet_data_t packet;
-        if (packet_queue_dequeue(&packet_queue, &packet) == 0) {
-            __sync_fetch_and_add(&total_packets_dequeued, 1);
-            // 直接处理数据包
-            if (packet.ip_header.protocol == IPPROTO_TCP) {
-                // 从存储的TCP头部数据中提取标志位
-                struct tcphdr *tcp_header = (struct tcphdr *)packet.transport_header.tcp.flags_byte;
-                uint8_t tcp_flags = *((uint8_t*)tcp_header + 13);  // TCP标志位在第13字节
-                uint32_t tcp_seq = packet.transport_header.tcp.seq;
-                
-                process_packet_direct(&packet.ip_header, 
-                                    packet.transport_header.tcp.source,
-                                    packet.transport_header.tcp.dest,
-                                    tcp_seq, tcp_flags, packet.timestamp);
-            } else if (packet.ip_header.protocol == IPPROTO_UDP) {
-                process_packet_direct(&packet.ip_header,
-                                    packet.transport_header.udp.source,
-                                    packet.transport_header.udp.dest,
-                                    0, 0, packet.timestamp);  // UDP没有序列号和标志位
+    // 等待工作线程处理完所有数据包
+    log_info("Waiting for worker threads to process remaining packets...");
+    uint64_t remaining_packets = packet_queue_size(&packet_queue);
+    if (remaining_packets > 0) {
+        log_info("Remaining packets in queue: %lu", remaining_packets);
+        
+        // 等待一段时间让工作线程处理剩余数据包
+        int wait_count = 0;
+        while (packet_queue_size(&packet_queue) > 0 && wait_count < 100) { // 最多等待10秒
+            usleep(100000); // 100ms
+            wait_count++;
+            
+            if (wait_count % 10 == 0) { // 每1秒输出一次状态
+                uint64_t current_remaining = packet_queue_size(&packet_queue);
+                log_info("Still waiting... remaining packets: %lu", current_remaining);
             }
+        }
+        
+        uint64_t final_remaining = packet_queue_size(&packet_queue);
+        if (final_remaining > 0) {
+            log_warn("Worker threads could not process all packets, %lu packets remaining", final_remaining);
+        } else {
+            log_info("All packets processed by worker threads");
         }
     }
     
@@ -1821,6 +1973,24 @@ void print_final_stats(void) {
     printf("  TCP Conversations: %u\n", get_tcp_conversation_count());
     printf("  UDP Conversations: %u\n", get_udp_conversation_count());
     
+    // 显示哈希性能统计
+    uint64_t hash_collisions, hash_operations;
+    get_hash_stats(&hash_collisions, &hash_operations);
+    if (hash_operations > 0) {
+        double collision_rate = (double)hash_collisions * 100.0 / hash_operations;
+        double load_factor = (double)hash_operations / 1048576.0; // HASH_TABLE_SIZE
+        printf("\nHash Performance:\n");
+        printf("  Total Operations: %lu\n", hash_operations);
+        printf("  Collisions: %lu\n", hash_collisions);
+        printf("  Collision Rate: %.2f%%\n", collision_rate);
+        printf("  Load Factor: %.2f%%\n", load_factor * 100.0);
+        printf("  Hash Table Size: 1M buckets\n");
+        printf("  Hash Algorithm: %s\n", get_hash_algorithm_name());
+        
+        // 调用详细分析
+        analyze_hash_distribution();
+    }
+    
     // ================== CSV导出功能 ==================
     if (csv_file) {
         printf("\n================== CSV Export ==================\n");
@@ -1865,6 +2035,9 @@ void print_usage(const char *prog_name) {
     printf("  -v, --verbose <level>       Debug level: 0=none, 1=basic, 2=detailed (default: 0)\n");
     printf("  -q, --quiet                 Quiet mode, don't print statistics to screen\n");
     printf("  -m, --monitor               Realtime monitor mode with ncurses interface\n");
+    printf("  -t, --hash-test             Test hash algorithm performance and distribution\n");
+    printf("  -a, --hash-algo <0-4>       Set hash algorithm: 0=Original, 1=xxHash, 2=Simple XOR, 3=XOR Combine, 4=XOR Aggressive\n");
+    printf("  -T, --threads <count>       Set number of worker threads (default: %d)\n", DEFAULT_WORKER_THREADS);
     printf("  -h, --help                  Show this help message\n");
 }
 
@@ -1875,6 +2048,35 @@ void init_time_base() {
     clock_gettime(CLOCK_MONOTONIC, &monotonic);
     boot_realtime = realtime;
     boot_monotonic_ns = (uint64_t)monotonic.tv_sec * 1000000000ULL + monotonic.tv_nsec;
+}
+
+/**
+ * 检测CPU核心数并设置合适的线程数
+ */
+static int detect_optimal_thread_count(void) {
+    int cpu_count = sysconf(_SC_NPROCESSORS_ONLN);
+    if (cpu_count <= 0) {
+        log_warn("Failed to detect CPU count, using default: %d", DEFAULT_WORKER_THREADS);
+        return DEFAULT_WORKER_THREADS;
+    }
+    
+    log_info("Detected %d CPU cores", cpu_count);
+    
+    // 对于2核设备，使用1个工作线程（避免过度竞争）
+    if (cpu_count <= 2) {
+        int optimal_threads = 1; // 2核设备使用1个线程
+        log_info("Low core count detected, using %d worker thread (optimal for %d cores)", optimal_threads, cpu_count);
+        return optimal_threads;
+    }
+    
+    // 对于多核设备，使用核心数-1个线程（留一个给主线程）
+    int optimal_threads = cpu_count - 1;
+    if (optimal_threads > MAX_WORKER_THREADS) {
+        optimal_threads = MAX_WORKER_THREADS;
+    }
+    
+    log_info("Using %d worker threads (optimal for %d cores)", optimal_threads, cpu_count);
+    return optimal_threads;
 }
 
 // 将bpf_ktime_get_ns()时间戳转为wall time字符串（东八区时间）
@@ -1905,11 +2107,16 @@ void format_beijing_time(time_t timestamp, char *buf, size_t buflen) {
 
 int main(int argc, char **argv) {
     init_time_base();
+    
     const char *ifname = "all";  // Default to monitor all interfaces
     const char *pcap_file = NULL;
     int c;
     int ret = 0;
     int monitor_mode = 0;  // 监控模式标志
+    
+    // 自动检测CPU核心数并设置默认线程数
+    worker_thread_count = detect_optimal_thread_count();
+    log_info("Worker thread count set to: %d", worker_thread_count);
     
     // 输出编译模式和日志级别信息
     log_info("Build Mode: %s", get_build_mode_log_level());
@@ -1927,7 +2134,7 @@ int main(int argc, char **argv) {
     init_system_monitoring();
     
     // Register cleanup function for normal exit
-    atexit(cleanup);
+    // atexit(cleanup);  // 注释掉，改为手动调用
     
     // 检查是否已经有实例在运行
     ret = check_single_instance();
@@ -1954,11 +2161,14 @@ int main(int argc, char **argv) {
         {"verbose",       required_argument, 0, 'v'},
         {"quiet",         no_argument,       0, 'q'},
         {"monitor",       no_argument,       0, 'm'},
+        {"hash-test",     no_argument,       0, 't'},
+        {"hash-algo",     required_argument, 0, 'a'},
+        {"threads",       required_argument, 0, 'T'},
         {"help",          no_argument,       0, 'h'},
         {0, 0, 0, 0}
     };
 
-    while ((c = getopt_long(argc, argv, "i:r:d:s:p:c:o:l:w:v:qmh", long_options, NULL)) != -1) {
+    while ((c = getopt_long(argc, argv, "i:r:d:s:p:c:o:l:w:v:qmt:a:T:h", long_options, NULL)) != -1) {
         switch (c) {
             case 'i':
                 ifname = optarg;
@@ -2037,6 +2247,30 @@ int main(int argc, char **argv) {
                 monitor_mode = 1;
                 printf("Monitor mode enabled, will start realtime monitor interface\n");
                 break;
+            case 't':
+                hash_test_mode = 1;
+                printf("Hash test mode enabled\n");
+                break;
+            case 'a':
+                {
+                    int algo = atoi(optarg);
+                    if (algo < 0 || algo > 4) {
+                        fprintf(stderr, "Hash algorithm must be 0-4 (0:Original, 1:xxHash, 2:Simple XOR, 3:XOR Combine, 4:XOR Aggressive)\n");
+                        return 1;
+                    }
+                    set_hash_algorithm((hash_algorithm_t)algo);
+                    set_hash_algorithm((hash_algorithm_t)algo);
+                    printf("Hash algorithm set to %d (%s)\n", algo, get_hash_algorithm_name());
+                }
+                break;
+            case 'T':
+                worker_thread_count = atoi(optarg);
+                if (worker_thread_count <= 0 || worker_thread_count > MAX_WORKER_THREADS) {
+                    log_error("Invalid thread count: %d (must be 1-%d)", worker_thread_count, MAX_WORKER_THREADS);
+                    return 1;
+                }
+                printf("Setting worker thread count to %d\n", worker_thread_count);
+                break;
             case 'h':
                 print_usage(argv[0]);
                 return 0;
@@ -2054,6 +2288,14 @@ int main(int argc, char **argv) {
         }
     }
 
+    if (hash_test_mode) {
+        // 哈希算法测试模式
+        printf("Starting hash algorithm test mode...\n");
+        srand(time(NULL));
+        test_hash_algorithms();
+        return 0;
+    }
+    
     if (monitor_mode) {
         // 实时监控模式
         printf("Starting realtime monitor mode...\n");
@@ -2080,11 +2322,26 @@ int main(int argc, char **argv) {
 
     if (pcap_file) {
         // Process pcap file
+        log_info("Starting PCAP file processing mode");
         ret = process_pcap_file(pcap_file);
     } else {
         // Live capture mode
+        log_info("Starting live capture mode");
         ret = run_live_capture(ifname);
     }
+
+    log_info("Main processing completed, getting thread pool stats...");
+    
+    // 检查线程池状态
+    log_info("Thread pool status check:");
+    log_info("  - thread_pool_initialized: %d", thread_pool_initialized);
+    log_info("  - g_thread_pool.thread_count: %d", g_thread_pool.thread_count);
+    log_info("  - g_thread_pool.shutdown: %d", g_thread_pool.shutdown);
+    log_info("  - packet_queue_size: %lu", packet_queue_size(&packet_queue));
+    
+    // 手动调用cleanup，而不是依赖atexit
+    log_info("Manually calling cleanup...");
+    cleanup();
 
     // 打印最终消息
     //printf("\n程序结束\n");
@@ -2310,8 +2567,8 @@ static int run_monitor_mode(const char *ifname) {
         // 短暂休眠
         usleep(500000); // 0.5秒
         
-        // 处理队列中的数据包
-        process_packet_queue();
+        // 多线程处理队列中的数据包
+        process_packet_queue_mt();
     }
 
     /* 8. Wait for capture thread to complete */
@@ -2442,28 +2699,7 @@ void print_ebpf_stats(void) {
     printf("================== eBPF Statistics End ==================\n\n");
 }
 
-// 内存监控函数
-static void check_memory_status(const char *operation) {
-    struct sysinfo si;
-    if (sysinfo(&si) == 0) {
-        unsigned long total_mem = si.totalram * si.mem_unit;
-        unsigned long free_mem = si.freeram * si.mem_unit;
-        unsigned long used_mem = total_mem - free_mem;
-        double mem_usage_percent = (double)used_mem * 100.0 / total_mem;
-        
-        log_info("Memory status before %s: Total=%.1f GB, Used=%.1f GB (%.1f%%), Free=%.1f GB",
-                operation,
-                total_mem / (1024.0 * 1024.0 * 1024.0),
-                used_mem / (1024.0 * 1024.0 * 1024.0),
-                mem_usage_percent,
-                free_mem / (1024.0 * 1024.0 * 1024.0));
-        
-        // 如果内存使用率过高，发出警告
-        if (mem_usage_percent > 80.0) {
-            log_warn("High memory usage detected (%.1f%%). Consider reducing workload or increasing system memory.", mem_usage_percent);
-        }
-    }
-}
+
 
 // 分析包数不匹配的原因
 void analyze_packet_count_mismatch(void) {
@@ -2540,8 +2776,415 @@ void analyze_packet_count_mismatch(void) {
     printf("================== 分析结束 ==================\n\n");
 }
 
+// 生成随机五元组
+static void generate_random_flow_key(struct flow_key *key) {
+    key->src_ip = rand() % 0xFFFFFFFF;
+    key->dst_ip = rand() % 0xFFFFFFFF;
+    key->src_port = rand() % 65536;
+    key->dst_port = rand() % 65536;
+    key->protocol = rand() % 256;
+}
 
+// 测试哈希算法性能
+static void test_hash_algorithms(void) {
+    struct flow_key key;
+    clock_t start, end;
+    double time_used;
+    
+    printf("\n=== 哈希算法性能测试 (%d 次) ===\n", hash_test_iterations);
+    printf("测试算法: Original, xxHash, Simple XOR, XOR Combine, XOR Aggressive\n\n");
+    
+    // 测试原始哈希
+    set_hash_algorithm(HASH_ALGO_ORIGINAL);
+    start = clock();
+    for (int i = 0; i < hash_test_iterations; i++) {
+        generate_random_flow_key(&key);
+        hash_flow_key(&key);
+    }
+    end = clock();
+    time_used = ((double)(end - start)) / CLOCKS_PER_SEC;
+    printf("Original: %.6f 秒 (%.0f ops/s)\n", time_used, hash_test_iterations / time_used);
+    
+    // 测试xxHash
+    set_hash_algorithm(HASH_ALGO_XXHASH);
+    start = clock();
+    for (int i = 0; i < hash_test_iterations; i++) {
+        generate_random_flow_key(&key);
+        hash_flow_key(&key);
+    }
+    end = clock();
+    time_used = ((double)(end - start)) / CLOCKS_PER_SEC;
+    printf("xxHash: %.6f 秒 (%.0f ops/s)\n", time_used, hash_test_iterations / time_used);
+    
+    // 测试简单异或
+    set_hash_algorithm(HASH_ALGO_SIMPLE);
+    start = clock();
+    for (int i = 0; i < hash_test_iterations; i++) {
+        generate_random_flow_key(&key);
+        hash_flow_key(&key);
+    }
+    end = clock();
+    time_used = ((double)(end - start)) / CLOCKS_PER_SEC;
+    printf("Simple XOR: %.6f 秒 (%.0f ops/s)\n", time_used, hash_test_iterations / time_used);
+    
+    // 测试异或组合
+    set_hash_algorithm(HASH_ALGO_XOR_COMBINE);
+    start = clock();
+    for (int i = 0; i < hash_test_iterations; i++) {
+        generate_random_flow_key(&key);
+        hash_flow_key(&key);
+    }
+    end = clock();
+    time_used = ((double)(end - start)) / CLOCKS_PER_SEC;
+    printf("XOR Combine: %.6f 秒 (%.0f ops/s)\n", time_used, hash_test_iterations / time_used);
+    
+    // 测试激进异或
+    set_hash_algorithm(HASH_ALGO_XOR_AGGRESSIVE);
+    start = clock();
+    for (int i = 0; i < hash_test_iterations; i++) {
+        generate_random_flow_key(&key);
+        hash_flow_key(&key);
+    }
+    end = clock();
+    time_used = ((double)(end - start)) / CLOCKS_PER_SEC;
+    printf("XOR Aggressive: %.6f 秒 (%.0f ops/s)\n", time_used, hash_test_iterations / time_used);
+    
+    // 测试哈希分布
+    printf("\n=== 哈希分布测试 (100,000 次) ===\n");
+    int buckets[1000] = {0};
+    int num_dist_tests = 100000;
+    
+    // 测试原始哈希分布
+    set_hash_algorithm(HASH_ALGO_ORIGINAL);
+    memset(buckets, 0, sizeof(buckets));
+    for (int i = 0; i < num_dist_tests; i++) {
+        generate_random_flow_key(&key);
+        uint32_t hash = hash_flow_key(&key);
+        buckets[hash % 1000]++;
+    }
+    
+    int min_bucket = buckets[0], max_bucket = buckets[0];
+    for (int i = 1; i < 1000; i++) {
+        if (buckets[i] < min_bucket) min_bucket = buckets[i];
+        if (buckets[i] > max_bucket) max_bucket = buckets[i];
+    }
+    printf("Original: 最小桶=%d, 最大桶=%d, 分布比=%.2f\n", 
+           min_bucket, max_bucket, (double)max_bucket / min_bucket);
+    
+    // 测试xxHash分布
+    set_hash_algorithm(HASH_ALGO_XXHASH);
+    memset(buckets, 0, sizeof(buckets));
+    for (int i = 0; i < num_dist_tests; i++) {
+        generate_random_flow_key(&key);
+        uint32_t hash = hash_flow_key(&key);
+        buckets[hash % 1000]++;
+    }
+    
+    min_bucket = max_bucket = buckets[0];
+    for (int i = 1; i < 1000; i++) {
+        if (buckets[i] < min_bucket) min_bucket = buckets[i];
+        if (buckets[i] > max_bucket) max_bucket = buckets[i];
+    }
+    printf("xxHash: 最小桶=%d, 最大桶=%d, 分布比=%.2f\n", 
+           min_bucket, max_bucket, (double)max_bucket / min_bucket);
+    
+    // 测试异或组合分布
+    set_hash_algorithm(HASH_ALGO_XOR_COMBINE);
+    memset(buckets, 0, sizeof(buckets));
+    for (int i = 0; i < num_dist_tests; i++) {
+        generate_random_flow_key(&key);
+        uint32_t hash = hash_flow_key(&key);
+        buckets[hash % 1000]++;
+    }
+    
+    min_bucket = max_bucket = buckets[0];
+    for (int i = 1; i < 1000; i++) {
+        if (buckets[i] < min_bucket) min_bucket = buckets[i];
+        if (buckets[i] > max_bucket) max_bucket = buckets[i];
+    }
+    printf("XOR Combine: 最小桶=%d, 最大桶=%d, 分布比=%.2f\n", 
+           min_bucket, max_bucket, (double)max_bucket / min_bucket);
+    
+    printf("\n=== 哈希测试完成 ===\n");
+    printf("提示: 使用 --hash-test 参数运行此测试\n");
+    printf("使用 --hash-algo <0-4> 设置哈希算法:\n");
+    printf("  0: Original, 1: xxHash, 2: Simple XOR, 3: XOR Combine, 4: XOR Aggressive\n\n");
+}
 
+// =================== 线程池实现 ===================
 
+/**
+ * 初始化线程池
+ */
+static int thread_pool_init(int thread_count) {
+    log_info("Initializing thread pool with %d threads...", thread_count);
+    
+    if (thread_count <= 0 || thread_count > MAX_WORKER_THREADS) {
+        log_error("Invalid thread count: %d (must be 1-%d)", thread_count, MAX_WORKER_THREADS);
+        return -1;
+    }
+    
+    // 初始化线程池结构
+    memset(&g_thread_pool, 0, sizeof(g_thread_pool));
+    g_thread_pool.thread_count = thread_count;
+    g_thread_pool.shutdown = 0;
+    
+    log_info("Thread pool structure initialized");
+    
+    // 初始化互斥锁和条件变量
+    if (pthread_mutex_init(&g_thread_pool.stats_mutex, NULL) != 0) {
+        log_error("Failed to initialize stats mutex");
+        return -1;
+    }
+    
+    if (pthread_mutex_init(&g_thread_pool.work_mutex, NULL) != 0) {
+        log_error("Failed to initialize work mutex");
+        pthread_mutex_destroy(&g_thread_pool.stats_mutex);
+        return -1;
+    }
+    
+    if (pthread_cond_init(&g_thread_pool.work_cond, NULL) != 0) {
+        log_error("Failed to initialize work condition variable");
+        pthread_mutex_destroy(&g_thread_pool.stats_mutex);
+        pthread_mutex_destroy(&g_thread_pool.work_mutex);
+        return -1;
+    }
+    
+    log_info("Mutexes and condition variables initialized");
+    
+    // 创建工作线程
+    for (int i = 0; i < thread_count; i++) {
+        worker_thread_t *worker = &g_thread_pool.workers[i];
+        worker->thread_id = i;
+        worker->running = 1;
+        worker->busy = 0;
+        worker->packets_processed = 0;
+        worker->bytes_processed = 0;
+        clock_gettime(CLOCK_MONOTONIC, &worker->last_activity);
+        
+        // 设置线程属性
+        pthread_attr_t attr;
+        pthread_attr_init(&attr);
+        pthread_attr_setstacksize(&attr, WORKER_THREAD_STACK_SIZE);
+        pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_JOINABLE);
+        
+        // 创建线程
+        if (pthread_create(&worker->thread, &attr, worker_thread_func, worker) != 0) {
+            log_error("Failed to create worker thread %d", i);
+            pthread_attr_destroy(&attr);
+            thread_pool_destroy();
+            return -1;
+        }
+        
+        pthread_attr_destroy(&attr);
+        log_info("Created worker thread %d", i);
+    }
+    
+    log_info("Thread pool initialized with %d worker threads", thread_count);
+    thread_pool_initialized = 1;  // 设置初始化标志
+    return 0;
+}
 
+/**
+ * 销毁线程池
+ */
+static void thread_pool_destroy(void) {
+    if (g_thread_pool.thread_count == 0) {
+        return; // 已经销毁
+    }
+    
+    log_info("Shutting down thread pool...");
+    
+    // 设置关闭标志
+    g_thread_pool.shutdown = 1;
+    
+    // 唤醒所有等待的线程
+    pthread_cond_broadcast(&g_thread_pool.work_cond);
+    
+    // 等待所有线程结束
+    for (int i = 0; i < g_thread_pool.thread_count; i++) {
+        worker_thread_t *worker = &g_thread_pool.workers[i];
+        if (worker->running) {
+            pthread_join(worker->thread, NULL);
+            log_info("Worker thread %d joined", i);
+        }
+    }
+    
+    // 清理资源
+    pthread_mutex_destroy(&g_thread_pool.stats_mutex);
+    pthread_mutex_destroy(&g_thread_pool.work_mutex);
+    pthread_cond_destroy(&g_thread_pool.work_cond);
+    
+    memset(&g_thread_pool, 0, sizeof(g_thread_pool));
+    log_info("Thread pool destroyed");
+}
+
+/**
+ * 工作线程函数
+ */
+static void *worker_thread_func(void *arg) {
+    worker_thread_t *worker = (worker_thread_t *)arg;
+    int thread_id = worker->thread_id;
+    
+    log_info("Worker thread %d started", thread_id);
+    
+    // 设置线程名称（如果支持）
+    char thread_name[16];
+    snprintf(thread_name, sizeof(thread_name), "worker_%d", thread_id);
+    pthread_setname_np(worker->thread, thread_name);
+    
+    while (worker->running && !g_thread_pool.shutdown) {
+        packet_data_t packet;
+        int processed = 0;
+        
+        // 处理队列中的数据包
+        uint64_t queue_size = packet_queue_size(&packet_queue);
+        if (queue_size > 0) {
+            log_debug("Worker %d: queue size = %lu", thread_id, queue_size);
+        }
+        
+        while (packet_queue_size(&packet_queue) > 0 && worker->running && !g_thread_pool.shutdown) {
+            if (packet_queue_dequeue(&packet_queue, &packet) == 0) {
+                worker->busy = 1;
+                clock_gettime(CLOCK_MONOTONIC, &worker->last_activity);
+                
+                // 处理数据包
+                if (packet.ip_header.protocol == IPPROTO_TCP) {
+                    // 从存储的TCP头部数据中提取标志位
+                    struct tcphdr *tcp_header = (struct tcphdr *)packet.transport_header.tcp.flags_byte;
+                    uint8_t tcp_flags = *((uint8_t*)tcp_header + 13);  // TCP标志位在第13字节
+                    uint32_t tcp_seq = packet.transport_header.tcp.seq;
+                    
+                    process_packet_direct(&packet.ip_header, 
+                                        packet.transport_header.tcp.source,
+                                        packet.transport_header.tcp.dest,
+                                        tcp_seq, tcp_flags, packet.timestamp);
+                } else if (packet.ip_header.protocol == IPPROTO_UDP) {
+                    process_packet_direct(&packet.ip_header,
+                                        packet.transport_header.udp.source,
+                                        packet.transport_header.udp.dest,
+                                        0, 0, packet.timestamp);  // UDP没有序列号和标志位
+                }
+                
+                // 更新统计信息
+                worker->packets_processed++;
+                worker->bytes_processed += packet.ip_header.tot_len;
+                processed++;
+                
+                // 原子更新全局统计
+                __sync_fetch_and_add(&total_packets_processed, 1);
+                __sync_fetch_and_add(&total_packets_dequeued, 1);
+                __sync_fetch_and_add(&total_bytes_processed, packet.ip_header.tot_len);
+            }
+        }
+        
+        // 如果没有处理任何包，短暂休眠避免空转
+        if (processed == 0) {
+            worker->busy = 0;
+            usleep(1000); // 1ms
+        }
+    }
+    
+    log_info("Worker thread %d finished (processed %lu packets)", 
+             thread_id, worker->packets_processed);
+    
+    return NULL;
+}
+
+/**
+ * 多线程处理数据包队列
+ */
+static void process_packet_queue_mt(void) {
+    // 线程池会自动处理队列中的数据包
+    // 这里只需要检查线程池状态
+    if (g_thread_pool.shutdown) {
+        return;
+    }
+    
+    // 可以在这里添加一些监控逻辑
+    static uint64_t last_check_time = 0;
+    uint64_t current_time = get_current_time();
+    
+    // 每100ms检查一次线程池状态
+    if (current_time - last_check_time >= 100000000) { // 100ms in nanoseconds
+        update_thread_pool_stats();
+        last_check_time = current_time;
+    }
+}
+
+/**
+ * 更新线程池统计信息
+ */
+static void update_thread_pool_stats(void) {
+    pthread_mutex_lock(&g_thread_pool.stats_mutex);
+    
+    uint64_t total_packets = 0;
+    uint64_t total_bytes = 0;
+    int busy_threads = 0;
+    
+    for (int i = 0; i < g_thread_pool.thread_count; i++) {
+        worker_thread_t *worker = &g_thread_pool.workers[i];
+        total_packets += worker->packets_processed;
+        total_bytes += worker->bytes_processed;
+        if (worker->busy) {
+            busy_threads++;
+        }
+    }
+    
+    // 输出线程池状态（仅在调试模式下）
+    static int debug_count = 0;
+    if (debug_count % 100 == 0) { // 每10秒输出一次
+        log_debug("Thread pool status: %d/%d threads busy, total packets: %lu, total bytes: %lu MB", 
+                 busy_threads, g_thread_pool.thread_count, total_packets, 
+                 total_bytes / (1024 * 1024));
+    }
+    debug_count++;
+    
+    pthread_mutex_unlock(&g_thread_pool.stats_mutex);
+}
+
+/**
+ * 获取线程池统计信息
+ */
+void get_thread_pool_stats(uint64_t *total_packets, uint64_t *total_bytes, 
+                          int *busy_threads, int *total_threads) {
+    log_info("Getting thread pool stats, thread_count: %d, initialized: %d, shutdown: %d", 
+              g_thread_pool.thread_count, thread_pool_initialized, g_thread_pool.shutdown);
+    
+    if (!thread_pool_initialized) {
+        log_warn("Thread pool not initialized!");
+        if (total_packets) *total_packets = 0;
+        if (total_bytes) *total_bytes = 0;
+        if (busy_threads) *busy_threads = 0;
+        if (total_threads) *total_threads = 0;
+        return;
+    }
+    
+    pthread_mutex_lock(&g_thread_pool.stats_mutex);
+    
+    uint64_t packets = 0;
+    uint64_t bytes = 0;
+    int busy = 0;
+    
+    for (int i = 0; i < g_thread_pool.thread_count; i++) {
+        worker_thread_t *worker = &g_thread_pool.workers[i];
+        packets += worker->packets_processed;
+        bytes += worker->bytes_processed;
+        if (worker->busy) {
+            busy++;
+        }
+        log_info("Worker %d: packets=%lu, bytes=%lu, busy=%d, running=%d", 
+                 i, worker->packets_processed, worker->bytes_processed, worker->busy, worker->running);
+    }
+    
+    if (total_packets) *total_packets = packets;
+    if (total_bytes) *total_bytes = bytes;
+    if (busy_threads) *busy_threads = busy;
+    if (total_threads) *total_threads = g_thread_pool.thread_count;
+    
+    log_info("Thread pool stats: packets=%lu, bytes=%lu, busy=%d, total=%d", 
+              packets, bytes, busy, g_thread_pool.thread_count);
+    
+    pthread_mutex_unlock(&g_thread_pool.stats_mutex);
+}
 

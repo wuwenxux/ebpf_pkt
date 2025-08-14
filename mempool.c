@@ -1,10 +1,13 @@
 // src/mempool.c
-#include "mempool.h"
-#include "logger.h"
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <stdio.h>
 #include <unistd.h>
+#include <sys/mman.h>
+#include <pthread.h>
+#include "mempool.h"
+#include "flow.h"
+#include "logger.h"
 
 // 设置内存锁定限制
 static void set_memory_lock_limit() {
@@ -106,11 +109,24 @@ struct flow_node *mempool_alloc(struct mempool *pool) {
     memset(node, 0, sizeof(struct flow_node));
     node->in_use = 1;
     
+    // 初始化互斥锁
+    if (pthread_mutex_init(&node->mutex, NULL) != 0) {
+        log_error("Failed to initialize mutex for flow node");
+        // 将节点返回到空闲链表
+        node->in_use = 0;
+        node->next = pool->free_list;
+        pool->free_list = node;
+        return NULL;
+    }
+    
     return node;
 }
 
 void mempool_free(struct mempool *pool, struct flow_node *node) {
     if (!pool || !node) return;
+    
+    // 销毁互斥锁
+    pthread_mutex_destroy(&node->mutex);
     
     // 将节点返回到空闲链表
     node->in_use = 0;
@@ -138,8 +154,16 @@ void mempool_clear(struct mempool *pool) {
     // 重置所有节点状态
     struct flow_node* nodes = (struct flow_node*)pool->physical_memory;
     for (size_t i = 0; i < pool->total_nodes; i++) {
+        // 销毁现有的互斥锁（如果已初始化）
+        pthread_mutex_destroy(&nodes[i].mutex);
+        
         memset(&nodes[i], 0, sizeof(struct flow_node));
         nodes[i].in_use = 0;
+        
+        // 重新初始化互斥锁
+        if (pthread_mutex_init(&nodes[i].mutex, NULL) != 0) {
+            log_error("Failed to initialize mutex for flow node %zu", i);
+        }
     }
     
     // 重建空闲链表
