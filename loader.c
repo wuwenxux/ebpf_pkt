@@ -125,6 +125,7 @@ extern session_manager_t *global_session_manager;
 extern struct mempool global_pool; // 从flow.c导入全局内存池
 extern void mempool_get_stats(struct mempool *pool, size_t *total_nodes, size_t *free_nodes, size_t *used_nodes);
 extern void cleanup_flows(void); // 从flow.c导入流清理函数
+extern int cleanup_expired_sessions(void); // 从transport_session.c导入会话清理函数
 extern void mempool_clear(struct mempool *pool); // 从mempool.c导入内存池清理函数
 extern void get_session_creation_stats(uint64_t *total_created, uint64_t *tcp_created, uint64_t *udp_created, uint64_t *reused);
 extern transport_session_t *process_packet_with_conversation(const struct flow_key *key, 
@@ -1371,11 +1372,12 @@ int run_live_capture(const char *ifname) {
             fflush(stdout);
             last_stats_time = current_time;
             
-            // 定期清理不活跃的流（每1秒清理一次）
+            // 定期清理不活跃的流和会话（每1秒清理一次）
             static uint64_t last_cleanup_time = 0;
             if (current_time - last_cleanup_time >= 1000) { // 1秒（毫秒）
                 if (running) {  // 只在程序运行时进行清理
                     cleanup_flows();
+                    cleanup_expired_sessions();  // 添加会话清理
                     last_cleanup_time = current_time;
                 }
             }
@@ -1391,6 +1393,7 @@ int run_live_capture(const char *ifname) {
                         log_debug("Emergency cleanup triggered - memory usage: %.1f%%", 
                                  (double)used_nodes * 100.0 / total_nodes);
                         cleanup_flows();
+                        cleanup_expired_sessions();  // 添加会话紧急清理
                         last_emergency_cleanup = current_time;
                     }
                 }

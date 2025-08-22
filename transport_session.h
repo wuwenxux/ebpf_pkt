@@ -286,7 +286,7 @@ transport_session_t *create_transport_session_with_state(const struct flow_key *
                                                         uint64_t timestamp);
 
 // 会话清理函数声明
-int cleanup_expired_sessions(uint64_t current_time);
+int cleanup_expired_sessions(void);
 int cleanup_sessions_by_memory_pressure(void);
 int cleanup_oldest_sessions(int max_cleanup_count);
 void start_session_cleanup_thread(void);

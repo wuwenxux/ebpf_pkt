@@ -2360,5 +2360,102 @@ int export_comprehensive_session_features(transport_session_t *session, FILE *fp
     return 0;
 }
 
+/**
+ * 清理过期的会话
+ * 返回清理的会话数量
+ */
+int cleanup_expired_sessions(void) {
+    if (!atomic_load(&session_manager_initialized) || !global_session_manager) {
+        return 0;
+    }
+    
+    uint64_t current_time = get_current_time();
+    int cleaned_count = 0;
+    
+    // 遍历所有哈希桶
+    for (int i = 0; i < SESSION_HASH_SIZE; i++) {
+        transport_session_t *session = atomic_load_session_ptr(&global_session_manager->sessions[i]);
+        transport_session_t *prev = NULL;
+        
+        while (session) {
+            transport_session_t *next = atomic_load_session_ptr(&session->next_atomic);
+            
+            // 检查会话是否过期
+            bool should_cleanup = false;
+            
+            // 条件1：会话不活跃
+            if (!atomic_load(&session->is_active)) {
+                should_cleanup = true;
+            }
+            
+            // 条件2：超过超时时间
+            if (current_time - session->stats.last_packet > global_session_manager->session_timeout_ns) {
+                should_cleanup = true;
+            }
+            
+            // 条件3：TCP会话已完成
+            if (session->type == SESSION_TYPE_TCP) {
+                if (session->state.tcp_state == TCP_SESSION_CLOSED || 
+                    session->state.tcp_state == TCP_SESSION_RESET) {
+                    should_cleanup = true;
+                }
+            }
+            
+            // 条件4：内存池使用率过高时的激进清理
+            uint32_t pool_usage = get_lockfree_pool_usage_percent(&global_session_manager->session_pool);
+            if (pool_usage > 80 && current_time - session->stats.last_packet > 10000000000ULL) { // 10秒
+                should_cleanup = true;
+            }
+            
+            if (should_cleanup) {
+                // 从链表中移除session
+                if (prev) {
+                    atomic_store_session_ptr(&prev->next_atomic, next);
+                    prev->next = next;
+                } else {
+                    atomic_store(&global_session_manager->sessions[i], (uintptr_t)next);
+                }
+                
+                if (next) {
+                    atomic_store_session_ptr(&next->prev_atomic, prev);
+                    next->prev = prev;
+                }
+                
+                // 更新统计信息
+                atomic_fetch_sub(&global_session_manager->active_sessions, 1);
+                atomic_fetch_add(&global_session_manager->sessions_destroyed, 1);
+                
+                if (session->type == SESSION_TYPE_TCP) {
+                    atomic_fetch_sub(&global_session_manager->tcp_sessions, 1);
+                } else if (session->type == SESSION_TYPE_UDP) {
+                    atomic_fetch_sub(&global_session_manager->udp_sessions, 1);
+                }
+                
+                // 释放session到内存池
+                lockfree_free_session_to_pool(session);
+                cleaned_count++;
+                
+                log_debug("Cleaned up expired session: %u.%u.%u.%u:%u -> %u.%u.%u.%u:%u (proto: %u)", 
+                         (session->key.src_ip >> 24) & 0xFF, (session->key.src_ip >> 16) & 0xFF, 
+                         (session->key.src_ip >> 8) & 0xFF, session->key.src_ip & 0xFF, ntohs(session->key.src_port),
+                         (session->key.dst_ip >> 24) & 0xFF, (session->key.dst_ip >> 16) & 0xFF, 
+                         (session->key.dst_ip >> 8) & 0xFF, session->key.dst_ip & 0xFF, ntohs(session->key.dst_port),
+                         session->key.protocol);
+            } else {
+                prev = session;
+            }
+            
+            session = next;
+        }
+    }
+    
+    if (cleaned_count > 0) {
+        uint32_t pool_usage = get_lockfree_pool_usage_percent(&global_session_manager->session_pool);
+        log_info("Cleaned up %d expired sessions, pool usage: %u%%", cleaned_count, pool_usage);
+    }
+    
+    return cleaned_count;
+}
+
 
 
