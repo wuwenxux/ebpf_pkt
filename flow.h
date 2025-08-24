@@ -437,8 +437,10 @@ uint64_t get_current_time();
 
 // 时间戳数组操作函数
 void timestamp_array_init(timestamp_array_t *arr);
+void timestamp_array_init_with_capacity(timestamp_array_t *arr, size_t initial_capacity);
 void timestamp_array_add(timestamp_array_t *arr, uint64_t timestamp);
 void timestamp_array_free(timestamp_array_t *arr);
+void timestamp_array_reset(timestamp_array_t *arr);  // 重置但不释放内存
 
 
 

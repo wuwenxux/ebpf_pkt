@@ -149,6 +149,14 @@ typedef struct session_export_data {
 // 内存池块大小
 #define MEMORY_POOL_BLOCK_SIZE sizeof(transport_session_t)
 
+// 特征值内存池配置
+#define FEATURES_POOL_SIZE 50000      // 5万个特征结构的内存池
+#define FEATURES_POOL_BLOCK_SIZE sizeof(struct flow_features)
+
+// 时间戳数组预分配配置
+#define TIMESTAMP_ARRAY_INITIAL_CAPACITY 32  // 初始容量32个时间戳
+#define TIMESTAMP_ARRAY_MAX_CAPACITY 1024    // 最大容量1024个时间戳
+
 // 无锁内存池结构 - Cache line aligned for performance
 typedef struct memory_pool {
     // 高频访问字段 - 第一个cache line
@@ -245,6 +253,7 @@ typedef struct session_manager {
     
     // 内存池
     memory_pool_t session_pool;
+    memory_pool_t features_pool;  // 特征值内存池
     
     // 原子统计信息 - 第三个cache line
     atomic_ulong sessions_created;      // 原子创建计数
@@ -255,6 +264,11 @@ typedef struct session_manager {
     // 性能统计
     atomic_ulong hash_collisions;       // 哈希冲突计数
     atomic_ulong lookup_operations;     // 查找操作计数
+    
+    // 特征值内存池统计
+    atomic_ulong features_pool_allocations;   // 特征池分配次数
+    atomic_ulong features_pool_deallocations; // 特征池释放次数
+    atomic_uint features_pool_max_usage;      // 特征池最大使用量
     
     // 动态配置参数
     uint32_t max_sessions_limit;        // 动态最大会话数限制
@@ -272,6 +286,11 @@ void cleanup_lockfree_memory_pool(memory_pool_t *pool);
 void *allocate_from_lockfree_pool(memory_pool_t *pool, uint32_t *block_index);
 int free_to_lockfree_pool(memory_pool_t *pool, void *ptr, uint32_t block_index);
 uint32_t get_lockfree_pool_usage_percent(const memory_pool_t *pool);
+
+// 特征值内存池函数声明
+struct flow_features *allocate_features_from_pool(void);
+void free_features_to_pool(struct flow_features *features);
+uint32_t get_features_pool_usage_percent(void);
 
 // 无锁会话管理函数
 transport_session_t *lockfree_find_session(const struct flow_key *key);
@@ -292,6 +311,12 @@ int cleanup_oldest_sessions(int max_cleanup_count);
 void start_session_cleanup_thread(void);
 void stop_session_cleanup_thread(void);
 uint32_t get_session_cleanup_stats(uint64_t *total_cleaned, uint64_t *expired_cleaned, uint64_t *memory_cleaned);
+
+// 批量清理函数
+int batch_cleanup_sessions(int max_cleanup_count);
+int batch_cleanup_features_memory(void);
+void schedule_batch_cleanup(void);
+void monitor_memory_usage(void);
 
 // 性能监控函数
 void print_lockfree_pool_stats(const memory_pool_t *pool);

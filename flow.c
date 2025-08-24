@@ -233,14 +233,46 @@ void timestamp_array_init(timestamp_array_t *arr) {
     arr->capacity = 0;
 }
 
+void timestamp_array_init_with_capacity(timestamp_array_t *arr, size_t initial_capacity) {
+    if (initial_capacity > 0) {
+        arr->times = malloc(initial_capacity * sizeof(uint64_t));
+        if (arr->times) {
+            arr->capacity = initial_capacity;
+            arr->count = 0;
+        } else {
+            // 分配失败，回退到默认初始化
+            arr->times = NULL;
+            arr->capacity = 0;
+            arr->count = 0;
+        }
+    } else {
+        timestamp_array_init(arr);
+    }
+}
+
 void timestamp_array_add(timestamp_array_t *arr, uint64_t timestamp) {
     if (arr->count >= arr->capacity) {
-        size_t new_capacity = arr->capacity == 0 ? 16 : arr->capacity * 2;
-        uint64_t *new_times = realloc(arr->times, new_capacity * sizeof(uint64_t));
-        if (!new_times) return;
+        // 限制最大容量，避免内存过度增长
+        size_t new_capacity;
+        if (arr->capacity == 0) {
+            new_capacity = TIMESTAMP_ARRAY_INITIAL_CAPACITY;
+        } else if (arr->capacity >= TIMESTAMP_ARRAY_MAX_CAPACITY) {
+            // 达到最大容量，循环使用
+            arr->count = 0;  // 重置到开始位置
+        } else {
+            new_capacity = arr->capacity * 2;
+            if (new_capacity > TIMESTAMP_ARRAY_MAX_CAPACITY) {
+                new_capacity = TIMESTAMP_ARRAY_MAX_CAPACITY;
+            }
+        }
         
-        arr->times = new_times;
-        arr->capacity = new_capacity;
+        if (new_capacity > arr->capacity) {
+            uint64_t *new_times = realloc(arr->times, new_capacity * sizeof(uint64_t));
+            if (!new_times) return;
+            
+            arr->times = new_times;
+            arr->capacity = new_capacity;
+        }
     }
     
     arr->times[arr->count++] = timestamp;
@@ -255,13 +287,14 @@ void timestamp_array_free(timestamp_array_t *arr) {
     arr->capacity = 0;
 }
 
+void timestamp_array_reset(timestamp_array_t *arr) {
+    // 重置计数但不释放内存，保留容量以便重用
+    arr->count = 0;
+}
+
 // =================== 时间处理函数 ===================
 
-uint64_t get_current_time() {
-    struct timespec ts;
-    clock_gettime(CLOCK_MONOTONIC, &ts);
-    return (uint64_t)ts.tv_sec * 1000000000ULL + ts.tv_nsec;
-}
+// get_current_time函数已在loader_core.c中定义
 
 void ns_to_timespec(uint64_t timestamp_ns, struct timespec *ts) {
     ts->tv_sec = timestamp_ns / 1000000000ULL;
@@ -1554,10 +1587,6 @@ struct flow_stats* get_or_create_udp_conversation(const struct flow_key *key, in
     
     while (node) {
         // 移除 is_shutdown_requested() 检查，允许遍历所有节点
-        // if (is_shutdown_requested()) {
-        //     log_debug("Skipping UDP flow lookup during shutdown");
-        //     return NULL;
-        // }
         // 验证节点指针的有效性
         if (!node || (uintptr_t)node < 0x1000) { 
             log_debug("Invalid UDP node pointer detected, skipping");
