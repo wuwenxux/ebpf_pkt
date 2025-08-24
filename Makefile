@@ -1,336 +1,236 @@
-# ==================== 构建配置 ====================
-CLANG ?= clang
-ARCH := $(shell uname -m | sed 's/x86_64/x86/;s/aarch64/arm64/')
-CC ?= gcc
+# 编译配置
+CC = cc
+CLANG = clang
 
-# 构建类型配置
+# 本地libbpf路径
+LOCAL_LIBBPF_PATH = /root/Projects/ebpf_pkt/usr
+LOCAL_LIBBPF_INCLUDE = $(LOCAL_LIBBPF_PATH)/include
+LOCAL_LIBBPF_LIB = $(LOCAL_LIBBPF_PATH)/lib64
+
+# 构建类型和日志级别
 BUILD_TYPE ?= release
-DEBUG_LEVEL ?= 0
+LOG_LEVEL ?= 1
 
 # 根据构建类型设置编译标志
 ifeq ($(BUILD_TYPE),debug)
-    # Debug版本配置
-    CFLAGS += -g -O0 -DDEBUG -DDEBUG_LEVEL=$(DEBUG_LEVEL) -Wall -Wextra -Wpedantic
-    CFLAGS += -fsanitize=address -fsanitize=undefined -fno-omit-frame-pointer
-    CFLAGS += -DTRACE_ENABLED -DASSERT_ENABLED
-    LDFLAGS += -fsanitize=address -fsanitize=undefined -lncurses
-    BPF_CFLAGS += -g -O0 -DDEBUG
-    BUILD_SUFFIX = _debug
-    DEBUG_INFO = 1
-else ifeq ($(BUILD_TYPE),release)
-    # Release版本配置
-    CFLAGS += -O3 -DNDEBUG -march=native -mtune=native
-    CFLAGS += -flto -ffast-math -funroll-loops
-    CFLAGS += -fomit-frame-pointer -DRELEASE_BUILD
-    LDFLAGS += -flto -lncurses
-    BPF_CFLAGS += -O2 -DNDEBUG
-    BUILD_SUFFIX = _release
-    DEBUG_INFO = 0
+    CFLAGS = -std=c11 -Wall -I$(LOCAL_LIBBPF_INCLUDE) -D_GNU_SOURCE -D_POSIX_C_SOURCE=200809L -g -DDEBUG -O0 -DLOG_LEVEL=2
+    BPF_CFLAGS = -g -DDEBUG -O0 -target bpf -D__TARGET_ARCH_x86 -I. -I$(LOCAL_LIBBPF_INCLUDE) -I/usr/include -I/usr/include/linux -I/usr/include/x86_64-linux-gnu -Werror -Wno-unused-value -Wno-pointer-sign -mcpu=v3 -g
+    OPTIMIZATION_FLAGS = -g -DDEBUG -O0
+    LOG_LEVEL = 2
 else ifeq ($(BUILD_TYPE),profile)
-    # Profile版本配置（用于性能分析）
-    CFLAGS += -O2 -g -pg -DDEBUG_LEVEL=1
-    CFLAGS += -fno-omit-frame-pointer -DTRACE_ENABLED
-    LDFLAGS += -pg -lncurses
-    BPF_CFLAGS += -O2 -g
-    BUILD_SUFFIX = _profile
-    DEBUG_INFO = 1
+    CFLAGS = -std=c11 -Wall -I$(LOCAL_LIBBPF_INCLUDE) -D_GNU_SOURCE -D_POSIX_C_SOURCE=200809L -g -pg -O2 -DLOG_LEVEL=1
+    BPF_CFLAGS = -g -O2 -target bpf -D__TARGET_ARCH_x86 -I. -I$(LOCAL_LIBBPF_INCLUDE) -I/usr/include -I/usr/include/linux -I/usr/include/x86_64-linux-gnu -Werror -Wno-unused-value -Wno-pointer-sign -mcpu=v3 -g
+    OPTIMIZATION_FLAGS = -g -pg -O2
+    LOG_LEVEL = 1
 else
-    # 默认release配置
-    BUILD_TYPE = release
-    CFLAGS += -O3 -DNDEBUG -march=native
-    BPF_CFLAGS += -O2 -DNDEBUG
-    BUILD_SUFFIX = _release
-    DEBUG_INFO = 0
+    # release版本
+    CFLAGS = -std=c11 -Wall -I$(LOCAL_LIBBPF_INCLUDE) -D_GNU_SOURCE -D_POSIX_C_SOURCE=200809L -O3 -DNDEBUG -DLOG_LEVEL=0
+    BPF_CFLAGS = -O2 -DNDEBUG -target bpf -D__TARGET_ARCH_x86 -I. -I$(LOCAL_LIBBPF_INCLUDE) -I/usr/include -I/usr/include/linux -I/usr/include/x86_64-linux-gnu -Werror -Wno-unused-value -Wno-pointer-sign -mcpu=v3 -g
+    OPTIMIZATION_FLAGS = -O3 -DNDEBUG -march=native -mtune=native -flto -ffast-math -funroll-loops -fomit-frame-pointer -fno-sanitize=address -fno-sanitize=undefined
+    LOG_LEVEL = 0
 endif
 
-# libbpf directories - 使用本地include目录
-LIBBPF_SRC := $(abspath include)
-
-# 通用编译标志
-CFLAGS += -std=c11 -Wall -I$(LIBBPF_SRC)
-CFLAGS += -D_GNU_SOURCE -D_POSIX_C_SOURCE=200809L
-
-# BPF编译器标志
-BPF_CFLAGS += -target bpf -D__TARGET_ARCH_$(ARCH) \
-             -I. \
-             -I$(LIBBPF_SRC) \
-             -I/usr/include \
-             -I/usr/include/linux \
-             -I/usr/include/$(shell uname -m)-linux-gnu \
-             -Werror -Wno-unused-value -Wno-pointer-sign \
-             -g -O2 -mcpu=v3
-
-# 库链接标志
-LDLIBS := -lelf -lz -lbpf -lm -lpcap -lncurses
-JSON_LDLIBS := $(LDLIBS) -lcjson
-
-# 确定正确的库路径
-LIB64_DIR := /usr/lib64
-LIB_DIR := /usr/lib
-
 # 构建信息
-BUILD_INFO := $(shell date +"%Y-%m-%d %H:%M:%S")
-GIT_HASH := $(shell git rev-parse --short HEAD 2>/dev/null || echo "unknown")
-VERSION := 1.0.0
+GIT_HASH = $(shell git rev-parse --short HEAD 2>/dev/null || echo "unknown")
+VERSION = 1.0.0
 
-# 编译时定义
-CFLAGS += -DBUILD_TYPE=\"$(BUILD_TYPE)\" -DGIT_HASH=\"$(GIT_HASH)\" -DVERSION=\"$(VERSION)\"
+# 源文件
+LOADER_SOURCES = loader_core.c lockfree_queue.c worker_threads.c ringbuf_handler.c interface_manager.c
+FLOW_SOURCES = flow.c mempool.c
+TRANSPORT_SOURCES = transport_session.c
+LOGGER_SOURCES = logger.c
+STATS_SOURCES = stats_window.c system_stats.c
 
-# ==================== 目标文件 ====================
-TARGETS := loader
-DEBUG_TARGETS := $(addsuffix $(BUILD_SUFFIX),$(TARGETS))
-RELEASE_TARGETS := $(addsuffix _release,$(TARGETS))
-PROFILE_TARGETS := $(addsuffix _profile,$(TARGETS))
+# 目标文件
+LOADER_OBJECTS = $(LOADER_SOURCES:.c=.o)
+FLOW_OBJECTS = $(FLOW_SOURCES:.c=.o)
+TRANSPORT_OBJECTS = $(TRANSPORT_SOURCES:.c=.o)
+LOGGER_OBJECTS = $(LOGGER_SOURCES:.c=.o)
+STATS_OBJECTS = $(STATS_SOURCES:.c=.o)
 
-# 主目标 - 包含BPF程序
-all: bpf_program.o $(TARGETS)
+# 库文件 - 使用本地libbpf
+LIBS = -lelf -lz -lm -lpcap -lncurses
+LDFLAGS = -L$(LOCAL_LIBBPF_LIB) -lbpf
 
-# Debug版本
-debug: CFLAGS := -std=c11 -Wall -I$(LIBBPF_SRC) -D_GNU_SOURCE -D_POSIX_C_SOURCE=200809L
-debug: CFLAGS += -g -O0 -DDEBUG -DDEBUG_LEVEL=$(DEBUG_LEVEL) -Wall -Wextra -Wpedantic -fPIC
-debug: CFLAGS += -fsanitize=address -fsanitize=undefined -fno-omit-frame-pointer
-debug: CFLAGS += -DBUILD_TYPE="debug" -DGIT_HASH="$(GIT_HASH)" -DVERSION="$(VERSION)"
-debug: LDFLAGS += -fsanitize=address -fsanitize=undefined -no-pie
-debug: loader_debug
+# 运行时库路径
+RPATH = -Wl,-rpath,$(LOCAL_LIBBPF_LIB)
 
-# Release版本
-release: CFLAGS := -std=c11 -Wall -I$(LIBBPF_SRC) -D_GNU_SOURCE -D_POSIX_C_SOURCE=200809L
-release: CFLAGS += -O3 -DNDEBUG -march=native -mtune=native
-release: CFLAGS += -flto -ffast-math -funroll-loops -fomit-frame-pointer
-release: CFLAGS += -fno-sanitize=address -fno-sanitize=undefined
-release: CFLAGS += -DBUILD_TYPE=\"release\" -DGIT_HASH=\"$(GIT_HASH)\" -DVERSION=\"$(VERSION)\"
-release: LDFLAGS += -flto
-release: loader_release
+# 默认目标
+all: release
 
-# Profile版本
-profile: CFLAGS := -std=c11 -Wall -I$(LIBBPF_SRC) -D_GNU_SOURCE -D_POSIX_C_SOURCE=200809L
-profile: CFLAGS += -O2 -g -pg -DDEBUG_LEVEL=1
-profile: CFLAGS += -fno-omit-frame-pointer -DTRACE_ENABLED
-profile: CFLAGS += -DBUILD_TYPE=\"profile\" -DGIT_HASH=\"$(GIT_HASH)\" -DVERSION=\"$(VERSION)\"
-profile: LDFLAGS += -pg
-profile: loader_profile
-
-# 所有版本
-all-versions: debug release profile
-
-# ==================== BPF程序编译 ====================
+# 编译BPF程序
 bpf_program.o: bpf_program.c
 	@echo "编译BPF程序 ($(BUILD_TYPE)版本)..."
-	$(CLANG) $(BPF_CFLAGS) -c $< -o $@
+	$(CLANG) $(BPF_CFLAGS) -c bpf_program.c -o bpf_program.o
 
-# ==================== 对象文件编译 ====================
-stats_window.o: stats_window.c stats_window.h
+# 编译核心模块
+loader_core.o: loader_core.c
+	@echo "编译loader_core.o..."
+	$(CC) $(CFLAGS) $(OPTIMIZATION_FLAGS) -DBUILD_TYPE=\"$(BUILD_TYPE)\" -DGIT_HASH=\"$(GIT_HASH)\" -DVERSION=\"$(VERSION)\" -c loader_core.c -o loader_core.o
+
+# 编译无锁队列模块
+lockfree_queue.o: lockfree_queue.c
+	@echo "编译lockfree_queue.o..."
+	$(CC) $(CFLAGS) $(OPTIMIZATION_FLAGS) -DBUILD_TYPE=\"$(BUILD_TYPE)\" -DGIT_HASH=\"$(GIT_HASH)\" -DVERSION=\"$(VERSION)\" -c lockfree_queue.c -o lockfree_queue.o
+
+# 编译工作线程模块
+worker_threads.o: worker_threads.c
+	@echo "编译worker_threads.o..."
+	$(CC) $(CFLAGS) $(OPTIMIZATION_FLAGS) -DBUILD_TYPE=\"$(BUILD_TYPE)\" -DGIT_HASH=\"$(GIT_HASH)\" -DVERSION=\"$(VERSION)\" -c worker_threads.c -o worker_threads.o
+
+# 编译RINGBUF处理模块
+ringbuf_handler.o: ringbuf_handler.c
+	@echo "编译ringbuf_handler.o..."
+	$(CC) $(CFLAGS) $(OPTIMIZATION_FLAGS) -DBUILD_TYPE=\"$(BUILD_TYPE)\" -DGIT_HASH=\"$(GIT_HASH)\" -DVERSION=\"$(VERSION)\" -c ringbuf_handler.c -o ringbuf_handler.o
+
+# 编译接口管理模块
+interface_manager.o: interface_manager.c
+	@echo "编译interface_manager.o..."
+	$(CC) $(CFLAGS) $(OPTIMIZATION_FLAGS) -DBUILD_TYPE=\"$(BUILD_TYPE)\" -DGIT_HASH=\"$(GIT_HASH)\" -DVERSION=\"$(VERSION)\" -c interface_manager.c -o interface_manager.o
+
+# 编译流处理模块
+flow.o: flow.c
+	@echo "编译flow.o..."
+	$(CC) $(CFLAGS) $(OPTIMIZATION_FLAGS) -DBUILD_TYPE=\"$(BUILD_TYPE)\" -DGIT_HASH=\"$(GIT_HASH)\" -DVERSION=\"$(VERSION)\" -c flow.c -o flow.o
+
+# 编译内存池模块
+mempool.o: mempool.c
+	@echo "编译mempool.o..."
+	$(CC) $(CFLAGS) $(OPTIMIZATION_FLAGS) -DBUILD_TYPE=\"$(BUILD_TYPE)\" -DGIT_HASH=\"$(GIT_HASH)\" -DVERSION=\"$(VERSION)\" -c mempool.c -o mempool.o
+
+# 编译传输会话模块
+transport_session.o: transport_session.c
+	@echo "编译transport_session.o..."
+	$(CC) $(CFLAGS) $(OPTIMIZATION_FLAGS) -DBUILD_TYPE=\"$(BUILD_TYPE)\" -DGIT_HASH=\"$(GIT_HASH)\" -DVERSION=\"$(VERSION)\" -c transport_session.c -o transport_session.o
+
+# 编译日志模块
+logger.o: logger.c
+	@echo "编译logger.o..."
+	$(CC) $(CFLAGS) $(OPTIMIZATION_FLAGS) -DBUILD_TYPE=\"$(BUILD_TYPE)\" -DGIT_HASH=\"$(GIT_HASH)\" -DVERSION=\"$(VERSION)\" -c logger.c -o logger.o
+
+# 编译统计窗口模块
+stats_window.o: stats_window.c
 	@echo "编译stats_window.o..."
-	$(CC) $(CFLAGS) -c $< -o $@
+	$(CC) $(CFLAGS) $(OPTIMIZATION_FLAGS) -DBUILD_TYPE=\"$(BUILD_TYPE)\" -DGIT_HASH=\"$(GIT_HASH)\" -DVERSION=\"$(VERSION)\" -c stats_window.c -o stats_window.o
 
+# 编译系统统计模块
 system_stats.o: system_stats.c
 	@echo "编译system_stats.o..."
-	$(CC) $(CFLAGS) -c $< -o $@
+	$(CC) $(CFLAGS) $(OPTIMIZATION_FLAGS) -DBUILD_TYPE=\"$(BUILD_TYPE)\" -DGIT_HASH=\"$(GIT_HASH)\" -DVERSION=\"$(VERSION)\" -c system_stats.c -o system_stats.o
 
-# ==================== 应用程序编译 ====================
+# 编译主程序
+loader: bpf_program.o $(LOADER_OBJECTS) $(FLOW_OBJECTS) $(TRANSPORT_OBJECTS) $(LOGGER_OBJECTS) $(STATS_OBJECTS)
+	@echo "编译loader_$(BUILD_TYPE) ($(BUILD_TYPE)版本)..."
+	@echo "构建类型: $(BUILD_TYPE)"
+	@echo "日志级别: $(LOG_LEVEL)"
+	@echo "使用本地libbpf库: $(LOCAL_LIBBPF_LIB)"
+	@echo "Git哈希: $(GIT_HASH)"
+	@echo "版本: $(VERSION)"
+	$(CC) $(CFLAGS) $(OPTIMIZATION_FLAGS) -DBUILD_TYPE=\"$(BUILD_TYPE)\" -DGIT_HASH=\"$(GIT_HASH)\" -DVERSION=\"$(VERSION)\" -flto $(RPATH) -o loader_$(BUILD_TYPE) $(LOADER_OBJECTS) $(FLOW_OBJECTS) $(TRANSPORT_OBJECTS) $(LOGGER_OBJECTS) $(STATS_OBJECTS) $(LDFLAGS) $(LIBS)
 
-# Loader应用程序
-loader: loader.c flow.c mempool.c transport_session.c logger.c stats_window.o system_stats.o
-	@echo "编译loader ($(BUILD_TYPE)版本)..."
-	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ $^ $(LDLIBS)
+# 构建目标
+debug: BUILD_TYPE=debug
+debug: loader_debug
 
-# 测试监控程序
-test_monitor: test_monitor.c flow.c mempool.c transport_session.c logger.c stats_window.o system_stats.o
-	@echo "编译test_monitor ($(BUILD_TYPE)版本)..."
-	$(CC) $(CFLAGS) -fno-sanitize=address -fno-sanitize=undefined $(LDFLAGS) -o $@ $^ $(LDLIBS)
+release: BUILD_TYPE=release
+release: loader_release
 
-loader_debug: loader.c flow.c mempool.c transport_session.c logger.c stats_window.o system_stats.o
-	@echo "编译loader (debug版本)..."
-	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ $^ $(LDLIBS)
+profile: BUILD_TYPE=profile
+profile: loader_profile
 
-loader_release: loader.c flow.c mempool.c transport_session.c logger.c stats_window.o system_stats.o
-	@echo "编译loader (release版本)..."
-	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ $^ $(LDLIBS)
+# 为不同构建类型创建符号链接
+loader_debug: BUILD_TYPE=debug
+loader_debug: loader
 
-loader_profile: loader.c flow.c mempool.c transport_session.c logger.c stats_window.o system_stats.o
-	@echo "编译loader (profile版本)..."
-	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ $^ $(LDLIBS)
+loader_release: BUILD_TYPE=release
+loader_release: loader
 
-loader_debug_noasan: loader.c flow.c mempool.c transport_session.c logger.c stats_window.o system_stats.o
-	@echo "编译loader (debug版本，无ASan，用于Valgrind)..."
-	$(CC) $(CFLAGS) -g -O0 -DDEBUG -DDEBUG_LEVEL=$(DEBUG_LEVEL) -Wall -Wextra -Wpedantic \
-		-fno-omit-frame-pointer -DTRACE_ENABLED -DASSERT_ENABLED \
-		$(LDFLAGS) -o $@ $^ $(LDLIBS)
+loader_profile: BUILD_TYPE=profile
+loader_profile: loader
 
-# 其他应用程序可以根据需要添加
-
-# ==================== 运行时路径修复 ====================
-fix_rpath:
-	@if [ -f loader ]; then \
-		echo "添加运行时库搜索路径到可执行文件..."; \
-		if [ -d $(LIB64_DIR) ]; then \
-			patchelf --set-rpath $(LIB64_DIR) loader; \
-		else \
-			patchelf --set-rpath $(LIB_DIR) loader; \
-		fi; \
-	fi
-	@if [ -f filter_manager ]; then \
-		echo "添加运行时库搜索路径到过滤器管理程序..."; \
-		if [ -d $(LIB64_DIR) ]; then \
-			patchelf --set-rpath $(LIB64_DIR) filter_manager; \
-		else \
-			patchelf --set-rpath $(LIB_DIR) filter_manager; \
-		fi; \
-	fi
-	@if [ -f filter_json_manager ]; then \
-		echo "添加运行时库搜索路径到JSON过滤器管理程序..."; \
-		if [ -d $(LIB64_DIR) ]; then \
-			patchelf --set-rpath $(LIB64_DIR) filter_json_manager; \
-		else \
-			patchelf --set-rpath $(LIB_DIR) filter_json_manager; \
-		fi; \
-	fi
-
-# ==================== 权限检查 ====================
-check_privileges:
-	@echo "检查 eBPF 特权模式..."
-	@if [ -f /proc/sys/kernel/unprivileged_bpf_disabled ] && [ $$(cat /proc/sys/kernel/unprivileged_bpf_disabled) -eq 1 ]; then \
-		echo "特权模式已启用 - 请确保使用 root 或 sudo 运行"; \
-	else \
-		echo "==================================================="; \
-		echo "注意: 可能需要设置 eBPF 特权模式!"; \
-		echo "如果运行时出现 'Operation not permitted' 错误，请运行:"; \
-		echo "sudo sysctl -w kernel.unprivileged_bpf_disabled=1"; \
-		echo "sudo sysctl -w kernel.bpf_stats_enabled=1"; \
-		echo "sudo sysctl -w net.core.bpf_jit_enable=1"; \
-		echo "==================================================="; \
-	fi
-
-# ==================== 安装目标 ====================
-install_all: check_privileges
-	@echo "=== 安装 libbpf 到系统 ==="
-	sudo $(MAKE) -C $(LIBBPF_SRC) install PREFIX=/usr
-	@echo "创建符号链接"
-	@if [ -d $(LIB64_DIR) ]; then \
-		if [ -f $(LIB64_DIR)/libbpf.so.1 ] && [ ! -L $(LIB_DIR)/libbpf.so.1 ]; then \
-			sudo ln -sf $(LIB64_DIR)/libbpf.so.1 $(LIB_DIR)/libbpf.so.1; \
-		elif [ -f $(LIB_DIR)/libbpf.so.1 ] && [ ! -L $(LIB64_DIR)/libbpf.so.1 ]; then \
-			sudo ln -sf $(LIB_DIR)/libbpf.so.1 $(LIB64_DIR)/libbpf.so.1; \
-		fi; \
-	fi
-	@echo "更新共享库缓存..."
-	sudo ldconfig
-	@echo ""
-	
-	@echo "=== 编译应用程序 ==="
-	@$(MAKE) all
-	@echo ""
-
-	@echo "=== 添加运行时库路径 ==="
-	@if command -v patchelf > /dev/null; then \
-		$(MAKE) fix_rpath; \
-	else \
-		echo "警告: 没有安装 patchelf，无法添加 RPATH. 可能需要手动设置 LD_LIBRARY_PATH"; \
-	fi
-	@echo ""
-	
-	@echo "=== 安装应用程序 ==="
-	sudo install -m 755 loader /usr/bin/ebpf_pkt
-	sudo install -m 755 filter_manager /usr/bin/ebpf_filter
-	sudo install -m 755 filter_json_manager /usr/bin/ebpf_filter_json
-	sudo mkdir -p /usr/share/ebpf_pkt
-	sudo install -m 644 bpf_program.o /usr/share/ebpf_pkt/
-	@echo "安装完成! 可以使用 'ebpf_pkt' 命令运行程序"
-	@echo "可以使用 'ebpf_filter' 命令管理过滤规则"
-	@echo "可以使用 'ebpf_filter_json' 命令管理 JSON 过滤规则"
-	@echo ""
-	@echo "如果仍然有库问题，请尝试运行:"
-	@echo "export LD_LIBRARY_PATH=\$$LD_LIBRARY_PATH:/usr/lib64:/usr/lib"
-	@echo ""
-	@echo "=== eBPF 权限须知 ==="
-	@echo "运行时如果出现 'Operation not permitted' 或 'Permission denied' 错误，"
-	@echo "请确保已设置以下系统参数:"
-	@echo "sudo sysctl -w kernel.unprivileged_bpf_disabled=1"
-	@echo "sudo sysctl -w kernel.bpf_stats_enabled=1"
-	@echo "sudo sysctl -w net.core.bpf_jit_enable=1"
-
-# ==================== 性能分析工具 ====================
-install-perf-tools:
-	@echo "安装性能分析工具..."
-	sudo apt-get update
-	sudo apt-get install -y perf-tools-unstable valgrind gprof
-	@echo "性能分析工具安装完成"
-
-# 使用gprof进行性能分析
-profile-gprof: profile
-	@echo "运行gprof性能分析..."
-	./loader_profile -i lo -c 1000
-	gprof loader_profile gmon.out > profile_report.txt
-	@echo "性能分析报告已保存到 profile_report.txt"
-
-# 使用perf进行性能分析
-profile-perf: release
-	@echo "运行perf性能分析..."
-	sudo perf record -g ./loader_release -i lo -c 1000
-	sudo perf report --stdio > perf_report.txt
-	@echo "perf分析报告已保存到 perf_report.txt"
-
-# 使用valgrind进行内存检查
-memcheck: debug-noasan
-	@echo "运行valgrind内存检查..."
-	valgrind --tool=memcheck --leak-check=full --show-leak-kinds=all \
-		--track-origins=yes --verbose --log-file=valgrind_report.txt \
-		./loader_debug_noasan -i lo -c 100
-	@echo "内存检查报告已保存到 valgrind_report.txt"
-
-# Debug版本（无ASan，用于Valgrind）
-debug-noasan: CFLAGS += -g -O0 -DDEBUG -DDEBUG_LEVEL=$(DEBUG_LEVEL) -Wall -Wextra -Wpedantic
-debug-noasan: CFLAGS += -fno-omit-frame-pointer
-debug-noasan: CFLAGS += -DTRACE_ENABLED -DASSERT_ENABLED
-debug-noasan: BPF_CFLAGS += -g -O0 -DDEBUG
-debug-noasan: loader_debug_noasan
-
-# ==================== 清理目标 ====================
+# 清理
 clean:
 	rm -f *.o loader filter_manager filter_json_manager test_* ebpf_pkt.sh
 	rm -f loader_debug loader_release loader_profile loader_debug_noasan
 	rm -f gmon.out profile_report.txt perf_report.txt valgrind_report.txt
 	rm -f *.debug *.release *.profile
 
-clean-all: clean
-	rm -f *.csv *.txt *.log
-	rm -rf debug/ release/ profile/
+# 安装
+install: loader_release
+	install -m 755 loader_release /usr/local/bin/loader
+	install -m 644 bpf_program.o /usr/local/lib/
 
-# ==================== 帮助信息 ====================
+# 卸载
+uninstall:
+	rm -f /usr/local/bin/loader
+	rm -f /usr/local/lib/bpf_program.o
+
+# 测试
+test: loader_release
+	@echo "运行测试..."
+	@echo "检查libbpf库路径..."
+	@ldd ./loader_release | grep libbpf || echo "libbpf库未找到，请检查路径"
+	./loader_release -h
+
+# 检查libbpf版本
+check-libbpf:
+	@echo "检查本地libbpf库..."
+	@echo "库路径: $(LOCAL_LIBBPF_LIB)"
+	@ls -la $(LOCAL_LIBBPF_LIB)/libbpf*
+	@echo ""
+	@echo "头文件路径: $(LOCAL_LIBBPF_INCLUDE)"
+	@ls -la $(LOCAL_LIBBPF_INCLUDE)/bpf/ 2>/dev/null || echo "头文件目录不存在"
+	@echo ""
+	@echo "pkg-config信息:"
+	@PKG_CONFIG_PATH=$(LOCAL_LIBBPF_LIB)/pkgconfig pkg-config --modversion libbpf 2>/dev/null || echo "pkg-config信息不可用"
+
+# 显示构建配置
+config:
+	@echo "=== 构建配置 ==="
+	@echo "构建类型: $(BUILD_TYPE)"
+	@echo "日志级别: $(LOG_LEVEL)"
+	@echo "编译器: $(CC)"
+	@echo "CLANG: $(CLANG)"
+	@echo "CFLAGS: $(CFLAGS)"
+	@echo "BPF_CFLAGS: $(BPF_CFLAGS)"
+	@echo "OPTIMIZATION_FLAGS: $(OPTIMIZATION_FLAGS)"
+	@echo "libbpf路径: $(LOCAL_LIBBPF_LIB)"
+	@echo "libbpf头文件: $(LOCAL_LIBBPF_INCLUDE)"
+	@echo "Git哈希: $(GIT_HASH)"
+	@echo "版本: $(VERSION)"
+	@echo "================"
+
+# 帮助
 help:
-	@echo "可用的构建目标:"
-	@echo "  all              - 构建默认版本 ($(BUILD_TYPE))"
-	@echo "  debug            - 构建debug版本 (包含调试信息和sanitizer)"
-	@echo "  release          - 构建release版本 (优化性能)"
-	@echo "  profile          - 构建profile版本 (用于性能分析)"
-	@echo "  all-versions     - 构建所有版本"
+	@echo "=== eBPF Packet Monitor 构建系统 ==="
 	@echo ""
-	@echo "性能分析:"
-	@echo "  profile-gprof    - 使用gprof进行性能分析"
-	@echo "  profile-perf     - 使用perf进行性能分析"
-	@echo "  memcheck         - 使用valgrind进行内存检查"
+	@echo "构建目标:"
+	@echo "  all         - 编译release版本 (默认)"
+	@echo "  release     - 编译loader_release (优化性能，日志级别0)"
+	@echo "  debug       - 编译loader_debug (调试信息，日志级别2)"
+	@echo "  profile     - 编译loader_profile (性能分析，日志级别1)"
 	@echo ""
-	@echo "安装和维护:"
-	@echo "  install_all      - 完整安装"
-	@echo "  install-perf-tools - 安装性能分析工具"
-	@echo "  clean            - 清理构建文件"
-	@echo "  clean-all        - 清理所有文件"
+	@echo "日志级别说明:"
+	@echo "  0 (ERROR)   - 只显示错误信息 (release版本)"
+	@echo "  1 (WARN)    - 显示警告和错误 (profile版本)"
+	@echo "  2 (INFO)    - 显示信息、警告和错误 (debug版本)"
 	@echo ""
-	@echo "环境变量:"
-	@echo "  BUILD_TYPE       - 构建类型 (debug/release/profile, 默认: $(BUILD_TYPE))"
-	@echo "  DEBUG_LEVEL      - 调试级别 (0-3, 默认: $(DEBUG_LEVEL))"
+	@echo "其他目标:"
+	@echo "  clean       - 清理编译文件"
+	@echo "  install     - 安装到系统"
+	@echo "  uninstall   - 从系统卸载"
+	@echo "  test        - 运行基本测试"
+	@echo "  check-libbpf- 检查libbpf库信息"
+	@echo "  config      - 显示当前构建配置"
+	@echo "  help        - 显示此帮助"
 	@echo ""
-	@echo "示例:"
-	@echo "  make debug DEBUG_LEVEL=3"
-	@echo "  make release"
-	@echo "  make profile-gprof"
+	@echo "使用示例:"
+	@echo "  make debug    # 编译loader_debug"
+	@echo "  make release  # 编译loader_release"
+	@echo "  make profile  # 编译loader_profile"
+	@echo "  ./loader_debug -i enp1s0    # 运行debug版本"
+	@echo "  ./loader_release -i enp1s0  # 运行release版本"
+	@echo ""
+	@echo "使用的libbpf库路径: $(LOCAL_LIBBPF_LIB)"
 
-# ==================== 创建启动脚本 ====================
-wrapper:
-	@echo "#!/bin/bash" > ebpf_pkt.sh
-	@echo "export LD_LIBRARY_PATH=\$$LD_LIBRARY_PATH:/usr/lib64:/usr/lib" >> ebpf_pkt.sh
-	@echo "./loader \$$@" >> ebpf_pkt.sh
-	@chmod +x ebpf_pkt.sh
-	@echo "创建了启动脚本 ebpf_pkt.sh - 使用这个来运行程序"
-
-.PHONY: all debug release profile all-versions clean clean-all help wrapper install_all fix_rpath check_privileges install-perf-tools profile-gprof profile-perf memcheck
+.PHONY: all release debug profile clean install uninstall test check-libbpf config help
