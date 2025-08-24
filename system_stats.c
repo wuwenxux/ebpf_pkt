@@ -1,3 +1,4 @@
+#include <stdio.h>
 #include <sys/resource.h>
 #include <sys/times.h>
 #include <sys/sysinfo.h>
@@ -8,35 +9,54 @@
 extern struct timespec program_start_time;
 extern volatile uint64_t total_packets_processed;
 
-// System statistics structure
-typedef struct {
+// System statistics structure已在loader_core.c中定义
+// 使用外部声明
+extern struct {
     double cpu_usage;
     double memory_usage;
     uint64_t packets_processed;
     double processing_time;
     uint64_t packets_per_second;
-} system_stats_t;
+} system_stats;
 
-// Global system statistics
-system_stats_t system_stats = {0};
-
-// Get CPU usage
+// Get CPU usage for all CPUs
 static double get_cpu_usage(void) {
-    // Implementation from loader.c
-    struct tms time_sample;
-    clock_t now = times(&time_sample);
-    if (now == (clock_t)-1) {
+    static uint64_t prev_total = 0;
+    static uint64_t prev_idle = 0;
+    
+    FILE *fp = fopen("/proc/stat", "r");
+    if (!fp) {
         return 0.0;
     }
-    double total_cpu_time = (double) (time_sample.tms_utime + time_sample.tms_stime) / sysconf(_SC_CLK_TCK);
-    struct timespec current_time;
-    clock_gettime(CLOCK_REALTIME, &current_time);
-    double elapsed_time = (current_time.tv_sec - program_start_time.tv_sec) + 
-                         (current_time.tv_nsec - program_start_time.tv_nsec) / 1000000000.0;
-    if (elapsed_time > 0) {
-        return (total_cpu_time / elapsed_time) * 100.0;
+    
+    uint64_t user, nice, system, idle, iowait, irq, softirq, steal, guest, guest_nice;
+    if (fscanf(fp, "cpu %lu %lu %lu %lu %lu %lu %lu %lu %lu %lu",
+               &user, &nice, &system, &idle, &iowait, &irq, &softirq, &steal, &guest, &guest_nice) != 10) {
+        fclose(fp);
+        return 0.0;
     }
-    return 0.0;
+    fclose(fp);
+    
+    // Calculate total CPU time
+    uint64_t total = user + nice + system + idle + iowait + irq + softirq + steal;
+    uint64_t non_idle = total - idle;
+    
+    double cpu_usage = 0.0;
+    
+    if (prev_total > 0) {
+        uint64_t total_diff = total - prev_total;
+        uint64_t non_idle_diff = non_idle - (prev_total - prev_idle);
+        
+        if (total_diff > 0) {
+            cpu_usage = (double)non_idle_diff / total_diff * 100.0;
+        }
+    }
+    
+    // Store current values for next calculation
+    prev_total = total;
+    prev_idle = idle;
+    
+    return cpu_usage;
 }
 
 // Get memory usage
