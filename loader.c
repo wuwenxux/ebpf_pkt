@@ -90,6 +90,7 @@ int quiet_mode = 0;
 int loop_count = 1;
 int loop_delay = 0;
 int duration = 0;
+int single_thread_mode = 0;  // 单线程模式标志
 static volatile sig_atomic_t cleanup_done = 0;
 static volatile int monitor_running = 1;  // 监控模式运行状态
 
@@ -113,7 +114,7 @@ realtime_stats_t g_realtime_stats = {0};
 void print_final_stats(void);
 void analyze_packet_count_mismatch(void);
 int run_single_interface_capture(const char *ifname);
-// 删除未使用的函数声明
+
 static int run_monitor_mode(const char *ifname);
 static void *capture_thread_func(void *arg);
 // flow_table_initialized是flow.c中的变量，我们在这里声明为外部变量
@@ -146,7 +147,7 @@ typedef struct {
     pthread_t thread;           // 监听线程
     struct bpf_object *obj;     // BPF对象
     struct bpf_link *link;      // BPF链接
-    struct perf_buffer *pb;     // 性能缓冲区
+    struct ring_buffer *rb;     // RINGBUF缓冲区
     int is_active;              // 是否活跃
     int thread_ret;             // 线程返回值
 } interface_thread_t;
@@ -464,11 +465,13 @@ struct packet_info {
     __u32 pkt_len;
     __u64 timestamp;
      __u8 tcp_flags;
+    __u32 ifindex;      // 接口索引
+    __u32 cpu_id;       // CPU ID
+    __u32 hash;         // 预计算的五元组哈希
+    __u8 priority;      // 优先级（用于QoS）
 } __attribute__((packed));
 
-struct perf_buffer_opts opts = {
-    .sz = sizeof(opts),
-};
+// RINGBUF不需要opts结构
 
 // 直接处理数据包函数（单线程版本）
 static void process_packet_direct(const struct iphdr *ip, uint16_t src_port, uint16_t dst_port, 
@@ -528,7 +531,7 @@ static void cleanup(void) {
 
     // Cleanup flow table
     if (flow_table_initialized) {
-        print_final_stats();  // 注释掉统计结果输出
+        print_final_stats();
         flow_table_destroy();
     }
 
@@ -650,19 +653,9 @@ static int check_single_instance(void) {
     return 0;
 }
 
-// 修改后的BPF数据处理函数，将数据包添加到队列
-static void handle_batch(void *ctx, int cpu, void *data, __u32 size) {
-    (void)ctx;  // 避免未使用参数警告
-    (void)cpu;  // 避免未使用参数警告
-    // 新增：断言 size 必须是 struct packet_info 的整数倍
-    /* 
-    if (size % sizeof(struct packet_info) != 0) {
-        fprintf(stderr, "[ASAN-DEBUG] handle_batch: perf event size %u is not a multiple of struct packet_info (%zu)!\n", size, sizeof(struct packet_info));
-        fflush(stderr);
-        abort();
-    }
-    */
-    const struct packet_info *pkts = data;
+// RINGBUF数据处理函数，将数据包添加到队列
+static int handle_ringbuf_event(void *ctx, void *data, size_t size) {
+    const struct packet_info *pkts = (const struct packet_info *)data;
     int count = size / sizeof(struct packet_info);
     
     // 预取数据，避免首次访问时的缓存缺失
@@ -744,6 +737,8 @@ static void handle_batch(void *ctx, int cpu, void *data, __u32 size) {
             __sync_fetch_and_add(&total_packets_queued, 1);
         }
     }
+    
+    return 0; // 成功处理
 }
 
 // 重新实现的pcap包处理函数 - 安全对齐处理
@@ -983,6 +978,11 @@ int process_pcap_file(const char *pcap_file) {
 
 // 获取系统所有网络接口
 static int get_available_interfaces(char interfaces[][IF_NAMESIZE], int max_count) {
+    return get_available_interfaces_ex(interfaces, max_count, true);
+}
+
+// 获取系统所有网络接口（扩展版本）
+static int get_available_interfaces_ex(char interfaces[][IF_NAMESIZE], int max_count, bool exclude_enp1s0) {
     struct if_nameindex *if_ni, *i;
     int count = 0;
     
@@ -995,8 +995,14 @@ static int get_available_interfaces(char interfaces[][IF_NAMESIZE], int max_coun
     for (i = if_ni; i->if_index != 0 || i->if_name != NULL; i++) {
         if (count >= max_count) break;
         
-        // 跳过回环接口和enp1s0
-        if (strcmp(i->if_name, "lo") == 0 || strcmp(i->if_name, "enp1s0") == 0) continue;
+        // 跳过回环接口
+        if (strcmp(i->if_name, "lo") == 0) continue;
+        
+        // 根据参数决定是否排除enp1s0
+        if (exclude_enp1s0 && strcmp(i->if_name, "enp1s0") == 0) {
+            log_info("Skipping enp1s0 interface in all-interfaces mode");
+            continue;
+        }
         
         strncpy(interfaces[count], i->if_name, IF_NAMESIZE - 1);
         interfaces[count][IF_NAMESIZE - 1] = '\0';
@@ -1044,14 +1050,14 @@ static void *interface_listener_thread(void *arg) {
     char *ifname = thread_arg->interface_name;
     int thread_id = thread_arg->thread_id;
     
+    log_info("Thread %d: Starting listener for interface %s", thread_id, ifname);
+    
     struct bpf_object *obj = NULL;
     struct bpf_program *prog = NULL;
     struct bpf_link *link = NULL;
-    struct perf_buffer *pb = NULL;
+    struct ring_buffer *rb = NULL;
     int map_fd, err;
     int ret = 0;
-    
-    log_info("Thread %d: Starting listener for interface %s", thread_id, ifname);
     
     // 加载BPF程序
     obj = bpf_object__open_file("bpf_program.o", NULL);
@@ -1096,27 +1102,19 @@ static void *interface_listener_thread(void *arg) {
         goto cleanup;
     }
     
-    // 设置性能缓冲区
-    map_fd = bpf_object__find_map_fd_by_name(obj, "events");
+    // 设置RINGBUF
+    map_fd = bpf_object__find_map_fd_by_name(obj, "ringbuf_events");
     if (map_fd < 0) {
-        log_error("Thread %d: Perf event map not found for %s", 
+        log_error("Thread %d: Ring buffer map not found for %s", 
                 thread_id, ifname);
         ret = 1;
         goto cleanup;
     }
     
-    struct perf_buffer_opts pb_opts = {
-        .sz = sizeof(pb_opts),
-    };
+    rb = ring_buffer__new(map_fd, handle_ringbuf_event, NULL, NULL);
     
-    pb = perf_buffer__new(map_fd, PERF_BUFFER_PAGES, 
-                          handle_batch, 
-                          NULL, 
-                          NULL, 
-                          &pb_opts);
-    
-    if (libbpf_get_error(pb)) {
-        log_error("Thread %d: Failed to create perf buffer for %s", 
+    if (libbpf_get_error(rb)) {
+        log_error("Thread %d: Failed to create ring buffer for %s", 
                 thread_id, ifname);
         ret = 1;
         goto cleanup;
@@ -1128,7 +1126,7 @@ static void *interface_listener_thread(void *arg) {
         if (strcmp(interface_threads[i].name, ifname) == 0) {
             interface_threads[i].obj = obj;
             interface_threads[i].link = link;
-            interface_threads[i].pb = pb;
+            interface_threads[i].rb = rb;
             interface_threads[i].is_active = 1;
             break;
         }
@@ -1139,7 +1137,7 @@ static void *interface_listener_thread(void *arg) {
     
     // 事件循环
     while (running) {
-        err = perf_buffer__poll(pb, 100);
+        err = ring_buffer__poll(rb, 100);
         if (err < 0 && err != -EINTR) {
             log_error("Thread %d: Error polling %s: %d", thread_id, ifname, err);
             break;
@@ -1150,8 +1148,8 @@ static void *interface_listener_thread(void *arg) {
     
 cleanup:
     // 清理资源
-    if (pb) {
-        perf_buffer__free(pb);
+    if (rb) {
+        ring_buffer__free(rb);
     }
     
     if (link) {
@@ -1259,15 +1257,22 @@ int run_live_capture(const char *ifname) {
         return run_single_interface_capture(ifname);
     }
     
-    // 多接口模式
+    // 检查是否使用单线程模式
+    if (single_thread_mode) {
+        log_info("Using single-thread multi-interface capture mode");
+        return run_single_thread_multi_interface_capture(ifname);
+    }
+    
+    // 多线程多接口模式
     char interfaces[MAX_INTERFACES][IF_NAMESIZE];
-    int available_count = get_available_interfaces(interfaces, MAX_INTERFACES);
+    int available_count = get_available_interfaces_ex(interfaces, MAX_INTERFACES, true);
     
     if (available_count == 0) {
         log_error( "No available network interfaces found\n");
         return 1;
     }
     
+    log_info("Using multi-thread multi-interface capture mode (excluding enp1s0)");
     log_info("Found %d available interfaces:\n", available_count);
     for (int i = 0; i < available_count; i++) {
         log_info("  %d: %s", i + 1, interfaces[i]);
@@ -1449,7 +1454,7 @@ int run_single_interface_capture(const char *ifname) {
     struct bpf_object *obj = NULL;
     struct bpf_program *prog = NULL;
     struct bpf_link *link = NULL;
-    struct perf_buffer *pb = NULL;
+    struct ring_buffer *pb = NULL;
     int map_fd, err;
     int ret = 0;
 
@@ -1525,33 +1530,25 @@ int run_single_interface_capture(const char *ifname) {
     }
     log_info("XDP program attached successfully");
 
-    /* 4. Setup perf buffer */
-    log_info("Setting up perf buffer...");
-    map_fd = bpf_object__find_map_fd_by_name(obj, "events");
+    /* 4. Setup ring buffer */
+    log_info("Setting up ring buffer...");
+    map_fd = bpf_object__find_map_fd_by_name(obj, "ringbuf_events");
     if (map_fd < 0) {
-        log_error("Perf event map 'events' not found");
+        log_error("Ring buffer map 'ringbuf_events' not found");
         ret = 1;
         goto cleanup;
     }
-    log_info("Perf event map found, fd: %d", map_fd);
-    
-    struct perf_buffer_opts pb_opts = {
-        .sz = sizeof(pb_opts),
-    };
+    log_info("Ring buffer map found, fd: %d", map_fd);
 
     /* 新版libbpf API */
-    pb = perf_buffer__new(map_fd, PERF_BUFFER_PAGES, 
-                        handle_batch, 
-                        NULL, 
-                        NULL, 
-                        &pb_opts);
+    pb = ring_buffer__new(map_fd, handle_ringbuf_event, NULL, NULL);
 
     if (libbpf_get_error(pb)) {
-        log_error("Failed to create perf buffer: %s", strerror(-libbpf_get_error(pb)));
+        log_error("Failed to create ring buffer: %s", strerror(-libbpf_get_error(pb)));
         ret = 1;
         goto cleanup;
     }
-    log_info("Perf buffer created successfully");
+    log_info("Ring buffer created successfully");
 
     log_info("Successfully started capturing on %s", ifname);
 
@@ -1571,7 +1568,7 @@ int run_single_interface_capture(const char *ifname) {
     const uint64_t STATS_INTERVAL_MS = 1000;  // 每1秒输出一次统计（毫秒）
     
     while (running) {
-        err = perf_buffer__poll(pb, 100);
+        err = ring_buffer__poll(pb, 100);
         // 使用位操作代替条件判断 - 仅当err < 0且err != -EINTR时退出
         int should_break = (err < 0) & (err != -EINTR);
         if (should_break) {
@@ -1766,8 +1763,8 @@ cleanup:
     
     // Cleanup resources in reverse order of creation
     if (pb) {
-        log_info("Cleaning up perf buffer...");
-        perf_buffer__free(pb);
+        log_info("Cleaning up ring buffer...");
+        ring_buffer__free(pb);
     }
     
     if (link) {
@@ -1868,6 +1865,7 @@ void print_usage(const char *prog_name) {
     printf("  -v, --verbose <level>       Debug level: 0=none, 1=basic, 2=detailed (default: 0)\n");
     printf("  -q, --quiet                 Quiet mode, don't print statistics to screen\n");
     printf("  -m, --monitor               Realtime monitor mode with ncurses interface\n");
+    printf("  -t, --single-thread         Single-thread mode for multi-interface capture\n");
     printf("  -h, --help                  Show this help message\n");
 }
 
@@ -1902,9 +1900,7 @@ void format_beijing_time(time_t timestamp, char *buf, size_t buflen) {
     strftime(buf, buflen, "%Y-%m-%d %H:%M:%S", &tm);
 }
 
-// 删除未使用的cleanup_expired_sessions函数
 
-// 删除未使用的print_realtime_stats函数
 
 int main(int argc, char **argv) {
     init_time_base();
@@ -1957,11 +1953,12 @@ int main(int argc, char **argv) {
         {"verbose",       required_argument, 0, 'v'},
         {"quiet",         no_argument,       0, 'q'},
         {"monitor",       no_argument,       0, 'm'},
+        {"single-thread", no_argument,       0, 't'},
         {"help",          no_argument,       0, 'h'},
         {0, 0, 0, 0}
     };
 
-    while ((c = getopt_long(argc, argv, "i:r:d:s:p:c:o:l:w:v:qmh", long_options, NULL)) != -1) {
+    while ((c = getopt_long(argc, argv, "i:r:d:s:p:c:o:l:w:v:qmt", long_options, NULL)) != -1) {
         switch (c) {
             case 'i':
                 ifname = optarg;
@@ -2040,6 +2037,10 @@ int main(int argc, char **argv) {
                 monitor_mode = 1;
                 printf("Monitor mode enabled, will start realtime monitor interface\n");
                 break;
+            case 't':
+                single_thread_mode = 1;
+                printf("Single-thread mode enabled, will use single thread for all interfaces\n");
+                break;
             case 'h':
                 print_usage(argv[0]);
                 return 0;
@@ -2099,16 +2100,16 @@ int main(int argc, char **argv) {
 
 // 捕获线程函数
 static void *capture_thread_func(void *arg) {
-    struct perf_buffer *pb = (struct perf_buffer *)arg;
+    struct ring_buffer *rb = (struct ring_buffer *)arg;
     int err;
     
     log_info("Capture thread started");
     
     while (monitor_running) {
-        // 处理perf buffer事件（非阻塞）
-        err = perf_buffer__poll(pb, 100); // 100ms超时
+        // 处理ring buffer事件（非阻塞）
+        err = ring_buffer__poll(rb, 100); // 100ms超时
         if (err < 0 && err != -EINTR) {
-            log_error("Error polling perf buffer: %s", strerror(-err));
+            log_error("Error polling ring buffer: %s", strerror(-err));
             break;
         }
         
@@ -2149,7 +2150,7 @@ static int run_monitor_mode(const char *ifname) {
     struct bpf_object *obj = NULL;
     struct bpf_program *prog = NULL;
     struct bpf_link *link = NULL;
-    struct perf_buffer *pb = NULL;
+    struct ring_buffer *rb = NULL;
     int map_fd, err;
     int ret = 0;
     WINDOW *win = NULL;
@@ -2220,37 +2221,29 @@ static int run_monitor_mode(const char *ifname) {
     log_info("XDP program attached successfully");
 
     /* 4. Setup perf buffer */
-    log_info("Setting up perf buffer...");
-    map_fd = bpf_object__find_map_fd_by_name(obj, "events");
+    log_info("Setting up ring buffer...");
+    map_fd = bpf_object__find_map_fd_by_name(obj, "ringbuf_events");
     if (map_fd < 0) {
-        log_error("Perf event map 'events' not found");
+        log_error("Ring buffer map 'ringbuf_events' not found");
         ret = 1;
         goto cleanup;
     }
-    log_info("Perf event map found, fd: %d", map_fd);
-    
-    struct perf_buffer_opts pb_opts = {
-        .sz = sizeof(pb_opts),
-    };
+    log_info("Ring buffer map found, fd: %d", map_fd);
 
     /* 新版libbpf API */
-    pb = perf_buffer__new(map_fd, PERF_BUFFER_PAGES, 
-                        handle_batch, 
-                        NULL, 
-                        NULL, 
-                        &pb_opts);
+    rb = ring_buffer__new(map_fd, handle_ringbuf_event, NULL, NULL);
 
-    if (libbpf_get_error(pb)) {
-        log_error("Failed to create perf buffer: %s", strerror(-libbpf_get_error(pb)));
+    if (libbpf_get_error(rb)) {
+        log_error("Failed to create ring buffer: %s", strerror(-libbpf_get_error(rb)));
         ret = 1;
         goto cleanup;
     }
-    log_info("Perf buffer created successfully");
+    log_info("Ring buffer created successfully");
     log_info("Successfully started capturing on %s", ifname);
 
     /* 5. Start capture thread */
     log_info("Starting capture thread...");
-    if (pthread_create(&capture_thread, NULL, capture_thread_func, pb) != 0) {
+    if (pthread_create(&capture_thread, NULL, capture_thread_func, rb) != 0) {
         log_error("Failed to create capture thread");
         ret = 1;
         goto cleanup;
@@ -2329,8 +2322,8 @@ cleanup:
     if (win) {
         cleanup_stats_window(win);
     }
-    if (pb) {
-        perf_buffer__free(pb);
+    if (rb) {
+        ring_buffer__free(rb);
     }
     if (link) {
         bpf_link__destroy(link);
@@ -2542,6 +2535,971 @@ void analyze_packet_count_mismatch(void) {
     
     printf("================== 分析结束 ==================\n\n");
 }
+
+// 全局RINGBUF处理器，用于接收所有接口的数据包
+static struct ring_buffer *global_ringbuf = NULL;
+static struct bpf_object *global_bpf_obj = NULL;
+static struct bpf_link **global_links = NULL;
+static int global_link_count = 0;
+
+// 单线程多接口捕获函数
+int run_single_thread_multi_interface_capture(const char *ifname) {
+    char interfaces[MAX_INTERFACES][IF_NAMESIZE];
+    int available_count = 0;
+    int ret = 0;
+    
+    // 如果指定了特定接口，只处理该接口
+    if (ifname && strcmp(ifname, "all") != 0) {
+        strncpy(interfaces[0], ifname, IF_NAMESIZE - 1);
+        interfaces[0][IF_NAMESIZE - 1] = '\0';
+        available_count = 1;
+        log_info("Single interface mode: allowing enp1s0");
+    } else {
+        // 获取所有可用接口，排除enp1s0
+        available_count = get_available_interfaces_ex(interfaces, MAX_INTERFACES, true);
+        if (available_count == 0) {
+            log_error("No available network interfaces found\n");
+            return 1;
+        }
+        log_info("All interfaces mode: excluding enp1s0");
+    }
+    
+    log_info("Single-thread multi-interface capture mode");
+    log_info("Found %d available interfaces:", available_count);
+    for (int i = 0; i < available_count; i++) {
+        log_info("  %d: %s", i + 1, interfaces[i]);
+    }
+    
+    // 初始化全局资源
+    start_time = time(NULL);
+    packet_queue_init(&packet_queue, PACKET_QUEUE_SIZE);
+    flow_table_init();
+    
+    // 初始化工作线程池
+    if (init_worker_threads() != 0) {
+        log_error("Failed to initialize worker threads\n");
+        return 1;
+    }
+    
+    // 初始化会话管理器
+    if (transport_session_manager_init() != 0) {
+        log_error("Failed to initialize session manager\n");
+        stop_worker_threads();
+        return 1;
+    }
+    
+    log_info("Flow tracking and session manager initialized");
+    if (duration > 0) {
+        log_info("Will capture traffic for %d seconds", duration);
+    }
+    
+    // 1. 加载BPF程序
+    log_info("Loading BPF program from bpf_program.o...");
+    global_bpf_obj = bpf_object__open_file("bpf_program.o", NULL);
+    if (libbpf_get_error(global_bpf_obj)) {
+        log_error("Failed to open BPF object file: %s", strerror(-libbpf_get_error(global_bpf_obj)));
+        ret = 1;
+        goto cleanup;
+    }
+    log_info("BPF object loaded successfully");
+    
+    // 2. 加载到内核
+    log_info("Loading BPF program into kernel...");
+    int err = bpf_object__load(global_bpf_obj);
+    if (err) {
+        log_error("BPF loading failed: %s", strerror(-err));
+        ret = 1;
+        goto cleanup;
+    }
+    log_info("BPF program loaded into kernel successfully");
+    
+    // 3. 创建全局RINGBUF
+    int map_fd = bpf_object__find_map_fd_by_name(global_bpf_obj, "ringbuf_events");
+    if (map_fd < 0) {
+        log_error("Ring buffer map not found");
+        ret = 1;
+        goto cleanup;
+    }
+    
+    global_ringbuf = ring_buffer__new(map_fd, handle_ringbuf_event_optimized, NULL, NULL);
+    if (libbpf_get_error(global_ringbuf)) {
+        log_error("Failed to create global ring buffer");
+        ret = 1;
+        goto cleanup;
+    }
+    log_info("Global ring buffer created successfully");
+    
+    // 4. 为每个接口附加XDP程序
+    global_links = calloc(available_count, sizeof(struct bpf_link *));
+    if (!global_links) {
+        log_error("Failed to allocate memory for links");
+        ret = 1;
+        goto cleanup;
+    }
+    
+    struct bpf_program *prog = bpf_object__find_program_by_name(global_bpf_obj, "xdp_packet_capture");
+    if (!prog) {
+        log_error("BPF program not found");
+        ret = 1;
+        goto cleanup;
+    }
+    
+    for (int i = 0; i < available_count; i++) {
+        int ifindex = if_nametoindex(interfaces[i]);
+        if (!ifindex) {
+            log_error("Failed to get interface index for %s: %s", interfaces[i], strerror(errno));
+            continue;
+        }
+        
+        global_links[global_link_count] = bpf_program__attach_xdp(prog, ifindex);
+        if (libbpf_get_error(global_links[global_link_count])) {
+            log_error("XDP attachment failed for %s: %s", interfaces[i], strerror(-errno));
+            continue;
+        }
+        
+        log_info("Successfully attached XDP to interface %s (index: %d)", interfaces[i], ifindex);
+        global_link_count++;
+    }
+    
+    if (global_link_count == 0) {
+        log_error("Failed to attach XDP to any interface");
+        ret = 1;
+        goto cleanup;
+    }
+    
+    log_info("Successfully attached XDP to %d interfaces", global_link_count);
+    
+    // 5. 主事件循环 - 单线程处理所有接口的数据
+    log_info("Starting single-thread event loop for all interfaces...");
+    running = 1;
+    
+    while (running) {
+        // 检查是否达到指定时间
+        if (duration > 0 && (time(NULL) - start_time) >= duration) {
+            log_info("Reached specified duration of %d seconds. Exiting...", duration);
+            break;
+        }
+        
+        // 轮询RINGBUF，处理所有接口的数据包
+        err = ring_buffer__poll(global_ringbuf, 100);
+        if (err < 0 && err != -EINTR) {
+            log_error("Error polling ring buffer: %d", err);
+            break;
+        }
+        
+        // 处理队列中的数据包
+        process_packet_queue();
+        
+        // 短暂休眠，避免CPU占用过高
+        usleep(10000); // 10ms
+    }
+    
+    log_info("Single-thread event loop ended");
+    
+cleanup:
+    // 清理资源
+    if (global_ringbuf) {
+        ring_buffer__free(global_ringbuf);
+        global_ringbuf = NULL;
+    }
+    
+    if (global_links) {
+        for (int i = 0; i < global_link_count; i++) {
+            if (global_links[i]) {
+                bpf_link__destroy(global_links[i]);
+            }
+        }
+        free(global_links);
+        global_links = NULL;
+        global_link_count = 0;
+    }
+    
+    if (global_bpf_obj) {
+        bpf_object__close(global_bpf_obj);
+        global_bpf_obj = NULL;
+    }
+    
+    // 停止工作线程池
+    stop_worker_threads();
+    
+    // 执行完整的清理操作
+    log_info("Performing complete cleanup...");
+    cleanup();
+    log_info("Cleanup completed");
+    
+    return ret;
+}
+
+// 线程亲和性和本地会话表优化
+#include <sched.h>
+#include <pthread.h>
+#include <sys/sysinfo.h>
+
+// 工作线程配置
+#define MAX_WORKER_THREADS 16
+#define WORKER_QUEUE_SIZE 10000
+
+// 本地会话表结构
+typedef struct local_session_table {
+    struct transport_session *sessions;
+    size_t capacity;
+    size_t size;
+    pthread_mutex_t mutex;
+    uint32_t thread_id;
+} local_session_table_t;
+
+// 工作线程结构
+typedef struct worker_thread {
+    pthread_t thread;
+    int thread_id;
+    int cpu_id;
+    local_session_table_t local_sessions;
+    packet_queue_t packet_queue;
+    volatile int running;
+    uint64_t packets_processed;
+    uint64_t bytes_processed;
+} worker_thread_t;
+
+// 全局工作线程数组
+static worker_thread_t worker_threads[MAX_WORKER_THREADS];
+static int worker_thread_count = 0;
+
+// 线程亲和性设置函数
+static int set_thread_affinity(pthread_t thread, int cpu_id) {
+    cpu_set_t cpuset;
+    CPU_ZERO(&cpuset);
+    CPU_SET(cpu_id, &cpuset);
+    
+    int ret = pthread_setaffinity_np(thread, sizeof(cpu_set_t), &cpuset);
+    if (ret != 0) {
+        log_error("Failed to set thread affinity for CPU %d: %s", cpu_id, strerror(ret));
+        return -1;
+    }
+    
+    log_info("Successfully set thread affinity to CPU %d", cpu_id);
+    return 0;
+}
+
+// 初始化本地会话表
+static int init_local_session_table(local_session_table_t *table, size_t capacity, int thread_id) {
+    table->sessions = calloc(capacity, sizeof(struct transport_session));
+    if (!table->sessions) {
+        log_error("Failed to allocate local session table for thread %d", thread_id);
+        return -1;
+    }
+    
+    table->capacity = capacity;
+    table->size = 0;
+    table->thread_id = thread_id;
+    
+    if (pthread_mutex_init(&table->mutex, NULL) != 0) {
+        log_error("Failed to initialize mutex for local session table %d", thread_id);
+        free(table->sessions);
+        return -1;
+    }
+    
+    log_info("Initialized local session table for thread %d with capacity %zu", thread_id, capacity);
+    return 0;
+}
+
+// 清理本地会话表
+static void cleanup_local_session_table(local_session_table_t *table) {
+    if (table->sessions) {
+        pthread_mutex_lock(&table->mutex);
+        
+        // 清理会话
+        for (size_t i = 0; i < table->size; i++) {
+            if (table->sessions[i].is_active) {
+                transport_session_cleanup(&table->sessions[i]);
+            }
+        }
+        
+        pthread_mutex_unlock(&table->mutex);
+        pthread_mutex_destroy(&table->mutex);
+        free(table->sessions);
+        table->sessions = NULL;
+    }
+}
+
+// 工作线程函数
+static void *worker_thread_func(void *arg) {
+    worker_thread_t *worker = (worker_thread_t *)arg;
+    int thread_id = worker->thread_id;
+    int cpu_id = worker->cpu_id;
+    
+    log_info("Worker thread %d started on CPU %d", thread_id, cpu_id);
+    
+    // 设置线程亲和性
+    if (set_thread_affinity(pthread_self(), cpu_id) != 0) {
+        log_warn("Failed to set affinity for worker thread %d", thread_id);
+    }
+    
+    // 初始化本地会话表
+    if (init_local_session_table(&worker->local_sessions, 10000, thread_id) != 0) {
+        log_error("Failed to initialize local session table for worker thread %d", thread_id);
+        return NULL;
+    }
+    
+    // 初始化本地数据包队列
+    packet_queue_init(&worker->packet_queue, WORKER_QUEUE_SIZE);
+    
+    while (worker->running) {
+        // 处理本地队列中的数据包
+        packet_data_t packet;
+        if (packet_queue_dequeue(&worker->packet_queue, &packet) == 0) {
+            worker->packets_processed++;
+            worker->bytes_processed += packet.ip_header.tot_len;
+            
+            // 使用本地会话表处理数据包
+            pthread_mutex_lock(&worker->local_sessions.mutex);
+            
+            // 查找或创建会话
+            struct transport_session *session = NULL;
+            for (size_t i = 0; i < worker->local_sessions.size; i++) {
+                if (worker->local_sessions.sessions[i].is_active &&
+                    worker->local_sessions.sessions[i].src_ip == packet.ip_header.saddr &&
+                    worker->local_sessions.sessions[i].dst_ip == packet.ip_header.daddr &&
+                    worker->local_sessions.sessions[i].src_port == packet.transport_header.tcp.source &&
+                    worker->local_sessions.sessions[i].dst_port == packet.transport_header.tcp.dest &&
+                    worker->local_sessions.sessions[i].protocol == packet.ip_header.protocol) {
+                    session = &worker->local_sessions.sessions[i];
+                    break;
+                }
+            }
+            
+            if (!session) {
+                // 创建新会话
+                if (worker->local_sessions.size < worker->local_sessions.capacity) {
+                    session = &worker->local_sessions.sessions[worker->local_sessions.size];
+                    transport_session_init(session, 
+                                         packet.ip_header.saddr,
+                                         packet.ip_header.daddr,
+                                         packet.transport_header.tcp.source,
+                                         packet.transport_header.tcp.dest,
+                                         packet.ip_header.protocol,
+                                         packet.timestamp);
+                    worker->local_sessions.size++;
+                }
+            }
+            
+            if (session) {
+                // 更新会话
+                transport_session_update(session, packet.timestamp);
+            }
+            
+            pthread_mutex_unlock(&worker->local_sessions.mutex);
+        } else {
+            // 队列为空，短暂休眠
+            usleep(1000); // 1ms
+        }
+    }
+    
+    // 清理资源
+    cleanup_local_session_table(&worker->local_sessions);
+    packet_queue_cleanup(&worker->packet_queue);
+    
+    log_info("Worker thread %d stopped", thread_id);
+    return NULL;
+}
+
+// 初始化工作线程池
+static int init_worker_threads(void) {
+    int cpu_count = get_nprocs();
+    worker_thread_count = (cpu_count > MAX_WORKER_THREADS) ? MAX_WORKER_THREADS : cpu_count;
+    
+    log_info("Initializing %d worker threads on %d CPUs", worker_thread_count, cpu_count);
+    
+    for (int i = 0; i < worker_thread_count; i++) {
+        worker_threads[i].thread_id = i;
+        worker_threads[i].cpu_id = i % cpu_count; // 循环分配CPU
+        worker_threads[i].running = 1;
+        worker_threads[i].packets_processed = 0;
+        worker_threads[i].bytes_processed = 0;
+        
+        if (pthread_create(&worker_threads[i].thread, NULL, worker_thread_func, &worker_threads[i]) != 0) {
+            log_error("Failed to create worker thread %d", i);
+            return -1;
+        }
+        
+        log_info("Created worker thread %d on CPU %d", i, worker_threads[i].cpu_id);
+    }
+    
+    return 0;
+}
+
+// 停止工作线程池
+static void stop_worker_threads(void) {
+    log_info("Stopping %d worker threads", worker_thread_count);
+    
+    for (int i = 0; i < worker_thread_count; i++) {
+        worker_threads[i].running = 0;
+    }
+    
+    for (int i = 0; i < worker_thread_count; i++) {
+        pthread_join(worker_threads[i].thread, NULL);
+    }
+    
+    log_info("All worker threads stopped");
+}
+
+// 优化的RINGBUF事件处理函数
+static int handle_ringbuf_event_optimized(void *ctx, void *data, size_t size) {
+    const struct packet_info *pkts = (const struct packet_info *)data;
+    int count = size / sizeof(struct packet_info);
+    
+    // 预取数据
+    for (int i = 0; i < count && i < 4; i++) {
+        PREFETCH(&pkts[i]);
+    }
+    
+    // 检查退出条件
+    time_t current_time = time(NULL);
+    int should_exit = (duration > 0) && (current_time - start_time >= duration);
+    running &= !should_exit;
+    
+    if (should_exit) {
+        log_info("Reached specified duration of %d seconds. Exiting...", duration);
+        return 0;
+    }
+    
+    // 批量处理数据包
+    for (int i = 0; i < count; i++) {
+        // 预取下一个数据包
+        if (i + 4 < count) {
+            PREFETCH(&pkts[i + 4]);
+        }
+        
+        const struct packet_info *pkt = &pkts[i];
+        
+        // 有效性检查
+        int is_valid = (pkt->src_ip != 0) && (pkt->dst_ip != 0) && (pkt->pkt_len != 0);
+        if (!is_valid) {
+            __sync_fetch_and_add(&total_packets_invalid, 1);
+            continue;
+        }
+        
+        // 更新全局统计
+        __sync_fetch_and_add(&global_packet_count, 1);
+        __sync_fetch_and_add(&total_packets_captured, 1);
+        __sync_fetch_and_add(&total_bytes_captured, pkt->pkt_len);
+        
+        // 准备数据包结构
+        packet_data_t packet_data;
+        packet_data.ip_header.saddr = pkt->src_ip;
+        packet_data.ip_header.daddr = pkt->dst_ip;
+        packet_data.ip_header.protocol = pkt->protocol;
+        packet_data.ip_header.tot_len = htons(pkt->pkt_len);
+        packet_data.transport_header.tcp.source = pkt->src_port;
+        packet_data.transport_header.tcp.dest = pkt->dst_port;
+        packet_data.transport_header.tcp.flags_byte[13] = pkt->tcp_flags;
+        packet_data.timestamp = pkt->timestamp;
+        
+        // 使用哈希值选择工作线程
+        int worker_id = pkt->hash % worker_thread_count;
+        if (worker_id >= 0 && worker_id < worker_thread_count) {
+            // 添加到对应工作线程的队列
+            if (packet_queue_enqueue(&worker_threads[worker_id].packet_queue, &packet_data) != 0) {
+                __sync_fetch_and_add(&total_packets_dropped, 1);
+            } else {
+                __sync_fetch_and_add(&total_packets_queued, 1);
+            }
+        } else {
+            // 回退到全局队列
+            if (packet_queue_enqueue(&packet_queue, &packet_data) != 0) {
+                __sync_fetch_and_add(&total_packets_dropped, 1);
+            } else {
+                __sync_fetch_and_add(&total_packets_queued, 1);
+            }
+        }
+    }
+    
+    return 0;
+}
+
+// 集成loader_ringbuf_improved.c的优化特性
+
+// 无锁队列实现（来自loader_ringbuf_improved.c）
+typedef struct {
+    struct packet_info *packets;
+    volatile uint64_t head;
+    volatile uint64_t tail;
+    volatile uint64_t capacity;
+    volatile uint64_t mask;
+} lockfree_queue_t;
+
+// 确保队列容量是2的幂次
+static uint64_t next_power_of_2(uint64_t n) {
+    n--;
+    n |= n >> 1;
+    n |= n >> 2;
+    n |= n >> 4;
+    n |= n >> 8;
+    n |= n >> 16;
+    n |= n >> 32;
+    return n + 1;
+}
+
+// 初始化无锁队列
+static void lockfree_queue_init(lockfree_queue_t *queue, int initial_capacity) {
+    uint64_t capacity = next_power_of_2(initial_capacity);
+    
+    queue->packets = (struct packet_info *)aligned_alloc(64, capacity * sizeof(struct packet_info));
+    if (!queue->packets) {
+        log_error("Failed to allocate lockfree packet queue");
+        exit(EXIT_FAILURE);
+    }
+    
+    queue->head = 0;
+    queue->tail = 0;
+    queue->capacity = capacity;
+    queue->mask = capacity - 1;
+    
+    memset(queue->packets, 0, capacity * sizeof(struct packet_info));
+    log_info("Initialized lockfree queue with capacity %lu", capacity);
+}
+
+// 销毁无锁队列
+static void lockfree_queue_destroy(lockfree_queue_t *queue) {
+    if (queue->packets) {
+        free(queue->packets);
+        queue->packets = NULL;
+    }
+}
+
+// 无锁入队操作
+static int lockfree_queue_enqueue(lockfree_queue_t *queue, const struct packet_info *packet) {
+    if (!running) return -1;
+    
+    uint64_t tail, head, next_tail;
+    int retry_count = 0;
+    const int max_retries = 1000;
+    
+    while (retry_count < max_retries && running) {
+        tail = queue->tail;
+        head = queue->head;
+        next_tail = tail + 1;
+        
+        if (next_tail - head >= queue->capacity - 1) {
+            __asm__ __volatile__("pause" ::: "memory");
+            retry_count++;
+            continue;
+        }
+        
+        if (__sync_bool_compare_and_swap(&queue->tail, tail, next_tail)) {
+            uint64_t idx = tail & queue->mask;
+            memcpy(&queue->packets[idx], packet, sizeof(struct packet_info));
+            __sync_synchronize();
+            return 0;
+        }
+        
+        __asm__ __volatile__("pause" ::: "memory");
+        retry_count++;
+    }
+    
+    if (running) {
+        static int drop_warning_count = 0;
+        if (drop_warning_count < 10) {
+            log_warn("Lockfree queue full, dropping packet (warning %d/10)", ++drop_warning_count);
+        }
+        return -1;
+    }
+    
+    return -1;
+}
+
+// 无锁出队操作
+static int lockfree_queue_dequeue(lockfree_queue_t *queue, struct packet_info *packet) {
+    uint64_t head, tail, next_head;
+    int retry_count = 0;
+    const int max_retries = 100;
+    
+    while (retry_count < max_retries && running) {
+        head = queue->head;
+        tail = queue->tail;
+        next_head = head + 1;
+        
+        if (head == tail) {
+            __asm__ __volatile__("pause" ::: "memory");
+            retry_count++;
+            continue;
+        }
+        
+        if (__sync_bool_compare_and_swap(&queue->head, head, next_head)) {
+            uint64_t idx = head & queue->mask;
+            memcpy(packet, &queue->packets[idx], sizeof(struct packet_info));
+            __sync_synchronize();
+            return 0;
+        }
+        
+        __asm__ __volatile__("pause" ::: "memory");
+        retry_count++;
+    }
+    
+    return running ? 0 : -1;
+}
+
+// 获取无锁队列大小
+static uint64_t lockfree_queue_size(lockfree_queue_t *queue) {
+    uint64_t tail = queue->tail;
+    uint64_t head = queue->head;
+    return tail - head;
+}
+
+// 优化的接口信息结构
+typedef struct {
+    char name[IF_NAMESIZE];
+    int ifindex;
+    struct bpf_object *obj;
+    struct bpf_link *link;
+    struct ring_buffer *rb;
+    pthread_t thread;
+    int is_active;
+    int thread_ret;
+    uint64_t packets_captured;
+    uint64_t bytes_captured;
+    uint64_t packets_dropped;
+    uint64_t packets_error;
+    int cpu_id;  // 绑定的CPU ID
+} optimized_interface_info_t;
+
+// 全局无锁队列
+static lockfree_queue_t global_lockfree_queue;
+
+// 优化的接口数组
+static optimized_interface_info_t optimized_interfaces[MAX_INTERFACES];
+static int optimized_interface_count = 0;
+static pthread_mutex_t optimized_interface_mutex = PTHREAD_MUTEX_INITIALIZER;
+
+// 优化的RINGBUF事件处理函数
+static int handle_ringbuf_event_optimized_improved(void *ctx, void *data, size_t size) {
+    const struct packet_info *pkts = (const struct packet_info *)data;
+    int count = size / sizeof(struct packet_info);
+    
+    // 预取数据
+    for (int i = 0; i < count && i < 4; i++) {
+        PREFETCH(&pkts[i]);
+    }
+    
+    // 检查退出条件
+    time_t current_time = time(NULL);
+    int should_exit = (duration > 0) && (current_time - start_time >= duration);
+    running &= !should_exit;
+    
+    if (should_exit) {
+        log_info("Reached specified duration of %d seconds. Exiting...", duration);
+        return 0;
+    }
+    
+    // 批量处理数据包
+    for (int i = 0; i < count; i++) {
+        // 预取下一个数据包
+        if (i + 4 < count) {
+            PREFETCH(&pkts[i + 4]);
+        }
+        
+        const struct packet_info *pkt = &pkts[i];
+        
+        // 验证数据包
+        if (pkt->src_ip == 0 || pkt->dst_ip == 0 || pkt->pkt_len == 0) {
+            __sync_fetch_and_add(&total_packets_invalid, 1);
+            continue;
+        }
+        
+        // 更新全局统计
+        __sync_fetch_and_add(&global_packet_count, 1);
+        __sync_fetch_and_add(&total_packets_captured, 1);
+        __sync_fetch_and_add(&total_bytes_captured, pkt->pkt_len);
+        
+        // 更新接口统计
+        pthread_mutex_lock(&optimized_interface_mutex);
+        for (int j = 0; j < optimized_interface_count; j++) {
+            if (optimized_interfaces[j].ifindex == pkt->ifindex) {
+                optimized_interfaces[j].packets_captured++;
+                optimized_interfaces[j].bytes_captured += pkt->pkt_len;
+                break;
+            }
+        }
+        pthread_mutex_unlock(&optimized_interface_mutex);
+        
+        // 使用无锁队列入队
+        if (lockfree_queue_enqueue(&global_lockfree_queue, pkt) != 0) {
+            __sync_fetch_and_add(&total_packets_dropped, 1);
+        } else {
+            __sync_fetch_and_add(&total_packets_queued, 1);
+        }
+    }
+    
+    return 0;
+}
+
+// 优化的数据包处理函数
+static void process_lockfree_packet_queue(void) {
+    while (lockfree_queue_size(&global_lockfree_queue) > 0 && running) {
+        struct packet_info packet;
+        if (lockfree_queue_dequeue(&global_lockfree_queue, &packet) == 0) {
+            __sync_fetch_and_add(&total_packets_dequeued, 1);
+            
+            // 准备数据包结构
+            packet_data_t packet_data;
+            packet_data.ip_header.saddr = packet.src_ip;
+            packet_data.ip_header.daddr = packet.dst_ip;
+            packet_data.ip_header.protocol = packet.protocol;
+            packet_data.ip_header.tot_len = htons(packet.pkt_len);
+            packet_data.transport_header.tcp.source = packet.src_port;
+            packet_data.transport_header.tcp.dest = packet.dst_port;
+            packet_data.transport_header.tcp.flags_byte[13] = packet.tcp_flags;
+            packet_data.timestamp = packet.timestamp;
+            
+            // 使用哈希值选择工作线程（如果启用了工作线程池）
+            if (worker_thread_count > 0) {
+                int worker_id = packet.hash % worker_thread_count;
+                if (worker_id >= 0 && worker_id < worker_thread_count) {
+                    if (packet_queue_enqueue(&worker_threads[worker_id].packet_queue, &packet_data) != 0) {
+                        __sync_fetch_and_add(&total_packets_dropped, 1);
+                    }
+                } else {
+                    // 回退到全局队列
+                    if (packet_queue_enqueue(&packet_queue, &packet_data) != 0) {
+                        __sync_fetch_and_add(&total_packets_dropped, 1);
+                    }
+                }
+            } else {
+                // 直接处理数据包
+                if (packet.ip_header.protocol == IPPROTO_TCP) {
+                    process_packet_direct(&packet_data.ip_header, 
+                                        packet_data.transport_header.tcp.source,
+                                        packet_data.transport_header.tcp.dest,
+                                        0, packet_data.transport_header.tcp.flags_byte[13], 
+                                        packet_data.timestamp);
+                } else if (packet.ip_header.protocol == IPPROTO_UDP) {
+                    process_packet_direct(&packet_data.ip_header,
+                                        packet_data.transport_header.udp.source,
+                                        packet_data.transport_header.udp.dest,
+                                        0, 0, packet_data.timestamp);
+                }
+            }
+        }
+    }
+}
+
+// 优化的单线程多接口捕获函数
+int run_optimized_single_thread_multi_interface_capture(const char *ifname) {
+    char interfaces[MAX_INTERFACES][IF_NAMESIZE];
+    int available_count = 0;
+    int ret = 0;
+    
+    // 如果指定了特定接口，只处理该接口
+    if (ifname && strcmp(ifname, "all") != 0) {
+        strncpy(interfaces[0], ifname, IF_NAMESIZE - 1);
+        interfaces[0][IF_NAMESIZE - 1] = '\0';
+        available_count = 1;
+        log_info("Single interface mode: allowing enp1s0");
+    } else {
+        // 获取所有可用接口，排除enp1s0
+        available_count = get_available_interfaces_ex(interfaces, MAX_INTERFACES, true);
+        if (available_count == 0) {
+            log_error("No available network interfaces found\n");
+            return 1;
+        }
+        log_info("All interfaces mode: excluding enp1s0");
+    }
+    
+    log_info("Optimized single-thread multi-interface capture mode");
+    log_info("Found %d available interfaces:", available_count);
+    for (int i = 0; i < available_count; i++) {
+        log_info("  %d: %s", i + 1, interfaces[i]);
+    }
+    
+    // 初始化全局资源
+    start_time = time(NULL);
+    
+    // 初始化无锁队列
+    lockfree_queue_init(&global_lockfree_queue, PACKET_QUEUE_SIZE);
+    
+    // 初始化传统队列（用于兼容性）
+    packet_queue_init(&packet_queue, PACKET_QUEUE_SIZE);
+    flow_table_init();
+    
+    // 初始化工作线程池（如果启用）
+    if (worker_thread_count > 0) {
+        if (init_worker_threads() != 0) {
+            log_error("Failed to initialize worker threads\n");
+            lockfree_queue_destroy(&global_lockfree_queue);
+            return 1;
+        }
+    }
+    
+    // 初始化会话管理器
+    if (transport_session_manager_init() != 0) {
+        log_error("Failed to initialize session manager\n");
+        if (worker_thread_count > 0) {
+            stop_worker_threads();
+        }
+        lockfree_queue_destroy(&global_lockfree_queue);
+        return 1;
+    }
+    
+    log_info("Flow tracking and session manager initialized");
+    if (duration > 0) {
+        log_info("Will capture traffic for %d seconds", duration);
+    }
+    
+    // 1. 加载BPF程序
+    log_info("Loading BPF program from bpf_program.o...");
+    global_bpf_obj = bpf_object__open_file("bpf_program.o", NULL);
+    if (libbpf_get_error(global_bpf_obj)) {
+        log_error("Failed to open BPF object file: %s", strerror(-libbpf_get_error(global_bpf_obj)));
+        ret = 1;
+        goto cleanup;
+    }
+    log_info("BPF object loaded successfully");
+    
+    // 2. 加载到内核
+    log_info("Loading BPF program into kernel...");
+    int err = bpf_object__load(global_bpf_obj);
+    if (err) {
+        log_error("BPF loading failed: %s", strerror(-err));
+        ret = 1;
+        goto cleanup;
+    }
+    log_info("BPF program loaded into kernel successfully");
+    
+    // 3. 创建全局RINGBUF
+    int map_fd = bpf_object__find_map_fd_by_name(global_bpf_obj, "ringbuf_events");
+    if (map_fd < 0) {
+        log_error("Ring buffer map not found");
+        ret = 1;
+        goto cleanup;
+    }
+    
+    global_ringbuf = ring_buffer__new(map_fd, handle_ringbuf_event_optimized_improved, NULL, NULL);
+    if (libbpf_get_error(global_ringbuf)) {
+        log_error("Failed to create global ring buffer");
+        ret = 1;
+        goto cleanup;
+    }
+    log_info("Global ring buffer created successfully");
+    
+    // 4. 为每个接口附加XDP程序
+    global_links = calloc(available_count, sizeof(struct bpf_link *));
+    if (!global_links) {
+        log_error("Failed to allocate memory for links");
+        ret = 1;
+        goto cleanup;
+    }
+    
+    struct bpf_program *prog = bpf_object__find_program_by_name(global_bpf_obj, "xdp_packet_capture");
+    if (!prog) {
+        log_error("BPF program not found");
+        ret = 1;
+        goto cleanup;
+    }
+    
+    // 初始化优化接口信息
+    optimized_interface_count = 0;
+    for (int i = 0; i < available_count; i++) {
+        int ifindex = if_nametoindex(interfaces[i]);
+        if (!ifindex) {
+            log_error("Failed to get interface index for %s: %s", interfaces[i], strerror(errno));
+            continue;
+        }
+        
+        // 初始化接口信息
+        memset(&optimized_interfaces[optimized_interface_count], 0, sizeof(optimized_interface_info_t));
+        strncpy(optimized_interfaces[optimized_interface_count].name, interfaces[i], IF_NAMESIZE - 1);
+        optimized_interfaces[optimized_interface_count].ifindex = ifindex;
+        optimized_interfaces[optimized_interface_count].cpu_id = optimized_interface_count % get_nprocs();
+        
+        global_links[global_link_count] = bpf_program__attach_xdp(prog, ifindex);
+        if (libbpf_get_error(global_links[global_link_count])) {
+            log_error("XDP attachment failed for %s: %s", interfaces[i], strerror(-errno));
+            continue;
+        }
+        
+        log_info("Successfully attached XDP to interface %s (index: %d, CPU: %d)", 
+                interfaces[i], ifindex, optimized_interfaces[optimized_interface_count].cpu_id);
+        global_link_count++;
+        optimized_interface_count++;
+    }
+    
+    if (global_link_count == 0) {
+        log_error("Failed to attach XDP to any interface");
+        ret = 1;
+        goto cleanup;
+    }
+    
+    log_info("Successfully attached XDP to %d interfaces", global_link_count);
+    
+    // 5. 主事件循环 - 单线程处理所有接口的数据
+    log_info("Starting optimized single-thread event loop for all interfaces...");
+    running = 1;
+    
+    while (running) {
+        // 检查是否达到指定时间
+        if (duration > 0 && (time(NULL) - start_time) >= duration) {
+            log_info("Reached specified duration of %d seconds. Exiting...", duration);
+            break;
+        }
+        
+        // 轮询RINGBUF，处理所有接口的数据包
+        err = ring_buffer__poll(global_ringbuf, 100);
+        if (err < 0 && err != -EINTR) {
+            log_error("Error polling ring buffer: %d", err);
+            break;
+        }
+        
+        // 处理无锁队列中的数据包
+        process_lockfree_packet_queue();
+        
+        // 处理传统队列中的数据包（兼容性）
+        process_packet_queue();
+        
+        // 短暂休眠，避免CPU占用过高
+        usleep(10000); // 10ms
+    }
+    
+    log_info("Optimized single-thread event loop ended");
+    
+cleanup:
+    // 清理资源
+    if (global_ringbuf) {
+        ring_buffer__free(global_ringbuf);
+        global_ringbuf = NULL;
+    }
+    
+    if (global_links) {
+        for (int i = 0; i < global_link_count; i++) {
+            if (global_links[i]) {
+                bpf_link__destroy(global_links[i]);
+            }
+        }
+        free(global_links);
+        global_links = NULL;
+        global_link_count = 0;
+    }
+    
+    if (global_bpf_obj) {
+        bpf_object__close(global_bpf_obj);
+        global_bpf_obj = NULL;
+    }
+    
+    // 停止工作线程池
+    if (worker_thread_count > 0) {
+        stop_worker_threads();
+    }
+    
+    // 清理无锁队列
+    lockfree_queue_destroy(&global_lockfree_queue);
+    
+    // 执行完整的清理操作
+    log_info("Performing complete cleanup...");
+    cleanup();
+    log_info("Cleanup completed");
+    
+    return ret;
+}
+
+// ... existing code ...
 
 
 

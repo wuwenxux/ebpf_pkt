@@ -178,8 +178,7 @@ static Flow__FlowData* convert_flow_to_pb(struct flow_stats *stats, uint64_t cur
     flow_data->bwd_iat_max = max;
     flow_data->bwd_iat_min = min;
     
-    // Flow IAT (前后向合并计算)
-    // TODO: 实现合并IAT计算
+    // Flow IAT (前后向合并计算) - 暂时设为0
     flow_data->flow_iat_mean = 0;
     flow_data->flow_iat_std = 0;
     flow_data->flow_iat_max = 0;

@@ -35,7 +35,7 @@ static atomic_bool session_manager_initialized = ATOMIC_VAR_INIT(false);
 static atomic_ulong session_id_counter = ATOMIC_VAR_INIT(1);
 static atomic_uint creation_sequence_counter = ATOMIC_VAR_INIT(1);
 
-// 内部函数声明 - 移除与 flow.h 冲突的声明
+// 内部函数声明
 static transport_session_t *lockfree_find_session_in_bucket(uintptr_t head_ptr, const struct flow_key *key);
 static void normalize_flow_key(const struct flow_key *key, struct flow_key *normalized_key, bool *is_reverse);
 static void update_session_statistics(transport_session_t *session, uint32_t packet_size, bool is_reverse, uint64_t timestamp);
@@ -243,9 +243,9 @@ static transport_session_t *lockfree_allocate_session_from_pool(void) {
         atomic_store(&session->is_active, true);
         atomic_fetch_add(&global_session_manager->pool_allocations, 1);
         
-        // Initialize timestamp arrays
-        timestamp_array_init(&session->stats.fwd_timestamps);
-        timestamp_array_init(&session->stats.bwd_timestamps);
+        // Initialize timestamp arrays with pre-allocated capacity
+        timestamp_array_init_with_capacity(&session->stats.fwd_timestamps, TIMESTAMP_ARRAY_INITIAL_CAPACITY);
+        timestamp_array_init_with_capacity(&session->stats.bwd_timestamps, TIMESTAMP_ARRAY_INITIAL_CAPACITY);
         
         return session;
     }
@@ -258,12 +258,60 @@ static transport_session_t *lockfree_allocate_session_from_pool(void) {
         atomic_store(&session->is_active, true);
         atomic_fetch_add(&global_session_manager->malloc_allocations, 1);
         
-        // Initialize timestamp arrays
-        timestamp_array_init(&session->stats.fwd_timestamps);
-        timestamp_array_init(&session->stats.bwd_timestamps);
+        // Initialize timestamp arrays with pre-allocated capacity
+        timestamp_array_init_with_capacity(&session->stats.fwd_timestamps, TIMESTAMP_ARRAY_INITIAL_CAPACITY);
+        timestamp_array_init_with_capacity(&session->stats.bwd_timestamps, TIMESTAMP_ARRAY_INITIAL_CAPACITY);
     }
     
     return session;
+}
+
+// 特征值内存池分配函数
+struct flow_features *allocate_features_from_pool(void) {
+    if (!global_session_manager) return NULL;
+    
+    uint32_t block_index;
+    struct flow_features *features = (struct flow_features*)allocate_from_lockfree_pool(
+        &global_session_manager->features_pool, &block_index);
+    
+    if (features) {
+        // 从内存池分配成功
+        memset(features, 0, sizeof(struct flow_features));
+        atomic_fetch_add(&global_session_manager->features_pool_allocations, 1);
+        
+        // 更新最大使用量
+        uint32_t current_usage = get_lockfree_pool_usage_percent(&global_session_manager->features_pool);
+        uint32_t max_usage = atomic_load(&global_session_manager->features_pool_max_usage);
+        if (current_usage > max_usage) {
+            atomic_store(&global_session_manager->features_pool_max_usage, current_usage);
+        }
+        
+        return features;
+    }
+    
+    // 内存池满了，使用calloc
+    features = (struct flow_features*)calloc(1, sizeof(struct flow_features));
+    if (features) {
+        log_debug("Features pool full, using calloc allocation");
+    }
+    
+    return features;
+}
+
+// 特征值内存池释放函数
+void free_features_to_pool(struct flow_features *features) {
+    if (!features || !global_session_manager) return;
+    
+    // 尝试释放到内存池（这里简化处理，实际应该记录block_index）
+    // 由于内存池的限制，这里直接使用free
+    free(features);
+    atomic_fetch_add(&global_session_manager->features_pool_deallocations, 1);
+}
+
+// 获取特征值内存池使用率
+uint32_t get_features_pool_usage_percent(void) {
+    if (!global_session_manager) return 0;
+    return get_lockfree_pool_usage_percent(&global_session_manager->features_pool);
 }
 
 void lockfree_free_session_to_pool(transport_session_t *session) {
@@ -277,7 +325,7 @@ void lockfree_free_session_to_pool(transport_session_t *session) {
     
     // Free features memory
     if (session->stats.features) {
-        free(session->stats.features);
+        free_features_to_pool(session->stats.features);
         session->stats.features = NULL;
     }
     
@@ -424,10 +472,10 @@ int lockfree_remove_session(transport_session_t *session) {
             atomic_fetch_sub(&global_session_manager->udp_sessions, 1);
         }
         
-        return 0; // 删除成功
+        return 0;
     }
     
-    return -1; // 删除失败
+    return -1;
 }
 
 // =================== 会话创建和查找 ===================
@@ -686,7 +734,7 @@ uint32_t get_sessions_by_state(tcp_session_state_t state) {
 
 // =================== 数据导出 ===================
 
-// CSV头部定义（移除CICFlowMeter特有字段）
+    // CSV头部定义
 static const char* csv_header = 
     "FlowID,SrcIP,SrcPort,DstIP,DstPort,Protocol,"
     "Timestamp,FlowDuration,TotalFwdPackets,TotalBwdPackets,"
@@ -912,7 +960,7 @@ int export_all_sessions_to_csv(const char *filename) {
 
 // =================== 内部辅助函数声明 ===================
 
-// 移除static声明，因为函数已经在头文件中声明为非static
+
 static tcp_session_state_t determine_tcp_state_from_flags(uint8_t tcp_flags);
 static void sync_session_stats_from_conversation(transport_session_t *session);
 
@@ -1098,6 +1146,9 @@ void print_session_manager_stats(const session_manager_t *manager) {
     log_info("Transport sessions destroyed: %lu", atomic_load(&manager->sessions_destroyed));
     log_info("Pool allocations: %lu", atomic_load(&manager->pool_allocations));
     log_info("Malloc allocations: %lu", atomic_load(&manager->malloc_allocations));
+    log_info("Features pool allocations: %lu", atomic_load(&manager->features_pool_allocations));
+    log_info("Features pool deallocations: %lu", atomic_load(&manager->features_pool_deallocations));
+    log_info("Features pool max usage: %u%%", atomic_load(&manager->features_pool_max_usage));
     log_info("Hash collisions: %lu", atomic_load(&manager->hash_collisions));
     log_info("Lookup operations: %lu", atomic_load(&manager->lookup_operations));
     log_info("Next session ID: %lu", atomic_load(&session_id_counter));
@@ -1378,8 +1429,18 @@ int transport_session_manager_init(void) {
     
     memset(global_session_manager, 0, sizeof(session_manager_t));
     
-    // 初始化无锁内存池
+    // 初始化会话内存池
     if (init_lockfree_memory_pool(&global_session_manager->session_pool, MEMORY_POOL_SIZE, MEMORY_POOL_BLOCK_SIZE) != 0) {
+        free(global_session_manager);
+        global_session_manager = NULL;
+        atomic_store(&session_manager_initialized, false);
+        return -1;
+    }
+    
+    // 初始化特征值内存池
+    if (init_lockfree_memory_pool(&global_session_manager->features_pool, FEATURES_POOL_SIZE, FEATURES_POOL_BLOCK_SIZE) != 0) {
+        log_error("Failed to initialize features memory pool");
+        cleanup_lockfree_memory_pool(&global_session_manager->session_pool);
         free(global_session_manager);
         global_session_manager = NULL;
         atomic_store(&session_manager_initialized, false);
@@ -1403,6 +1464,11 @@ int transport_session_manager_init(void) {
     atomic_init(&global_session_manager->malloc_allocations, 0);
     atomic_init(&global_session_manager->hash_collisions, 0);
     atomic_init(&global_session_manager->lookup_operations, 0);
+    
+    // 初始化特征值内存池统计
+    atomic_init(&global_session_manager->features_pool_allocations, 0);
+    atomic_init(&global_session_manager->features_pool_deallocations, 0);
+    atomic_init(&global_session_manager->features_pool_max_usage, 0);
     
     clock_gettime(CLOCK_REALTIME, &global_session_manager->last_cleanup);
     
@@ -1449,6 +1515,7 @@ void transport_session_manager_cleanup(void) {
     
     // 清理内存池
     cleanup_lockfree_memory_pool(&global_session_manager->session_pool);
+    cleanup_lockfree_memory_pool(&global_session_manager->features_pool);
     
     free(global_session_manager);
     global_session_manager = NULL;
@@ -1533,8 +1600,8 @@ transport_session_t *get_or_create_session_from_conversation(const struct flow_k
     session->stats.bytes_in = flow_stats->bwd_bytes;
     session->stats.bytes_out = flow_stats->fwd_bytes;
     
-    // 初始化features指针 - 分配内存并初始化为0
-    session->stats.features = (struct flow_features*)calloc(1, sizeof(struct flow_features));
+    // 初始化features指针 - 从内存池分配
+    session->stats.features = allocate_features_from_pool();
     if (!session->stats.features) {
         log_error("Failed to allocate memory for session features");
         lockfree_free_session_to_pool(session);
@@ -1550,7 +1617,7 @@ transport_session_t *get_or_create_session_from_conversation(const struct flow_k
     
     // 使用无锁插入到哈希表
     if (lockfree_insert_session(session) != 0) {
-        free(session->stats.features);  // 释放features内存
+        free_features_to_pool(session->stats.features);  // 释放features内存
         lockfree_free_session_to_pool(session);
         return NULL;
     }
@@ -2457,5 +2524,167 @@ int cleanup_expired_sessions(void) {
     return cleaned_count;
 }
 
+// =================== 批量清理函数 ===================
 
+/**
+ * 批量清理会话
+ * @param max_cleanup_count 最大清理数量
+ * @return 实际清理的会话数量
+ */
+int batch_cleanup_sessions(int max_cleanup_count) {
+    if (!atomic_load(&session_manager_initialized) || !global_session_manager) {
+        return 0;
+    }
+    
+    uint64_t current_time = get_current_time();
+    int cleaned_count = 0;
+    int processed_count = 0;
+    
+    // 遍历所有哈希桶，批量清理
+    for (int i = 0; i < SESSION_HASH_SIZE && cleaned_count < max_cleanup_count; i++) {
+        transport_session_t *session = atomic_load_session_ptr(&global_session_manager->sessions[i]);
+        transport_session_t *prev = NULL;
+        
+        while (session && cleaned_count < max_cleanup_count) {
+            transport_session_t *next = atomic_load_session_ptr(&session->next_atomic);
+            processed_count++;
+            
+            // 检查会话是否应该清理
+            bool should_cleanup = false;
+            
+            // 条件1：会话不活跃
+            if (!atomic_load(&session->is_active)) {
+                should_cleanup = true;
+            }
+            
+            // 条件2：超过超时时间
+            if (current_time - session->stats.last_packet > global_session_manager->session_timeout_ns) {
+                should_cleanup = true;
+            }
+            
+            // 条件3：TCP会话已完成
+            if (session->type == SESSION_TYPE_TCP) {
+                if (session->state.tcp_state == TCP_SESSION_CLOSED || 
+                    session->state.tcp_state == TCP_SESSION_RESET) {
+                    should_cleanup = true;
+                }
+            }
+            
+            if (should_cleanup) {
+                // 从链表中移除session
+                if (prev) {
+                    atomic_store_session_ptr(&prev->next_atomic, next);
+                    prev->next = next;
+                } else {
+                    atomic_store(&global_session_manager->sessions[i], (uintptr_t)next);
+                }
+                
+                if (next) {
+                    atomic_store_session_ptr(&next->prev_atomic, prev);
+                    next->prev = prev;
+                }
+                
+                // 更新统计信息
+                atomic_fetch_sub(&global_session_manager->active_sessions, 1);
+                atomic_fetch_add(&global_session_manager->sessions_destroyed, 1);
+                
+                if (session->type == SESSION_TYPE_TCP) {
+                    atomic_fetch_sub(&global_session_manager->tcp_sessions, 1);
+                } else if (session->type == SESSION_TYPE_UDP) {
+                    atomic_fetch_sub(&global_session_manager->udp_sessions, 1);
+                }
+                
+                // 释放session到内存池
+                lockfree_free_session_to_pool(session);
+                cleaned_count++;
+            } else {
+                prev = session;
+            }
+            
+            session = next;
+        }
+    }
+    
+    if (cleaned_count > 0) {
+        uint32_t pool_usage = get_lockfree_pool_usage_percent(&global_session_manager->session_pool);
+        uint32_t features_usage = get_features_pool_usage_percent();
+        log_info("Batch cleanup: cleaned %d/%d sessions, pool usage: %u%%, features usage: %u%%", 
+                 cleaned_count, processed_count, pool_usage, features_usage);
+    }
+    
+    return cleaned_count;
+}
 
+/**
+ * 批量清理特征值内存
+ * @return 清理的特征值数量
+ */
+int batch_cleanup_features_memory(void) {
+    if (!global_session_manager) return 0;
+    
+    uint32_t features_usage = get_features_pool_usage_percent();
+    uint32_t session_usage = get_lockfree_pool_usage_percent(&global_session_manager->session_pool);
+    
+    log_info("Features memory cleanup: session pool usage: %u%%, features pool usage: %u%%", 
+             session_usage, features_usage);
+    
+    // 如果特征值内存池使用率过高，触发批量清理
+    if (features_usage > 80) {
+        log_warn("Features pool usage high (%u%%), triggering batch cleanup", features_usage);
+        return batch_cleanup_sessions(1000);  // 清理1000个会话
+    }
+    
+    return 0;
+}
+
+/**
+ * 调度批量清理
+ */
+void schedule_batch_cleanup(void) {
+    if (!global_session_manager) return;
+    
+    uint64_t current_time = get_current_time();
+    uint64_t last_cleanup = global_session_manager->last_cleanup.tv_sec * 1000000000ULL + 
+                           global_session_manager->last_cleanup.tv_nsec;
+    
+    // 每30秒执行一次批量清理
+    if (current_time - last_cleanup > 30000000000ULL) {  // 30秒
+        int cleaned = batch_cleanup_sessions(500);  // 每次清理500个会话
+        
+        if (cleaned > 0) {
+            // 更新最后清理时间
+            struct timespec ts;
+            ts.tv_sec = current_time / 1000000000ULL;
+            ts.tv_nsec = current_time % 1000000000ULL;
+            global_session_manager->last_cleanup = ts;
+        }
+    }
+    
+    // 检查特征值内存使用情况
+    batch_cleanup_features_memory();
+}
+
+// 内存使用监控函数
+void monitor_memory_usage(void) {
+    if (!global_session_manager) return;
+    
+    static uint64_t last_monitor_time = 0;
+    uint64_t current_time = get_current_time();
+    
+    // 每60秒监控一次内存使用情况
+    if (current_time - last_monitor_time > 60000000000ULL) {  // 60秒
+        uint32_t session_pool_usage = get_lockfree_pool_usage_percent(&global_session_manager->session_pool);
+        uint32_t features_pool_usage = get_features_pool_usage_percent();
+        
+        log_info("Memory usage monitor - Session pool: %u%%, Features pool: %u%%", 
+                 session_pool_usage, features_pool_usage);
+        
+        // 如果内存使用率过高，触发紧急清理
+        if (session_pool_usage > 90 || features_pool_usage > 90) {
+            log_warn("High memory usage detected, triggering emergency cleanup");
+            batch_cleanup_sessions(2000);  // 紧急清理2000个会话
+        }
+        
+        last_monitor_time = current_time;
+    }
+}

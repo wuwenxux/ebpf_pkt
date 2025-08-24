@@ -18,10 +18,9 @@
 #include "logger.h"
 #include "transport_session.h"
 
-// 前向声明
-typedef struct lockfree_queue lockfree_queue_t;
-extern uint64_t packet_queue_size(lockfree_queue_t *queue);
-extern lockfree_queue_t packet_queue;
+// 前向声明已在loader.h中定义
+// 外部变量声明
+extern packet_queue_t packet_queue;
 
 // 实时统计结构定义
 typedef struct {
@@ -388,7 +387,7 @@ void draw_ebpf_stats_window(WINDOW *win) {
     }
     
     // 获取队列状态
-    uint64_t queue_size = packet_queue_size(&packet_queue);
+    int queue_size = packet_queue_size(&packet_queue);
     
     // 获取当前时间
     time_t now = time(NULL);
@@ -416,7 +415,7 @@ void draw_ebpf_stats_window(WINDOW *win) {
     mvwprintw(win, 10, 4, "Byte Processing Rate: %.1f%%", byte_processing_ratio);
     
     // 显示队列状态
-    mvwprintw(win, 11, 2, "Queue Status: %lu packets pending", queue_size);
+    mvwprintw(win, 11, 2, "Queue Status: %d packets pending", queue_size);
     
     // 状态指示
     const char *status_msg = "";
@@ -486,4 +485,4 @@ void cleanup_stats_window(WINDOW *win) {
     fflush(stdout);
 }
 
-// 删除未使用的run_realtime_monitor函数 
+ 
